@@ -16,6 +16,7 @@
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="RedisNearCache.Tests" />
+    <InternalsVisibleTo Include="RedisNearCache.UnitTests" />
     <InternalsVisibleTo Include="RedisNearCache.HybridCache" />
     <InternalsVisibleTo Include="RedisNearCache.Bench" />
   </ItemGroup>

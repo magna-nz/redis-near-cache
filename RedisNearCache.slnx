@@ -12,5 +12,6 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/RedisNearCache.Tests/RedisNearCache.Tests.csproj" />
+    <Project Path="tests/RedisNearCache.UnitTests/RedisNearCache.UnitTests.csproj" />
   </Folder>
 </Solution>

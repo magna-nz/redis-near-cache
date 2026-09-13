@@ -5,9 +5,16 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  unit:
+    name: unit tests (no Redis)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,27 +23,100 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
-      - name: Start Redis (standalone + 3-master cluster)
+      - name: Build
+        run: dotnet build -c Release -nologo
+      - name: Unit tests (net8.0 and net10.0)
+        run: dotnet test tests/RedisNearCache.UnitTests -c Release --no-build -nologo --logger "trx;LogFileName=unit.trx"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          path: tests/RedisNearCache.UnitTests/TestResults/*.trx
+
+  integration:
+    name: integration tests (Redis, replica, cluster)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Start Redis 7.4 (standalone + replica) and the 3-master cluster
         run: |
           docker compose up -d
           ./cluster-up.sh
-          docker exec redis-near-cache-redis redis-cli ping
+          for i in $(seq 1 30); do docker exec redis-near-cache-redis redis-cli ping 2>/dev/null | grep -q PONG && break; sleep 1; done
+          for i in $(seq 1 30); do docker exec redis-near-cache-replica redis-cli -p 6380 info replication 2>/dev/null | grep -q master_link_status:up && break; sleep 1; done
+          docker exec redis-near-cache-replica redis-cli -p 6380 info replication | grep master_link_status
       - name: Build
         run: dotnet build -c Release -nologo
-      - name: Test
-        run: dotnet test tests/RedisNearCache.Tests -c Release --no-build -nologo --logger "trx;LogFileName=results.trx"
-      - name: Upload test results
+      - name: Integration, chaos and edge-case tests
+        run: dotnet test tests/RedisNearCache.Tests -c Release --no-build -nologo --logger "trx;LogFileName=integration.trx"
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: test-results
+          name: integration-test-results
           path: tests/RedisNearCache.Tests/TestResults/*.trx
+
+  pack:
+    name: pack
+    needs: [unit, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            base=$(sed -n 's/.*<Version>\(.*\)<\/Version>.*/\1/p' Directory.Build.props)
+            echo "value=${base}-ci.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
       - name: Pack
         run: |
-          dotnet pack src/RedisNearCache/RedisNearCache.csproj -c Release --no-build -o artifacts
-          dotnet pack src/RedisNearCache.HybridCache/RedisNearCache.HybridCache.csproj -c Release --no-build -o artifacts
-      - name: Upload packages
-        uses: actions/upload-artifact@v4
+          dotnet pack src/RedisNearCache/RedisNearCache.csproj -c Release -nologo -o artifacts -p:Version=${{ steps.version.outputs.value }} -p:ContinuousIntegrationBuild=true
+          dotnet pack src/RedisNearCache.HybridCache/RedisNearCache.HybridCache.csproj -c Release -nologo -o artifacts -p:Version=${{ steps.version.outputs.value }} -p:ContinuousIntegrationBuild=true
+          ls -l artifacts
+      - uses: actions/upload-artifact@v4
         with:
           name: nupkg
           path: artifacts/*.nupkg
+
+  publish:
+    name: publish to NuGet
+    # A published GitHub Release (its tag is vX.Y.Z) or a pushed v* tag. Needs the repository secret
+    # NUGET_API_KEY (Settings > Secrets and variables > Actions).
+    if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
+    needs: [pack]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/download-artifact@v4
+        with:
+          name: nupkg
+          path: artifacts
+      - name: Push packages
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          test -n "$NUGET_API_KEY" || { echo "NUGET_API_KEY secret is not set (repo Settings > Secrets and variables > Actions)"; exit 1; }
+          for pkg in artifacts/*.nupkg; do
+            dotnet nuget push "$pkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          done
+      - name: Attach packages to the GitHub release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" artifacts/*.nupkg --repo "${{ github.repository }}" --clobber
