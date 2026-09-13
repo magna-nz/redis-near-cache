@@ -32,6 +32,11 @@ public interface IRedisNearCache : IAsyncDisposable
     /// <summary>Counters for hits, misses, invalidations, flushes and re-arms.</summary>
     RedisNearCacheStatistics Statistics { get; }
 
-    /// <summary>Completes once tracking is armed on every master and invalidations are being received.</summary>
+    /// <summary>
+    /// Completes once the invalidation subscription is up and the initial arming pass over every master has
+    /// finished. Masters that could not be armed are retried in the background; until every master is armed
+    /// the cache serves every read from Redis and stores nothing locally. Faults only if no master could be
+    /// armed at all, in which case the cache stays in that pass-through mode permanently.
+    /// </summary>
     Task Ready { get; }
 }

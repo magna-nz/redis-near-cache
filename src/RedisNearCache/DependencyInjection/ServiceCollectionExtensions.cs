@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -25,28 +26,28 @@ public static class ServiceCollectionExtensions
         services.AddOptions();
         services.Configure(configure);
 
-        services.AddSingleton(sp =>
+        services.TryAddSingleton(sp =>
         {
             var options = sp.GetRequiredService<IOptions<RedisNearCacheOptions>>().Value;
             var logger = CreateLogger<RedisNearCacheConnection>(sp);
             return RedisNearCacheConnection.Connect(options, logger);
         });
 
-        services.AddSingleton<ITrackingArmer>(sp =>
+        services.TryAddSingleton<ITrackingArmer>(sp =>
         {
             var connection = sp.GetRequiredService<RedisNearCacheConnection>();
             var logger = CreateLogger<TrackingArmer>(sp);
             return new TrackingArmer(connection, logger);
         });
 
-        services.AddSingleton<IInvalidationListener>(sp =>
+        services.TryAddSingleton<IInvalidationListener>(sp =>
         {
             var connection = sp.GetRequiredService<RedisNearCacheConnection>();
             var logger = CreateLogger<InvalidationListener>(sp);
             return new InvalidationListener(connection, logger);
         });
 
-        services.AddSingleton<IRedisNearCache>(sp =>
+        services.TryAddSingleton<IRedisNearCache>(sp =>
         {
             var connection = sp.GetRequiredService<RedisNearCacheConnection>();
             var armer = sp.GetRequiredService<ITrackingArmer>();

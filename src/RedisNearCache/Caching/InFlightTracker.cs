@@ -36,8 +36,6 @@ internal sealed class InFlightTracker
 
     public long Begin(string key)
     {
-        long token = Interlocked.Increment(ref _version);
-
         while (true)
         {
             var entry = _entries.GetOrAdd(key, static _ => new Entry());
@@ -48,8 +46,10 @@ internal sealed class InFlightTracker
                     continue;
                 }
 
+                // Take the token only once the entry is registered and locked, so no MarkInvalidated can slip
+                // between "token taken" and "entry visible" and be dropped.
                 entry.ActiveReaders++;
-                return token;
+                return Interlocked.Increment(ref _version);
             }
         }
     }

@@ -8,4 +8,11 @@ internal sealed class RedisNearCacheTestHooks
     /// Tests use it to perform a concurrent write and prove the stale reply is discarded.
     /// </summary>
     public Func<string, Task>? AfterRedisReadBeforeStore { get; set; }
+
+    /// <summary>
+    /// Invoked synchronously inside every whole-cache flush handler (FLUSHDB, re-arm, tracking lost) AFTER the
+    /// in-flight tracker has been marked and BEFORE L1 is cleared. Tests use it to land a read's store exactly
+    /// in that window and prove the post-store re-check evicts it.
+    /// </summary>
+    public Action? InsideFlushHandler { get; set; }
 }

@@ -140,15 +140,23 @@ internal sealed class TrackingArmer : ITrackingArmer
         }
 
         var results = await Task.WhenAll(endPoints.Select(ep => ArmWithRetryAsync(ep, reason, linked.Token))).ConfigureAwait(false);
-        var failures = results.OfType<Exception>().ToArray();
-        if (failures.Length == 0) return;
+        var failures = new List<Exception>();
+        for (var i = 0; i < endPoints.Count; i++)
+        {
+            if (results[i] is not { } error) continue;
+            failures.Add(error);
+            // The endpoint is unarmed: say so (the facade stops caching until it is re-armed) and keep
+            // retrying in the background instead of leaving it silently untracked.
+            MarkLostAndRetryLater(endPoints[i], reason);
+        }
+        if (failures.Count == 0) return;
 
-        if (failures.Length == endPoints.Count)
+        if (failures.Count == endPoints.Count)
             throw new RedisNearCacheTrackingException($"Could not arm CLIENT TRACKING on any of the {endPoints.Count} connected master(s).", new AggregateException(failures));
 
         _logger.LogWarning(new AggregateException(failures),
-            "RedisNearCache armed CLIENT TRACKING on {Armed} of {Total} master(s) ({Reason}); reads served from the unarmed node(s) will not be invalidated until they are re-armed",
-            endPoints.Count - failures.Length, endPoints.Count, reason);
+            "RedisNearCache armed CLIENT TRACKING on {Armed} of {Total} master(s) ({Reason}); the cache stays in pass-through until the remaining node(s) are armed",
+            endPoints.Count - failures.Count, endPoints.Count, reason);
     }
 
     /// <inheritdoc />
@@ -202,9 +210,9 @@ internal sealed class TrackingArmer : ITrackingArmer
         {
             await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (ObjectDisposedException)
+        catch (ObjectDisposedException ex)
         {
-            return null; // disposed while we were queued
+            return ex; // disposed while we were queued: not a success
         }
 
         try
@@ -427,7 +435,7 @@ internal sealed class TrackingArmer : ITrackingArmer
             {
                 if (_redirectTargets.ContainsKey(endPoint)) continue;
                 _logger.LogInformation("RedisNearCache saw a configuration change adding master {EndPoint}; arming CLIENT TRACKING", endPoint);
-                QueueArm(endPoint, ArmReason.Initial);
+                QueueArm(endPoint, ArmReason.TopologyChanged);
             }
         }
         catch (Exception ex)
@@ -453,7 +461,8 @@ internal sealed class TrackingArmer : ITrackingArmer
         {
             try
             {
-                await ArmWithRetryAsync(endPoint, reason, token).ConfigureAwait(false);
+                var error = await ArmWithRetryAsync(endPoint, reason, token).ConfigureAwait(false);
+                if (error is not null) MarkLostAndRetryLater(endPoint, reason);
             }
             catch (OperationCanceledException)
             {
@@ -462,6 +471,44 @@ internal sealed class TrackingArmer : ITrackingArmer
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "RedisNearCache failed to re-arm CLIENT TRACKING on {EndPoint} ({Reason})", endPoint, reason);
+            }
+        }, CancellationToken.None);
+    }
+
+    /// <summary>Interval between background retries once the fast backoff ladder has been exhausted.</summary>
+    private static readonly TimeSpan SlowRetryInterval = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// An arm exhausted its retries. Forget the (dead) redirect id so the endpoint is not mistaken for armed,
+    /// raise <see cref="TrackingLost"/> so the facade stops caching, and keep retrying every
+    /// <see cref="SlowRetryInterval"/> until it succeeds or we are disposed.
+    /// </summary>
+    private void MarkLostAndRetryLater(EndPoint endPoint, ArmReason reason)
+    {
+        _redirectTargets.TryRemove(endPoint, out _);
+        Raise(TrackingLost, endPoint, nameof(TrackingLost));
+
+        CancellationToken token;
+        try { token = _shutdown.Token; } catch (ObjectDisposedException) { return; }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    await Task.Delay(SlowRetryInterval, token).ConfigureAwait(false);
+                    _logger.LogInformation("RedisNearCache retrying CLIENT TRACKING arm on {EndPoint} ({Reason}) after the backoff ladder was exhausted", endPoint, reason);
+                    if (await ArmWithRetryAsync(endPoint, reason, token).ConfigureAwait(false) is null) return;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // shutting down
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "RedisNearCache background re-arm of {EndPoint} stopped unexpectedly", endPoint);
             }
         }, CancellationToken.None);
     }

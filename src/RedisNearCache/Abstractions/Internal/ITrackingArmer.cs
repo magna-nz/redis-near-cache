@@ -13,6 +13,8 @@ internal enum ArmReason
     SubscriptionRestored,
     /// <summary>Requested explicitly (tests, diagnostics).</summary>
     Manual,
+    /// <summary>A master appeared after a cluster configuration change; slots may have moved, so L1 is flushed.</summary>
+    TopologyChanged,
 }
 
 /// <summary>Raised after CLIENT TRACKING ON REDIRECT succeeded on one endpoint.</summary>

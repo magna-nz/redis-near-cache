@@ -21,6 +21,8 @@ internal sealed class RedisNearCache : IRedisNearCache
     private readonly L1Cache _l1;
     private readonly InFlightTracker _inflight;
     private volatile bool _degraded;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<EndPoint, bool> _lostEndpoints = new();
+    private int _disposed;
 
     public RedisNearCacheStatistics Statistics { get; } = new();
 
@@ -66,26 +68,34 @@ internal sealed class RedisNearCache : IRedisNearCache
         }
     }
 
+    // Ordering rule for every handler below: mark the in-flight tracker FIRST, then touch L1.
+    // A read that stores its reply between the two steps re-checks the tracker after storing (see GetAsync),
+    // so mark-then-clear closes every interleaving; clear-then-mark leaves the "store after clear, re-check
+    // before mark" window open and the stale entry survives.
+
     private void OnKeyInvalidated(string key)
     {
-        _l1.Remove(key);
         _inflight.MarkInvalidated(key);
+        _l1.Remove(key);
         Statistics.Invalidation();
     }
 
     private void OnFlushAll()
     {
-        _l1.Clear();
         _inflight.MarkAllInvalidated();
+        _options.TestHooks.InsideFlushHandler?.Invoke();
+        _l1.Clear();
         Statistics.Flush();
     }
 
     private void OnArmed(TrackingArmedEvent e)
     {
+        _lostEndpoints.TryRemove(e.EndPoint, out _);
         if (e.Reason != ArmReason.Initial)
         {
-            _l1.Clear();
             _inflight.MarkAllInvalidated();
+            _options.TestHooks.InsideFlushHandler?.Invoke();
+            _l1.Clear();
             Statistics.Flush();
             Statistics.Rearm();
         }
@@ -93,11 +103,17 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     private void OnTrackingLost(EndPoint endPoint)
     {
-        // Conservative: nothing can be trusted while tracking is down on this endpoint.
-        _l1.Clear();
+        // Nothing can be trusted while tracking is down on any endpoint: flush, and stop populating L1
+        // until every lost endpoint has been re-armed (see CachingEnabled).
+        _lostEndpoints[endPoint] = true;
         _inflight.MarkAllInvalidated();
+        _options.TestHooks.InsideFlushHandler?.Invoke();
+        _l1.Clear();
         Statistics.Flush();
     }
+
+    /// <summary>L1 may only be read or populated while tracking is believed to be armed everywhere.</summary>
+    private bool CachingEnabled => !_degraded && _lostEndpoints.IsEmpty;
 
     private bool MatchesPrefixes(string key)
     {
@@ -135,7 +151,7 @@ internal sealed class RedisNearCache : IRedisNearCache
             _degraded = true;
         }
 
-        if (!_degraded && _l1.TryGet(key, out var cached))
+        if (CachingEnabled && _l1.TryGet(key, out var cached))
         {
             Statistics.Hit();
             return _options.Serializer.Deserialize<T>(cached);
@@ -160,7 +176,7 @@ internal sealed class RedisNearCache : IRedisNearCache
                 return default;
             }
 
-            if (!_degraded && MatchesPrefixes(key))
+            if (CachingEnabled && MatchesPrefixes(key))
             {
                 if (_inflight.WasInvalidated(key, token))
                 {
@@ -228,6 +244,11 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+        {
+            return;
+        }
+
         _listener.KeyInvalidated -= OnKeyInvalidated;
         _listener.FlushAll -= OnFlushAll;
         _armer.Armed -= OnArmed;
