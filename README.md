@@ -20,7 +20,7 @@ few milliseconds later. It runs on StackExchange.Redis 3.x over its own connecti
 existing setup changes.
 
 <div align="center">
-  <img src="docs/architecture.svg" alt="Your code reads through RedisNearCache; misses go over a tracked private connection; Redis pushes invalidations to a private subscriber connection which evicts the local copy" width="820" />
+  <img src="docs/architecture-diagram.svg" alt="Your code reads through RedisNearCache; misses go over a tracked private connection; Redis pushes invalidations to a private subscriber connection which evicts the local copy" width="820" />
   <br />
   <sub><strong>Only reads that go through the cache are tracked.</strong> Writes can come from anywhere.</sub>
 </div>
