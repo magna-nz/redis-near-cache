@@ -34,6 +34,16 @@ internal sealed class RedisNearCacheConnection : IAsyncDisposable
         return cfg;
     }
 
+    /// <summary>Synchronous connect for DI factories.</summary>
+    public static RedisNearCacheConnection Connect(RedisNearCacheOptions options, ILogger logger)
+    {
+        var cfg = BuildConfiguration(options);
+        logger.LogInformation("RedisNearCache connecting private multiplexer {ClientName} to {EndPoints} (RESP2, admin)",
+            cfg.ClientName, string.Join(",", cfg.EndPoints.Select(e => e.ToString())));
+        var mux = ConnectionMultiplexer.Connect(cfg);
+        return new RedisNearCacheConnection(mux, cfg.ClientName!);
+    }
+
     public static async Task<RedisNearCacheConnection> ConnectAsync(RedisNearCacheOptions options, ILogger logger, CancellationToken cancellationToken)
     {
         var cfg = BuildConfiguration(options);
