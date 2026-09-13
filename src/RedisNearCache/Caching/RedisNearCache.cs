@@ -21,6 +21,7 @@ internal sealed class RedisNearCache : IRedisNearCache
     private readonly L1Cache _l1;
     private readonly InFlightTracker _inflight;
     private volatile bool _degraded;
+    private int _startupSettled;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<EndPoint, bool> _lostEndpoints = new();
     private int _disposed;
 
@@ -100,6 +101,8 @@ internal sealed class RedisNearCache : IRedisNearCache
         }
         // Re-enable caching only AFTER the flush, so no concurrent read can hit an entry the flush discards.
         _lostEndpoints.TryRemove(e.EndPoint, out _);
+        // An arm succeeded, so startup (or its recovery) is settled and the cache is no longer degraded.
+        Volatile.Write(ref _startupSettled, 1);
         _degraded = false;
     }
 
@@ -146,15 +149,9 @@ internal sealed class RedisNearCache : IRedisNearCache
     public async ValueTask<T?> GetAsync<T>(string key, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        if (!Ready.IsCompletedSuccessfully)
+        if (Volatile.Read(ref _startupSettled) == 0)
         {
-            if (Ready.IsCompleted)
-            {
-                // Faulted or cancelled startup: degrade to a pass-through (every read goes to Redis, nothing is
-                // cached) until the armer's background retry raises Armed. No exception per call.
-                _degraded = true;
-            }
-            else
+            if (!Ready.IsCompleted)
             {
                 try
                 {
@@ -166,8 +163,17 @@ internal sealed class RedisNearCache : IRedisNearCache
                 }
                 catch
                 {
-                    _degraded = true; // already logged by StartAsync
+                    // already logged by StartAsync; handled below
                 }
+            }
+
+            // Settle exactly once. A faulted or cancelled startup degrades to a pass-through (every read goes
+            // to Redis, nothing is cached) until the armer's background retry raises Armed, which clears the
+            // flag and settles startup itself. Never re-derive the flag from Ready on later calls: Ready stays
+            // faulted forever, but the cache does not.
+            if (Interlocked.Exchange(ref _startupSettled, 1) == 0 && !Ready.IsCompletedSuccessfully)
+            {
+                _degraded = true;
             }
         }
 

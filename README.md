@@ -1,269 +1,109 @@
-# RedisNearCache
+<div align="center">
+  <img src="docs/mark.svg" alt="RedisNearCache mark" width="104" />
+  <h1>RedisNearCache</h1>
+  <p><strong>An in-process cache for Redis values that the Redis server itself keeps fresh. Any writer, in any language, invalidates it. Your existing StackExchange.Redis connection is never touched.</strong></p>
+  <p>
+    <a href="https://github.com/magna-nz/redis-near-cache/actions/workflows/ci.yml"><img src="https://github.com/magna-nz/redis-near-cache/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
+    <a href="https://www.nuget.org/packages/RedisNearCache"><img src="https://img.shields.io/nuget/v/RedisNearCache?label=nuget" alt="NuGet" /></a>
+    <a href="https://dotnet.microsoft.com/"><img src="https://img.shields.io/badge/.NET-8%20%7C%2010-512BD4" alt=".NET 8 and 10" /></a>
+    <a href="https://redis.io/docs/latest/develop/clients/client-side-caching/"><img src="https://img.shields.io/badge/Redis-6%2B%20%7C%20Valkey-DC382D" alt="Redis 6+ or Valkey" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License" /></a>
+  </p>
+  <p><a href="https://magna-nz.github.io/redis-near-cache/">Documentation</a></p>
+</div>
 
-Server-assisted client-side caching for .NET, layered on StackExchange.Redis 3.2.0.
+<br />
 
-RedisNearCache keeps an in-process copy (an "L1") of the Redis values your application reads, and lets
-the Redis server itself tell you when one of them changes, using the `CLIENT TRACKING` feature Redis 6
-introduced. There is no cooperation required from writers: any client, in any language, doing a plain
-`SET` or `DEL` (or `redis-cli` by hand) causes Redis to push an invalidation message, and RedisNearCache
-evicts the stale entry. This is different from an application-level pub/sub backplane (the kind
-FusionCache and the proposed HybridCache backplane use), where only writers built with the same library
-publish invalidations, so a writer in another language or process silently leaves readers stale. Server-
-assisted tracking moves the responsibility to the one place every write already passes through: Redis
-itself. RedisNearCache opens its own private connection to do this; your application's existing
-`IConnectionMultiplexer` is never touched, reconfigured, or depended on.
+Redis 6 added server-assisted client-side caching: the server remembers which keys a connection has read
+and pushes an invalidation when any client writes one of them. RedisNearCache layers that on
+StackExchange.Redis 3.x without forking it. Reads of hot keys are served from memory in under a microsecond,
+and a `SET` from redis-cli, a Go service or a Lua script evicts the local copy within a couple of
+milliseconds. No pub/sub backplane, no cooperation from writers.
 
-See [docs/how-it-works.html](docs/how-it-works.html) for diagrams of the mechanism, the reconnect
-handling, and the cluster case.
+<div align="center">
+  <img src="docs/architecture.svg" alt="Your code reads through RedisNearCache; misses go over a tracked private connection; Redis pushes invalidations to a private subscriber connection which evicts the local copy" width="820" />
+  <br />
+  <sub><strong>Only reads that go through the cache are tracked.</strong> Writes can come from anywhere.</sub>
+</div>
 
-## Requirements
+<br />
 
-| Requirement | Detail |
-|---|---|
-| Redis server | Redis 6 or newer, or Valkey (any version that implements `CLIENT TRACKING`). |
-| Garnet | Not supported. Garnet does not implement `CLIENT TRACKING`. |
-| .NET | .NET 8 or .NET 10. |
-| StackExchange.Redis | 3.2.0 (pinned; see `Directory.Packages.props`). |
-| Your own connection | No special requirements. Any protocol (RESP2 or RESP3), no admin mode needed. |
-| RedisNearCache's private connection | Opened by RedisNearCache itself, forced to RESP2 with admin mode (`AllowAdmin=true`) and its own client name. This is required for `CLIENT TRACKING` and `CLIENT LIST`, and because StackExchange.Redis 3.x swallows RESP3 invalidation push frames. |
+More in the [documentation](https://magna-nz.github.io/redis-near-cache/), including the sequence diagrams,
+the reconnect model and the API reference.
 
-## Quick start
+## Install
 
-```bash
+```sh
 dotnet add package RedisNearCache
 ```
 
-Register the cache and resolve it from DI:
+Add `RedisNearCache.HybridCache` as well if you want it behind `HybridCache` or `IDistributedCache`.
+Needs Redis 6 or newer, or Valkey. Garnet does not implement `CLIENT TRACKING`.
+
+## Use
 
 ```csharp
-using Microsoft.Extensions.DependencyInjection;
-using RedisNearCache;
-
-var services = new ServiceCollection();
 services.AddRedisNearCache("localhost:6379");
+```
 
-await using var provider = services.BuildServiceProvider();
+```csharp
 var cache = provider.GetRequiredService<IRedisNearCache>();
+await cache.Ready;                                     // subscription up, tracking armed on every master
 
-// Wait for the invalidation subscription and initial arming to complete.
-await cache.Ready;
+var user = await cache.GetAsync<User>("user:42");      // miss: one GET, tracked, stored locally
+var again = await cache.GetAsync<User>("user:42");     // hit: no network call
 
-await cache.SetAsync("user:42", new { Name = "Ada" });
-
-var user = await cache.GetAsync<User>("user:42");     // miss: reads Redis, populates L1, arms tracking
-var again = await cache.GetAsync<User>("user:42");    // hit: served from L1, no network call
-
-await cache.RemoveAsync("user:42");
-
-if (cache.TryGetLocal<User>("user:42", out var local))
-{
-    // local is only set if the key is currently cached in L1; Redis is never touched.
-}
-
-Console.WriteLine(cache.Statistics);                  // hits=1 misses=1 invalidations=0 flushes=0 rearms=0 raceDiscards=0
-
-record User(string Name);
+await cache.SetAsync("user:42", user with { Name = "Ada" });   // writes through, evicts the local copy
+Console.WriteLine(cache.Statistics);                   // hits=1 misses=1 invalidations=0 flushes=0 rearms=0 raceDiscards=0
 ```
 
-You can also configure options explicitly:
+Then, from anywhere:
 
-```csharp
-services.AddRedisNearCache(options =>
-{
-    options.ConnectionString = "localhost:6379";
-    options.KeyPrefixes.Add("user:");
-    options.L1MaxAge = TimeSpan.FromMinutes(5);
-});
+```sh
+redis-cli SET user:42 '{"Name":"Grace"}'               # the next GetAsync sees Grace
 ```
 
-## How it works
-
-RedisNearCache opens one private StackExchange.Redis multiplexer, cloned from your connection settings
-with `Protocol=Resp2`, `AllowAdmin=true` and a unique client name. Under RESP2 that multiplexer has two
-connections per Redis node: an **interactive connection**, used for the actual `GET`/`SET` calls, and a
-**subscriber connection**, which RedisNearCache tells Redis to redirect invalidations to
-(`CLIENT TRACKING ON REDIRECT <subscriber id>`). The subscriber subscribes to `__redis__:invalidate` and
-turns each incoming message into an eviction from L1.
-
-Tracking is **one-shot per key**: after Redis sends an invalidation for a key, it forgets that key was
-being tracked until the connection reads it again. Every `GetAsync<T>` miss re-arms tracking for that key
-by reading it over the tracked interactive connection.
-
-Because an invalidation can arrive between sending a `GET` and storing its reply, RedisNearCache keeps an
-in-flight guard: each read records a version token before the request goes out, and the reply is only
-stored in L1 if no invalidation for that key was seen in the meantime. A stale reply is still returned to
-the caller (it was correct when read); it is simply not cached, and `Statistics.RaceDiscards` counts it.
-
-Writes made through RedisNearCache's own `SetAsync`/`RemoveAsync` are armed with `NOLOOP`, so Redis does
-not echo them back as invalidations; RedisNearCache evicts its own L1 entry for the key directly around the
-write instead.
-
-## Options
-
-`RedisNearCacheOptions`, configured via `AddRedisNearCache`:
-
-| Property | Default | What it does |
-|---|---|---|
-| `Configuration` | `null` | `ConfigurationOptions` for the Redis deployment. RedisNearCache clones this and forces `Protocol=Resp2`, `AllowAdmin=true` and its own `ClientName`. Either this or `ConnectionString` must be set. |
-| `ConnectionString` | `null` | Alternative to `Configuration`; parsed with `ConfigurationOptions.Parse`. |
-| `KeyPrefixes` | empty | Key prefixes that RedisNearCache will cache locally. Reads of keys outside these prefixes still go through RedisNearCache to Redis but are not stored in L1, so they cost nothing to invalidate. Empty (the default) means every key read through RedisNearCache is cached. |
-| `L1SizeLimit` | `10_000` | Maximum number of entries held in L1. Least-recently-used entries are evicted beyond this. |
-| `L1MaxAge` | 5 minutes | Safety net: an L1 entry is dropped after this age even if no invalidation arrived. Protects against a missed invalidation. Set to `Timeout.InfiniteTimeSpan` to disable. |
-| `Serializer` | `JsonRedisNearCacheSerializer.Instance` | Serializer for values. Defaults to `System.Text.Json`; `string` and `byte[]` are passed through untouched. |
-| `ClientNamePrefix` | `"rnc"` | Prefix for the Redis client name RedisNearCache sets on its own connections. A unique suffix is appended. |
-
-## Reconnects
-
-Tracking is state Redis holds per connection, so a reconnect of either of RedisNearCache's own connections
-(on any node) invalidates that state:
-
-| Event | What Redis does | What RedisNearCache does |
-|---|---|---|
-| Interactive connection reconnects | Server drops tracking entirely (`CLIENT TRACKINGINFO` reports `flags=off`, `redirect=-1`). | Re-issues `CLIENT TRACKING ON REDIRECT` on that node, then flushes L1. |
-| Subscriber connection reconnects | Server keeps redirecting to the now-dead old client id; invalidations are silently lost. | Looks up the new subscriber client id via `CLIENT LIST`, re-issues `CLIENT TRACKING OFF` then `ON REDIRECT <new id>`, then flushes L1. |
-| Cluster topology change (a master added/rediscovered) | Slots may have moved to the new master. | Arms the new master, then flushes L1 (`ArmReason.TopologyChanged`); masters already armed are left alone. |
-| Any connection failed but not yet restored | Nothing can be trusted. | Flushes L1 and serves every read straight from Redis (no caching) until that node is re-armed. |
-
-Every re-arm after the very first one, and every "tracking lost" event, flushes L1 completely: anything
-invalidated during the gap would otherwise be lost. `Statistics.Rearms` counts each re-arm issued after the
-initial pass, and `Statistics.Flushes` counts every whole-cache flush (a null invalidation/`FLUSHDB`, a
-lost connection, or a re-arm). On a cluster, each master node is armed and re-armed independently: losing
-one node's connections flushes L1 (nothing can be trusted while any node is unarmed) but only that node is
-re-armed.
-
-## HybridCache and IDistributedCache
-
-```bash
-dotnet add package RedisNearCache.HybridCache
-```
+Behind `HybridCache`:
 
 ```csharp
 services.AddRedisNearCache("localhost:6379");
-services.AddRedisNearCacheHybridCache();
+services.AddRedisNearCacheHybridCache();               // HybridCache's own L1 is disabled; ours is the coherent one
 ```
 
-This registers `RedisNearCacheDistributedCache` as both `IDistributedCache` and `IBufferDistributedCache`,
-backed by the `IRedisNearCache` that `AddRedisNearCache` already registered, and then calls `AddHybridCache`
-so that `Microsoft.Extensions.Caching.Hybrid.HybridCache` uses RedisNearCache as its distributed tier.
-Use `AddRedisNearCacheDistributedCache()` alone if you only want the `IDistributedCache`/`IBufferDistributedCache`
-adapters (for session state, output caching, etc.) without `HybridCache`.
+## What you get
 
-`HybridCache` keeps its own in-process L1 in front of whatever `IDistributedCache` it is given, and that L1
-knows nothing about Redis invalidations: only RedisNearCache's own L1 is evicted when the server invalidates
-a key. To avoid two L1s where only one is coherent, `AddRedisNearCacheHybridCache` sets
-`HybridCacheOptions.DefaultEntryOptions.Flags` to `HybridCacheEntryFlags.DisableLocalCache` (unless your
-`configure` callback overrides it). Every `HybridCache` read then goes to `IDistributedCache`, which is
-RedisNearCache's tracked L1, so nothing is lost: a hit is still served in-process. One consequence: `HybridCache`
-writes a freshly computed value to the distributed tier in the background, so a second `GetOrCreateAsync` issued
-before that write lands (well under 10 ms locally) may run the factory again. Concurrent callers are still
-coalesced by `HybridCache`'s stampede protection. That is an occasional extra factory call, never a stale read. Flags merge per call, so
-`GetOrCreateAsync(key, factory, new HybridCacheEntryOptions { Expiration = ... })` keeps the local cache
-disabled. If you pass explicit `Flags` per call, keep `DisableLocalCache` in them. (A small
-`LocalCacheExpiration` would not have worked: a per-call `Expiration` silently becomes the local expiration
-too, which is how an earlier build of this adapter served stale values for the full entry lifetime.)
+Measured on one machine against a local Redis 7.4, 20 application instances, 160 readers and 2,000
+foreign writes per second (details and caveats in the [docs](https://magna-nz.github.io/redis-near-cache/#performance)):
 
-**Sliding expiration limitation.** Redis TTLs, and RedisNearCache's `SetAsync`, have no notion of a sliding
-window. `DistributedCacheEntryOptions.SlidingExpiration` is mapped to a plain absolute expiry equal to the
-sliding window, applied once at write time, and is never extended by a later read. `Refresh` and
-`RefreshAsync` are no-ops for this reason: the Redis TTL set at write time is authoritative until the key
-expires, is overwritten, or is deleted. Callers that need a true sliding window must re-`Set` on each access
-themselves.
+| | Near cache | Plain StackExchange.Redis |
+|---|---:|---:|
+| Reads per second | 1,369,673 | 190,756 |
+| Server commands per second | 59,585 | 192,758 |
+| Stale local entries after 60,000 foreign writes | 0 | n/a |
 
-## Limitations
+## How it stays correct
 
-- **RESP3 push tracking is not used.** StackExchange.Redis 3.x collapses RESP3 to a single connection and
-  swallows the invalidation push frames on it, so RedisNearCache always forces RESP2 for its own connection.
-- **No `OPTIN`/`OPTOUT` tracking mode.** `CLIENT CACHING YES` must be sent immediately adjacent to the next
-  command on the wire, which is not guaranteed on a multiplexed connection. Selection of what gets cached is
-  done in the library instead, via `KeyPrefixes`.
-- **Garnet is not supported.** Garnet does not implement `CLIENT TRACKING`.
-- **TTL expiry is only reflected in L1 once Redis actually expires the key.** Redis's active expiry cycle,
-  not the TTL deadline itself, is what triggers the invalidation push; there can be a gap between a key's TTL
-  elapsing and Redis noticing and sending the invalidation. `L1MaxAge` is the safety net for this and for any
-  other missed invalidation: an L1 entry is dropped after that age regardless.
-- **Per-write invalidation cost on hot keys.** Every write to a tracked key causes Redis to push an
-  invalidation to every reader that had it tracked; a very hot key can mean a lot of pushes. Use
-  `KeyPrefixes` to opt only the keys you actually want cached into L1, so writes to everything else cost
-  nothing extra.
-- **`Ready` only faults if no master could be armed at all.** If some masters armed and others did not,
-  `Ready` completes, but the cache stays in pass-through (every read goes to Redis, nothing is stored in L1)
-  until every master is armed. Unarmed masters are retried in the background every 5 seconds. Watch
-  `Statistics.Hits`: it stays flat while the cache is in pass-through.
+- The private connection is armed with `CLIENT TRACKING ON REDIRECT <subscriber> NOLOOP` on every master.
+- An interactive or subscriber reconnect re-arms that node and flushes the local cache; the cache serves
+  straight from Redis until every master is armed again.
+- A read whose key was invalidated while the reply was in flight is not cached.
+- If tracking cannot be armed at all, every read goes to Redis and nothing is cached, ever, until it can.
 
-## Performance
+## Docs
 
-Numbers below are quoted from `bench/RedisNearCache.Bench/README.md`; see that file for full methodology.
-Both modes need a Redis server reachable at `localhost:6379` (the repo's `docker compose` container).
-
-**Zero-traffic demo** (`--demo`): seeds a key, reads it once through the near cache (a miss), then reads it
-1,000 more times and checks the server's `cmdstat_get` counter delta:
-
-```text
-1000 reads of 'demo:near-cache:zero-traffic' through the near cache (all should be L1 hits):
-  cmdstat_get calls before : 263325
-  cmdstat_get calls after  : 263325
-  delta (Redis GETs issued): 0  (expected 0)
-
-Write-to-eviction latency  : 1688.0 µs
-
-Statistics: hits=1000 misses=1 invalidations=1 flushes=0 rearms=0 raceDiscards=0
-```
-
-All 1,000 repeated reads were served from L1 with zero Redis traffic; the one external write (from a
-second, separate multiplexer standing in for another client) evicted the local copy in 1688.0 µs, which is
-the invalidation push's round trip: write, Redis, `__redis__:invalidate`, subscriber, L1 evicted.
-
-**BenchmarkDotNet suite**, run on an Apple M4 Pro against a local single-node Redis container
-(`Toolchain=InProcessEmitToolchain`, `RunStrategy=Monitoring`, 10 iterations):
-
-| Method | Kind | Mean | Allocated |
-|---|---|---:|---:|
-| Plain_StringGet | String | 173.717 us | 1360 B |
-| NearCache_Hit | String | 1.604 us | 2144 B |
-| NearCache_Miss | String | 198.658 us | 9088 B |
-| NearCache_TryGetLocal | String | 1.325 us | 2072 B |
-| Plain_StringGet | Json | 276.979 us | 5456 B |
-| NearCache_Hit | Json | 3.967 us | 424 B |
-| NearCache_Miss | Json | 280.596 us | 6472 B |
-| NearCache_TryGetLocal | Json | 2.875 us | 352 B |
-
-`NearCache_Hit` and `NearCache_TryGetLocal` are roughly **100x faster** than a plain Redis round trip in this
-run, because they never leave the process. `NearCache_Miss` lands close to (and, for the string case, a
-little above) `Plain_StringGet`, since both do a real Redis round trip; the near cache's overhead on the
-miss path is locking, in-flight bookkeeping, and deserialization. `RunStrategy.Monitoring` with only 10
-iterations means run-to-run variance is higher than a long `Throughput` run would show; this is a deliberate
-trade-off to keep the whole suite finishing in well under a minute.
+The quickstart, diagrams, configuration, API reference, HybridCache adapter, operations guide and FAQ live
+on the **[documentation site](https://magna-nz.github.io/redis-near-cache/)**.
 
 ## Development
 
-Start the containers Redis needs:
-
-```bash
-docker compose up -d          # standalone Redis 7.4 on localhost:6379
-./cluster-up.sh                # 3-master cluster on 127.0.0.1:7100-7102
-```
-
-Build and test:
-
-```bash
-dotnet build
+```sh
+docker compose up -d      # Redis 7.4 on :6379 with a replica on :6380
+./cluster-up.sh           # 3-master cluster on :7100-7102
 dotnet test tests/RedisNearCache.Tests
 ```
 
-Integration tests expect both containers to be running.
-
-Project layout:
-
-```text
-src/RedisNearCache/                 core library: contracts, private connection, tracking armer,
-                                     invalidation listener, L1 cache, the facade, and DI registration
-src/RedisNearCache.HybridCache/      IDistributedCache / IBufferDistributedCache / HybridCache adapters
-tests/RedisNearCache.Tests/          integration tests and Chaos/ (reconnects, cluster, races, stress)
-bench/RedisNearCache.Bench/          zero-traffic demo and BenchmarkDotNet suite
-samples/MinimalApi, samples/Worker   runnable sample applications
-docs/how-it-works.html              mechanism diagrams
-```
+The tests are integration tests against those containers: reconnects, cluster, races, stress, chaos.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT

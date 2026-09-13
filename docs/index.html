@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RedisNearCache &#8212; server-assisted client-side caching for .NET</title>
+<meta name="description" content="RedisNearCache: a near cache for .NET whose entries are invalidated by the Redis server itself, using CLIENT TRACKING. Layered on StackExchange.Redis 3.2.0.">
+<link rel="icon" href="mark.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650;700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<a class="skip" href="#introduction">Skip to content</a>
+<header class="topbar">
+<img src="mark.svg" alt="">
+<span class="title">RedisNearCache</span>
+<span class="sub">Server-assisted client-side caching for .NET</span>
+<span class="spacer"></span>
+<a class="toplink" href="https://www.nuget.org/packages/RedisNearCache" target="_blank" rel="noopener">NuGet</a>
+<a class="toplink" href="https://github.com/magna-nz/redis-near-cache" target="_blank" rel="noopener">GitHub</a>
+</header>
+<div class="layout">
+<nav class="sidebar" aria-label="Sections">
+<div class="nav-group"><ul><li><a href="#introduction">Introduction</a></li><li><a href="#quickstart">Quickstart</a></li><li><a href="#how-it-works">How it works</a></li><li><a href="#configuration">Configuration</a></li><li><a href="#api-reference">API reference</a><ul class="sub-nav"><li><a href="#getasync">GetAsync</a></li><li><a href="#setasync">SetAsync</a></li><li><a href="#removeasync">RemoveAsync</a></li><li><a href="#evictlocal">EvictLocal</a></li><li><a href="#trygetlocal">TryGetLocal</a></li><li><a href="#statistics">Statistics</a></li><li><a href="#ready">Ready</a></li><li><a href="#redisnearcachestatistics">RedisNearCacheStatistics</a></li><li><a href="#iredisnearcacheserializer">IRedisNearCacheSerializer</a></li><li><a href="#jsonredisnearcacheserializer">JsonRedisNearCacheSerializer</a></li><li><a href="#addrednc-configure">AddRedisNearCache(configure)</a></li><li><a href="#addrednc-connectionstring">AddRedisNearCache(connString)</a></li></ul></li><li><a href="#hybridcache">HybridCache</a><ul class="sub-nav"><li><a href="#addrednc-distributedcache">AddRedisNearCacheDistributedCache</a></li><li><a href="#addrednc-hybridcache">AddRedisNearCacheHybridCache</a></li><li><a href="#redisnearcachedistributedcache">RedisNearCacheDistributedCache</a></li></ul></li><li><a href="#reconnects-cluster">Reconnects and cluster</a></li><li><a href="#operations">Operations</a></li><li><a href="#limitations">Limitations</a></li><li><a href="#performance">Performance</a></li><li><a href="#samples">Samples</a></li><li><a href="#faq">FAQ</a></li></ul></div>
+</nav>
+<div class="main">
+<div class="codeband" aria-hidden="true"></div>
+<section class="section" id="introduction">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Overview</div>
+<h2>Introduction <a class="anchor" href="#introduction" aria-label="Link to this section">#</a></h2>
+<p class="lede">A near cache for .NET whose entries are invalidated by the Redis server itself.</p>
+
+<p>RedisNearCache keeps an in-process copy (an <strong>L1</strong>) of the Redis values your application reads, and lets the Redis server tell you when one of them changes, using the <code>CLIENT TRACKING</code> feature Redis 6 introduced.</p><p><strong>The one-sentence mechanism:</strong> your app keeps an in-process copy of the Redis values it reads, Redis remembers which keys each tracked connection has read, and when <em>any</em> client writes one of those keys, Redis pushes a message naming it and the local copy is thrown away. Nothing in the write path has to cooperate: a Java service, a Go job, or someone at <code>redis-cli</code> all invalidate you the same way.</p>
+<figure><img src="architecture.svg" alt="Architecture: your code calls IRedisNearCache, which serves from L1 or reads over a private interactive connection; Redis sends invalidations to a private subscriber connection which evicts from L1; your own multiplexer and any other writer send writes to Redis directly." style="max-width:100%;height:auto;display:block;border:1px solid var(--rule-strong);border-radius:6px;background:#F6F7F9;padding:8px;"><figcaption>RedisNearCache opens its own private connection to Redis. Your application’s existing <code>IConnectionMultiplexer</code> is never touched, reconfigured, or depended on.</figcaption></figure>
+<h3>Why server-assisted beats a backplane</h3>
+<p>FusionCache and the proposed HybridCache backplane solve staleness with an application-level pub/sub channel that the <em>writer</em> publishes to. That only works when every writer uses the same library and remembers to publish. A writer in another language or process silently leaves readers stale. Server-assisted tracking moves the responsibility to the one place every write already passes through: Redis itself. Any client, in any language, doing a plain <code>SET</code> or <code>DEL</code> (or <code>redis-cli</code> by hand) causes Redis to push an invalidation, with no cooperation required from writers.</p>
+<h3>Requirements</h3>
+<div class="table-wrap"><table><thead><tr><th>Requirement</th><th>Detail</th></tr></thead><tbody><tr><td>Redis server</td><td>Redis 6 or newer, or Valkey (any version that implements <code>CLIENT TRACKING</code>).</td></tr><tr><td>Garnet</td><td>Not supported. Garnet does not implement <code>CLIENT TRACKING</code>.</td></tr><tr><td>.NET</td><td>.NET 8 or .NET 10.</td></tr><tr><td>StackExchange.Redis</td><td>3.2.0 (pinned; see <code>Directory.Packages.props</code>).</td></tr><tr><td>Your own connection</td><td>No special requirements. Any protocol (RESP2 or RESP3), no admin mode needed.</td></tr><tr><td>RedisNearCache's private connection</td><td>Opened by RedisNearCache itself, forced to RESP2 with admin mode (<code>AllowAdmin=true</code>) and its own client name. Required for <code>CLIENT TRACKING</code> and <code>CLIENT LIST</code>, and because StackExchange.Redis 3.x swallows RESP3 invalidation push frames.</td></tr></tbody></table></div>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">install</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">dotnet add package RedisNearCache</code></pre></div>
+<p class="rail-note">One package for the core near cache. <code>RedisNearCache.HybridCache</code> is a separate, optional package covered in <a href="#hybridcache">HybridCache and IDistributedCache</a>.</p></div>
+</div>
+</section>
+<section class="section" id="quickstart">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Get started</div>
+<h2>Quickstart <a class="anchor" href="#quickstart" aria-label="Link to this section">#</a></h2>
+<p class="lede">Install the package, register the cache, and watch an outside write invalidate it.</p>
+
+<h3>1. Install</h3><p>Add the package to your project.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">dotnet add package RedisNearCache</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<h3>2. Register and resolve</h3><p>Register <code>IRedisNearCache</code> against a connection string and resolve it from DI. Await <code>Ready</code> once at startup so the invalidation subscription and the initial tracking arm have completed before you rely on the cache being coherent.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">Program.cs</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">using Microsoft.Extensions.DependencyInjection;
+using RedisNearCache;
+
+var services = new ServiceCollection();
+services.AddRedisNearCache("localhost:6379");
+
+await using var provider = services.BuildServiceProvider();
+var cache = provider.GetRequiredService&lt;IRedisNearCache&gt;();
+
+// Wait for the invalidation subscription and initial arming to complete.
+await cache.Ready;</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<h3>3. Write, then read</h3><p><code>SetAsync</code> writes through to Redis and evicts any local copy. The first <code>GetAsync&lt;T&gt;</code> after that is always a miss: it fetches from Redis, stores the value in L1, and arms server-side tracking for that key. Every read after that is served from L1 with no network call, until the key is invalidated.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">read and remove</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">await cache.SetAsync("user:42", new { Name = "Ada" });
+
+var user = await cache.GetAsync&lt;User&gt;("user:42");     // miss: reads Redis, populates L1, arms tracking
+var again = await cache.GetAsync&lt;User&gt;("user:42");    // hit: served from L1, no network call
+
+await cache.RemoveAsync("user:42");
+
+if (cache.TryGetLocal&lt;User&gt;("user:42", out var local))
+{
+    // local is only set if the key is currently cached in L1; Redis is never touched.
+}
+
+record User(string Name);</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<h3>4. See an invalidation from <code>redis-cli</code></h3><p>Read a key so it is cached, then change it from a completely different client, one that knows nothing about RedisNearCache. The very next read reflects the new value, because Redis itself pushed the invalidation.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash"># in another terminal, or from any language's Redis client
+redis-cli SET user:42 '{"Name":"Grace"}'</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>Back in your application, the next <code>GetAsync&lt;T&gt;("user:42")</code> is a miss (it goes to Redis to re-populate L1 and re-arm tracking) and returns <code>Grace</code>. Every read after that is a hit again, until the next external write.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">stats</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">Console.WriteLine(cache.Statistics);
+// hits=1 misses=1 invalidations=0 flushes=0 rearms=0 raceDiscards=0</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<h3>5. Check the stats</h3><p><code>Statistics</code> exposes six cumulative, thread-safe counters. See <a href="#operations">Operations</a> for what to watch in production.</p>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="how-it-works">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Mechanism</div>
+<h2>How it works <a class="anchor" href="#how-it-works" aria-label="Link to this section">#</a></h2>
+<p class="lede">The private connection, one-shot tracking, NOLOOP writes, and the in-flight guard.</p>
+
+<h3>Why not an app-level backplane</h3>
+<p>FusionCache and the proposed HybridCache backplane solve staleness with pub/sub that the <em>writer</em> publishes to. That only works when every writer uses the same library. Server-assisted tracking moves the responsibility to the one place every write already passes through.</p>
+<figure><div class="diagram"><svg viewBox="0 0 860 250" role="img" aria-label="Two approaches side by side: with a pub/sub backplane the writer must publish an invalidation; with server-assisted tracking Redis itself sends the invalidation for any writer."><defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker><marker id="arc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--crimson)"/></marker></defs><g font-family="JetBrains Mono, monospace" font-size="12" fill="currentColor"><text x="20" y="22" font-weight="500">A. Pub/sub backplane</text><rect x="20" y="40" width="130" height="40" rx="3" fill="none" stroke="currentColor"/><text x="85" y="65" text-anchor="middle">.NET writer</text><rect x="20" y="180" width="130" height="40" rx="3" fill="none" stroke="currentColor"/><text x="85" y="205" text-anchor="middle">Go writer</text><rect x="250" y="110" width="110" height="40" rx="3" fill="none" stroke="currentColor"/><text x="305" y="135" text-anchor="middle">Redis</text><rect x="250" y="40" width="110" height="40" rx="3" fill="none" stroke="currentColor" stroke-dasharray="4 3"/><text x="305" y="65" text-anchor="middle">channel</text><rect x="20" y="110" width="130" height="40" rx="3" fill="none" stroke="var(--teal)"/><text x="85" y="135" text-anchor="middle" fill="var(--teal)">.NET reader + L1</text><line x1="150" y1="60" x2="248" y2="60" stroke="var(--crimson)" marker-end="url(#arc)"/><text x="199" y="52" text-anchor="middle" fill="var(--crimson)" font-size="11">publish</text><line x1="150" y1="70" x2="248" y2="122" stroke="currentColor" marker-end="url(#ar)"/><text x="172" y="98" font-size="11">SET</text><line x1="250" y1="80" x2="152" y2="118" stroke="var(--crimson)" marker-end="url(#arc)"/><text x="232" y="103" text-anchor="end" fill="var(--crimson)" font-size="11">evict</text><line x1="150" y1="200" x2="248" y2="146" stroke="currentColor" marker-end="url(#ar)"/><text x="180" y="185" font-size="11">SET</text><text x="20" y="242" fill="var(--crimson)" font-size="11">Go writer never publishes &#8594; reader stays stale</text><line x1="430" y1="10" x2="430" y2="240" stroke="var(--rule)"/><text x="460" y="22" font-weight="500">B. Server-assisted (this package)</text><rect x="460" y="40" width="130" height="40" rx="3" fill="none" stroke="currentColor"/><text x="525" y="65" text-anchor="middle">.NET writer</text><rect x="460" y="180" width="130" height="40" rx="3" fill="none" stroke="currentColor"/><text x="525" y="205" text-anchor="middle">Go writer</text><rect x="690" y="110" width="110" height="40" rx="3" fill="none" stroke="currentColor"/><text x="745" y="135" text-anchor="middle">Redis</text><text x="745" y="98" text-anchor="middle" font-size="11" fill="var(--muted)">tracks keys per conn</text><rect x="460" y="110" width="130" height="40" rx="3" fill="none" stroke="var(--teal)"/><text x="525" y="135" text-anchor="middle" fill="var(--teal)">.NET reader + L1</text><line x1="590" y1="70" x2="688" y2="122" stroke="currentColor" marker-end="url(#ar)"/><text x="612" y="98" font-size="11">SET</text><line x1="590" y1="200" x2="688" y2="146" stroke="currentColor" marker-end="url(#ar)"/><text x="620" y="185" font-size="11">SET</text><line x1="688" y1="130" x2="592" y2="130" stroke="var(--crimson)" marker-end="url(#arc)"/><text x="640" y="123" text-anchor="middle" fill="var(--crimson)" font-size="11">invalidate key</text><text x="460" y="242" fill="var(--teal)" font-size="11">Any writer &#8594; Redis sends the invalidation</text></g></svg></div><figcaption>In A the reader is only as fresh as the most disciplined writer. In B the server is the single source of invalidations.</figcaption></figure>
+<h3>The parts</h3>
+<p>RedisNearCache opens one private StackExchange.Redis multiplexer, cloned from your connection settings with <code>Protocol=Resp2</code>, <code>AllowAdmin=true</code> and a unique client name. Under RESP2 that multiplexer has two connections per Redis node: an <strong>interactive connection</strong>, used for the actual <code>GET</code>/<code>SET</code> calls, and a <strong>subscriber connection</strong>, which RedisNearCache tells Redis to redirect invalidations to (<code>CLIENT TRACKING ON REDIRECT &lt;subscriber id&gt;</code>). The subscriber subscribes to <code>__redis__:invalidate</code> and turns each incoming message into an eviction from L1.</p>
+<figure><div class="diagram"><svg viewBox="0 0 900 400" role="img" aria-label="Architecture: your code calls IRedisNearCache, which serves from L1 or reads over the private interactive connection; Redis sends invalidations to the private subscriber connection which evicts from L1; your own multiplexer and any other writer send writes to Redis directly."><defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker><marker id="a2c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--crimson)"/></marker><marker id="a2t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--teal)"/></marker></defs><g font-family="JetBrains Mono, monospace" font-size="12" fill="currentColor"><rect x="20" y="20" width="560" height="360" rx="6" fill="none" stroke="var(--rule)" stroke-dasharray="6 4"/><text x="34" y="42" fill="var(--muted)" font-size="11">YOUR PROCESS</text><rect x="40" y="70" width="130" height="44" rx="3" fill="none" stroke="currentColor"/><text x="105" y="97" text-anchor="middle">Your code</text><rect x="220" y="60" width="200" height="130" rx="3" fill="none" stroke="currentColor"/><text x="320" y="82" text-anchor="middle" font-weight="500">IRedisNearCache</text><rect x="240" y="98" width="160" height="34" rx="3" fill="none" stroke="var(--teal)"/><text x="320" y="120" text-anchor="middle" fill="var(--teal)">L1  MemoryCache</text><rect x="240" y="142" width="160" height="34" rx="3" fill="none" stroke="currentColor"/><text x="320" y="164" text-anchor="middle">in-flight set</text><rect x="220" y="220" width="200" height="120" rx="3" fill="none" stroke="currentColor"/><text x="320" y="242" text-anchor="middle" font-weight="500">private multiplexer</text><text x="320" y="258" text-anchor="middle" font-size="11" fill="var(--muted)">RESP2 &#183; allowAdmin &#183; own name</text><rect x="240" y="270" width="160" height="26" rx="3" fill="none" stroke="currentColor"/><text x="320" y="288" text-anchor="middle" font-size="11">interactive conn (tracked)</text><rect x="240" y="304" width="160" height="26" rx="3" fill="none" stroke="var(--crimson)"/><text x="320" y="322" text-anchor="middle" font-size="11" fill="var(--crimson)">subscriber conn (redirect)</text><rect x="40" y="260" width="130" height="60" rx="3" fill="none" stroke="currentColor"/><text x="105" y="285" text-anchor="middle">Your multiplexer</text><text x="105" y="303" text-anchor="middle" font-size="11" fill="var(--muted)">untouched</text><rect x="700" y="200" width="170" height="140" rx="3" fill="none" stroke="currentColor"/><text x="785" y="224" text-anchor="middle" font-weight="500">Redis 6+ / Valkey</text><text x="785" y="246" text-anchor="middle" font-size="11" fill="var(--muted)">tracking table:</text><text x="785" y="262" text-anchor="middle" font-size="11" fill="var(--muted)">key &#8594; client ids</text><text x="785" y="292" text-anchor="middle" font-size="11">CLIENT TRACKING ON</text><text x="785" y="308" text-anchor="middle" font-size="11">REDIRECT &lt;sub id&gt;</text><rect x="700" y="60" width="170" height="60" rx="3" fill="none" stroke="currentColor"/><text x="785" y="84" text-anchor="middle">Other writers</text><text x="785" y="102" text-anchor="middle" font-size="11" fill="var(--muted)">redis-cli, Java, Go, Lua</text><line x1="170" y1="92" x2="218" y2="92" stroke="currentColor" marker-end="url(#a2)"/><text x="194" y="84" text-anchor="middle" font-size="11">GetAsync</text><line x1="320" y1="190" x2="320" y2="218" stroke="currentColor" marker-end="url(#a2)"/><text x="330" y="208" font-size="11">GET on miss</text><line x1="400" y1="283" x2="698" y2="283" stroke="currentColor" marker-end="url(#a2)"/><text x="549" y="276" text-anchor="middle" font-size="11">GET key  (server tracks it)</text><line x1="698" y1="317" x2="402" y2="317" stroke="var(--crimson)" marker-end="url(#a2c)"/><text x="549" y="332" text-anchor="middle" font-size="11" fill="var(--crimson)">message __redis__:invalidate [key]</text><path d="M240 317 L200 317 L200 115 L238 115" fill="none" stroke="var(--crimson)" marker-end="url(#a2c)"/><text x="196" y="230" text-anchor="end" font-size="11" fill="var(--crimson)">evict</text><line x1="170" y1="290" x2="698" y2="290" stroke="currentColor" stroke-dasharray="4 3"/><text x="440" y="356" text-anchor="middle" font-size="11" fill="var(--muted)">writes from your multiplexer (dashed) go straight to Redis; they invalidate like any other writer</text><line x1="785" y1="120" x2="785" y2="198" stroke="currentColor" marker-end="url(#a2)"/><text x="795" y="162" font-size="11">SET key</text></g></svg></div><figcaption>Only reads that go through the package are tracked, because only the package&#8217;s interactive connection is tracked. Writes can come from anywhere.</figcaption><div class="key"><span class="k-plain">reads and writes</span><span class="k-inv">invalidation</span><span class="k-hit">local cache</span></div></figure>
+<h3>One-shot tracking</h3>
+<p>Tracking is <strong>one-shot per key</strong>: after Redis sends an invalidation for a key, it forgets that key was being tracked until the connection reads it again. Every <code>GetAsync&lt;T&gt;</code> miss re-arms tracking for that key by reading it over the tracked interactive connection.</p>
+<figure><div class="diagram"><pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant App as Your code
+    participant NC as RedisNearCache
+    participant L1
+    participant I as interactive conn
+    participant S as subscriber conn
+    participant R as Redis
+    participant W as Any writer
+    App->>NC: GetAsync("user:42")
+    NC->>L1: TryGet
+    L1-->>NC: miss
+    NC->>NC: inflight.Begin(user:42)
+    NC->>I: GET user:42
+    I->>R: GET user:42
+    Note over R: remembers user:42 was read by this connection
+    R-->>I: value v1
+    I-->>NC: value v1
+    NC->>NC: invalidated while in flight? no
+    NC->>L1: Set(user:42, v1)
+    NC-->>App: v1
+    App->>NC: GetAsync("user:42")
+    NC->>L1: TryGet
+    L1-->>NC: hit
+    NC-->>App: v1 (no network)
+    W->>R: SET user:42 v2
+    R->>S: message __redis__:invalidate [user:42]
+    Note over R: forgets user:42 for this connection (one-shot)
+    S->>NC: KeyInvalidated(user:42)
+    NC->>L1: Remove(user:42)
+    App->>NC: GetAsync("user:42")
+    NC->>L1: TryGet
+    L1-->>NC: miss
+    NC->>I: GET user:42
+    I->>R: GET user:42
+    Note over R: tracks user:42 again
+    R-->>NC: value v2
+    NC->>L1: Set(user:42, v2)
+    NC-->>App: v2
+</pre></div><figcaption>Tracking is one-shot per key. After the invalidation Redis forgets the key until the next read re-tracks it.</figcaption></figure>
+<h3>NOLOOP</h3>
+<p>Writes made through RedisNearCache&#8217;s own <code>SetAsync</code>/<code>RemoveAsync</code> are armed with <code>NOLOOP</code>, so Redis does not echo them back as invalidations; RedisNearCache evicts its own L1 entry for the key directly around the write instead.</p>
+<h3>The in-flight guard</h3>
+<p>Because an invalidation can arrive between sending a <code>GET</code> and storing its reply, RedisNearCache keeps an in-flight guard: each read records a version token before the request goes out, and the reply is only stored in L1 if no invalidation for that key was seen in the meantime. A stale reply is still returned to the caller (it was correct when read); it is simply not cached, and <code>Statistics.RaceDiscards</code> counts it.</p>
+<figure><div class="diagram"><pre class="mermaid">
+sequenceDiagram
+    participant NC as RedisNearCache
+    participant L1
+    participant R as Redis
+    participant W as Any writer
+    NC->>NC: token = inflight.Begin(k)  (version 7)
+    NC->>R: GET k
+    R-->>NC: v1 (in transit)
+    W->>R: SET k v2
+    R->>NC: invalidate [k]
+    NC->>NC: inflight.MarkInvalidated(k)  (version 8)
+    NC->>L1: Remove(k)  (nothing there yet)
+    Note over NC: reply v1 arrives
+    NC->>NC: WasInvalidated(k, token)? version 8 &#8800; 7 &#8594; yes
+    NC->>NC: discard v1, Statistics.RaceDiscards++
+    Note over NC: return v1 to the caller (it was true when read); next read fetches v2
+</pre></div><figcaption>The reply is still returned to the caller, which is correct for a read that was valid when issued. It is simply not cached.</figcaption></figure>
+<h3>Reconnects, the part that actually needs care</h3>
+<p>Tracking is per-connection state on the server. The spike showed two silent failure modes, both handled by re-arming and flushing.</p>
+<div class="table-wrap"><table><thead><tr><th>What breaks</th><th>What the server does</th><th>What we do</th></tr></thead><tbody><tr><td>Interactive connection drops and reconnects</td><td>New connection, tracking off (<code>TRACKINGINFO</code> flags=off, redirect=-1). Reads succeed untracked.</td><td>On <code>ConnectionRestored(Interactive)</code>: re-issue <code>CLIENT TRACKING ON REDIRECT</code>, flush L1.</td></tr><tr><td>Subscriber connection drops and reconnects</td><td>New client id. The interactive connection still redirects to the <em>dead</em> id. Invalidations vanish with no error.</td><td>On <code>ConnectionRestored(Subscription)</code>: look up the new id in <code>CLIENT LIST</code>, <code>TRACKING OFF</code> then <code>ON REDIRECT &lt;new id&gt;</code>, flush L1.</td></tr><tr><td>Any connection failed, not yet restored</td><td>Nothing can be trusted.</td><td>Flush L1; serve from Redis until re-armed.</td></tr></tbody></table></div>
+<figure><div class="diagram"><pre class="mermaid">
+sequenceDiagram
+    participant A as TrackingArmer
+    participant L1
+    participant I as interactive conn (id 26)
+    participant S as subscriber conn (id 27 &#8594; 58)
+    participant R as Redis
+    Note over R: redirect target for id 26 is 27
+    R-xS: connection killed
+    S->>R: reconnect, CLIENT ID = 58
+    Note over R: id 26 still redirects to dead 27
+    S-->>A: ConnectionRestored(Subscription)
+    A->>L1: Clear()  (anything missed is gone)
+    A->>R: CLIENT LIST (via interactive)
+    R-->>A: our subscriber = 58
+    A->>R: CLIENT TRACKING OFF
+    A->>R: CLIENT TRACKING ON REDIRECT 58
+    R-->>A: OK
+    A-->>L1: Armed(SubscriptionRestored)
+</pre></div><figcaption>Measured in the spike: the subscriber came back in about 60 ms with a new id while the server kept redirecting to the old one.</figcaption></figure>
+<h4>Per-endpoint state</h4>
+<figure><div class="diagram"><pre class="mermaid">
+stateDiagram-v2
+    [*] --> Unarmed
+    Unarmed --> Arming: StartAsync / find subscriber id
+    Arming --> Armed: TRACKING ON REDIRECT ok
+    Arming --> Arming: subscriber not visible yet, backoff retry
+    Armed --> Lost: ConnectionFailed (either type)
+    Lost --> Arming: ConnectionRestored
+    Armed --> Arming: ConnectionRestored (server dropped or re-pointed)
+    note right of Armed: L1 trusted
+    note right of Lost: L1 flushed, reads pass through
+</pre></div><figcaption>One state machine per master node. Every transition into Arming after the first clears L1.</figcaption></figure>
+<h3>Cluster</h3>
+<p>Client ids and tracking tables live on each node, and a node sends invalidations only for keys it owns. The private multiplexer already keeps an interactive and a subscriber connection per master, so the armer repeats the same dance per node with that node&#8217;s subscriber id.</p>
+<figure><div class="diagram"><pre class="mermaid">
+flowchart LR
+    subgraph P[private multiplexer]
+      direction TB
+      A1[interactive &#8594; 7100]
+      S1[subscriber id 11]
+      A2[interactive &#8594; 7101]
+      S2[subscriber id 7]
+      A3[interactive &#8594; 7102]
+      S3[subscriber id 7]
+    end
+    subgraph C[cluster]
+      N1[(master 7100<br/>slots 0-5460)]
+      N2[(master 7101<br/>slots 5461-10922)]
+      N3[(master 7102<br/>slots 10923-16383)]
+    end
+    A1 -- "TRACKING ON REDIRECT 11" --> N1
+    A2 -- "TRACKING ON REDIRECT 7" --> N2
+    A3 -- "TRACKING ON REDIRECT 7" --> N3
+    N1 -. "invalidate spike:c1" .-> S1
+    N2 -. "invalidate spike:c3" .-> S2
+    N3 -. "invalidate spike:c2" .-> S3
+</pre></div><figcaption>Ids from the spike&#8217;s cluster run: two nodes both handed out id 7, which is why an id is only meaningful together with its node.</figcaption></figure>
+<h3>What was ruled out, and why</h3>
+<div class="table-wrap"><table><thead><tr><th>Option</th><th>Finding</th></tr></thead><tbody><tr><td>Use your existing multiplexer</td><td>Every <code>CLIENT TRACKING</code> and <code>CLIENT LIST</code> call needs <code>allowAdmin</code>, and every read on it would be tracked, cache or not.</td></tr><tr><td>RESP3 push messages (the 3.x default)</td><td>StackExchange.Redis collapses to one connection and drops the <code>invalidate</code> pushes. Server says tracking is on; zero messages arrive.</td></tr><tr><td>Lua to bypass admin mode</td><td><code>CLIENT TRACKING</code> is flagged <code>noscript</code>.</td></tr><tr><td><code>OPTIN</code> / <code>CLIENT CACHING YES</code></td><td>Must be adjacent on the wire to the next command; impossible on a multiplexed connection. Selection lives in the package instead.</td></tr><tr><td>Raw-socket sidecar per node</td><td>Works, kept as fallback. It re-implements TLS, auth, topology and reconnects that the library already provides.</td></tr><tr><td>Garnet</td><td>Does not implement <code>CLIENT TRACKING</code>. Redis 6+ and Valkey do.</td></tr></tbody></table></div>
+</div>
+<div class="rail"><p class="rail-note">The mechanism diagrams and mermaid sequences on this page are reused verbatim from <code>docs/how-it-works.html</code>.</p></div>
+</div>
+</section>
+<section class="section" id="configuration">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Setup</div>
+<h2>Configuration <a class="anchor" href="#configuration" aria-label="Link to this section">#</a></h2>
+<p class="lede">Two ways to register the cache, and every option on RedisNearCacheOptions.</p>
+
+<p><code>AddRedisNearCache</code> has two overloads. Both register <code>IRedisNearCache</code> as a singleton together with the private connection, the tracking armer, and the invalidation listener it depends on.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">connection string overload</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">services.AddRedisNearCache("localhost:6379");</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>The convenience overload takes a connection string directly and sets <code>RedisNearCacheOptions.ConnectionString</code>.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">options overload</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">services.AddRedisNearCache(options =&gt;
+{
+    options.ConnectionString = "localhost:6379";
+    options.KeyPrefixes.Add("user:");
+    options.L1MaxAge = TimeSpan.FromMinutes(5);
+});</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>The full overload takes an <code>Action&lt;RedisNearCacheOptions&gt;</code> and lets you set every option, including <code>Configuration</code> (a <code>ConfigurationOptions</code> instance) instead of a plain connection string. Either <code>Configuration</code> or <code>ConnectionString</code> must end up set; resolving <code>IRedisNearCache</code> without one throws <code>InvalidOperationException</code>.</p>
+<h3>RedisNearCacheOptions</h3>
+<div class="table-wrap"><table><thead><tr><th>Property</th><th>Default</th><th>What it does</th></tr></thead><tbody><tr><td><code>Configuration</code></td><td><code>null</code></td><td><code>ConfigurationOptions</code> for the Redis deployment. RedisNearCache clones this and forces <code>Protocol=Resp2</code>, <code>AllowAdmin=true</code> and its own <code>ClientName</code>. Either this or <code>ConnectionString</code> must be set.</td></tr><tr><td><code>ConnectionString</code></td><td><code>null</code></td><td>Alternative to <code>Configuration</code>; parsed with <code>ConfigurationOptions.Parse</code>.</td></tr><tr><td><code>KeyPrefixes</code></td><td>empty</td><td>Key prefixes that RedisNearCache will cache locally. Reads of keys outside these prefixes still go through RedisNearCache to Redis but are not stored in L1, so they cost nothing to invalidate. Empty (the default) means every key read through RedisNearCache is cached.</td></tr><tr><td><code>L1SizeLimit</code></td><td><code>10_000</code></td><td>Maximum number of entries held in L1. Least-recently-used entries are evicted beyond this.</td></tr><tr><td><code>L1MaxAge</code></td><td>5 minutes</td><td>Safety net: an L1 entry is dropped after this age even if no invalidation arrived. Protects against a missed invalidation. Set to <code>Timeout.InfiniteTimeSpan</code> to disable.</td></tr><tr><td><code>Serializer</code></td><td><code>JsonRedisNearCacheSerializer.Instance</code></td><td>Serializer for values. Defaults to System.Text.Json; <code>string</code> and <code>byte[]</code> are passed through untouched.</td></tr><tr><td><code>ClientNamePrefix</code></td><td><code>"rnc"</code></td><td>Prefix for the Redis client name RedisNearCache sets on its own connections. A unique suffix is appended.</td></tr></tbody></table></div>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">custom serializer</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">using System.Text.Json;
+
+services.AddRedisNearCache(options =&gt;
+{
+    options.ConnectionString = "localhost:6379";
+    options.Serializer = new JsonRedisNearCacheSerializer(new JsonSerializerOptions
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    });
+});</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<h3>Serializer customisation</h3><p>The default <code>JsonRedisNearCacheSerializer</code> uses <code>System.Text.Json</code>, with <code>string</code> and <code>byte[]</code> passed through untouched (no double-encoding, which matters for the <code>IDistributedCache</code> adapter). Pass your own <code>JsonSerializerOptions</code> to the constructor, or implement <code>IRedisNearCacheSerializer</code> directly for a non-JSON format.</p>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="api-reference">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Reference</div>
+<h2>API reference <a class="anchor" href="#api-reference" aria-label="Link to this section">#</a></h2>
+<p class="lede">Every public member of RedisNearCache, one entry at a time.</p>
+
+<div class="member" id="getasync">
+<div class="row">
+<div class="prose">
+<h3>GetAsync&amp;lt;T&amp;gt;<span class="pill">method</span> <a class="anchor" href="#getasync" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">ValueTask&lt;T?&gt; GetAsync&lt;T&gt;(string key, CancellationToken cancellationToken = default)</div>
+<p>Gets the value stored at <code>key</code>, serving from L1 when present and tracked. On a miss, reads the key over RedisNearCache&#8217;s tracked interactive connection, which arms server-side tracking for it, stores it in L1 if the key matches <code>KeyPrefixes</code>, and returns it.</p>
+<div class="returns"><strong>Returns</strong> the deserialized value, or <code>default</code> when the key does not exist in Redis.</div>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">ValueTask&lt;T?&gt; GetAsync&lt;T&gt;(
+    string key,
+    CancellationToken cancellationToken = default);</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="setasync">
+<div class="row">
+<div class="prose">
+<h3>SetAsync&amp;lt;T&amp;gt;<span class="pill">method</span> <a class="anchor" href="#setasync" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">ValueTask SetAsync&lt;T&gt;(string key, T value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)</div>
+<p>Writes <code>value</code> to Redis through RedisNearCache&#8217;s own connection (armed with <code>NOLOOP</code> so the write does not invalidate itself) and evicts any L1 copy. The next <code>GetAsync&lt;T&gt;</code> re-reads and re-tracks the key. <code>SetAsync</code> does not populate L1 itself; write-through population of L1 is out of scope for v1.</p>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">ValueTask SetAsync&lt;T&gt;(
+    string key,
+    T value,
+    TimeSpan? expiry = null,
+    CancellationToken cancellationToken = default);</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="removeasync">
+<div class="row">
+<div class="prose">
+<h3>RemoveAsync<span class="pill">method</span> <a class="anchor" href="#removeasync" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">ValueTask&lt;bool&gt; RemoveAsync(string key, CancellationToken cancellationToken = default)</div>
+<p>Deletes the key in Redis and evicts any L1 copy.</p>
+<div class="returns"><strong>Returns</strong> whether the key existed in Redis.</div>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">ValueTask&lt;bool&gt; RemoveAsync(
+    string key,
+    CancellationToken cancellationToken = default);</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="evictlocal">
+<div class="row">
+<div class="prose">
+<h3>EvictLocal<span class="pill">method</span> <a class="anchor" href="#evictlocal" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">void EvictLocal(string key)</div>
+<p>Evicts the L1 copy only. Redis is not touched. Use this to force the next read to re-fetch from Redis without deleting the key.</p>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">void EvictLocal(string key);</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="trygetlocal">
+<div class="row">
+<div class="prose">
+<h3>TryGetLocal&amp;lt;T&amp;gt;<span class="pill">method</span> <a class="anchor" href="#trygetlocal" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">bool TryGetLocal&lt;T&gt;(string key, out T? value)</div>
+<p>Returns <code>true</code> and the L1 value when the key is currently cached locally. Never touches Redis, so this never blocks and never counts as a hit or miss against Redis traffic.</p>
+<div class="returns"><strong>Returns</strong> <code>true</code> if the key is cached in L1 right now.</div>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">bool TryGetLocal&lt;T&gt;(string key, out T? value);</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="statistics">
+<div class="row">
+<div class="prose">
+<h3>Statistics<span class="pill">property</span> <a class="anchor" href="#statistics" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">RedisNearCacheStatistics Statistics { get; }</div>
+<p>Counters for hits, misses, invalidations, flushes, re-arms and race discards. See <a href="#redisnearcachestatistics">RedisNearCacheStatistics</a> below and <a href="#operations">Operations</a> for what to watch.</p>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">RedisNearCacheStatistics Statistics { get; }</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="ready">
+<div class="row">
+<div class="prose">
+<h3>Ready<span class="pill">property</span> <a class="anchor" href="#ready" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">Task Ready { get; }</div>
+<p>Completes once the invalidation subscription is up and the initial arming pass over every master has finished. Masters that could not be armed are retried in the background every 5 seconds; until every master is armed the cache serves every read from Redis and stores nothing locally (pass-through). <strong>Faults only if no master could be armed at all</strong>, in which case the cache stays in pass-through mode permanently.</p>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">Task Ready { get; }</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="redisnearcachestatistics">
+<div class="row">
+<div class="prose">
+<h3>RedisNearCacheStatistics<span class="pill">class</span> <a class="anchor" href="#redisnearcachestatistics" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">public sealed class RedisNearCacheStatistics</div>
+<p>Six thread-safe, cumulative counters, each backed by <code>Interlocked</code>/<code>Volatile</code>. Sample them periodically and graph the rate, not the raw value.</p><div class="table-wrap"><table><thead><tr><th>Counter</th><th>Meaning</th></tr></thead><tbody><tr><td><code>Hits</code></td><td>Reads served from L1 without touching Redis.</td></tr><tr><td><code>Misses</code></td><td>Reads that went to Redis.</td></tr><tr><td><code>Invalidations</code></td><td>Per-key invalidation messages received from the server.</td></tr><tr><td><code>Flushes</code></td><td>Whole-cache flushes (null invalidation, reconnect, re-arm).</td></tr><tr><td><code>Rearms</code></td><td>Times <code>CLIENT TRACKING</code> was (re)issued on an endpoint after the initial arm.</td></tr><tr><td><code>RaceDiscards</code></td><td>Redis replies discarded because an invalidation for the key arrived while the read was in flight.</td></tr></tbody></table></div>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">ToString()</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">cache.Statistics.ToString();
+// "hits=1 misses=1 invalidations=0 flushes=0 rearms=0 raceDiscards=0"</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="iredisnearcacheserializer">
+<div class="row">
+<div class="prose">
+<h3>IRedisNearCacheSerializer<span class="pill">interface</span> <a class="anchor" href="#iredisnearcacheserializer" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">public interface IRedisNearCacheSerializer</div>
+<p>Converts values to and from the bytes stored in Redis. Implement this to plug in a non-JSON format.</p>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">byte[] Serialize&lt;T&gt;(T value);
+T? Deserialize&lt;T&gt;(ReadOnlyMemory&lt;byte&gt; data);</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="jsonredisnearcacheserializer">
+<div class="row">
+<div class="prose">
+<h3>JsonRedisNearCacheSerializer<span class="pill">class</span> <a class="anchor" href="#jsonredisnearcacheserializer" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">public sealed class JsonRedisNearCacheSerializer : IRedisNearCacheSerializer</div>
+<p>Default serializer: <code>System.Text.Json</code>, with <code>string</code> and <code>byte[]</code> passed through untouched (no double-encoding). <code>Instance</code> is a shared instance using <code>JsonSerializerOptions.Default</code>; the constructor takes custom <code>JsonSerializerOptions</code>.</p>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">public static JsonRedisNearCacheSerializer Instance { get; }
+
+public JsonRedisNearCacheSerializer(JsonSerializerOptions options);</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="addrednc-configure">
+<div class="row">
+<div class="prose">
+<h3>AddRedisNearCache(configure)<span class="pill">method</span> <a class="anchor" href="#addrednc-configure" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">IServiceCollection AddRedisNearCache(this IServiceCollection services, Action&lt;RedisNearCacheOptions&gt; configure)</div>
+<p>Adds <code>IRedisNearCache</code> as a singleton, together with the private connection, tracking armer and invalidation listener it depends on. <code>configure</code> must set either <code>RedisNearCacheOptions.Configuration</code> or <code>RedisNearCacheOptions.ConnectionString</code>; otherwise resolving <code>IRedisNearCache</code> throws <code>InvalidOperationException</code>.</p>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">public static IServiceCollection AddRedisNearCache(
+    this IServiceCollection services,
+    Action&lt;RedisNearCacheOptions&gt; configure);</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="addrednc-connectionstring">
+<div class="row">
+<div class="prose">
+<h3>AddRedisNearCache(connectionString)<span class="pill">method</span> <a class="anchor" href="#addrednc-connectionstring" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">IServiceCollection AddRedisNearCache(this IServiceCollection services, string connectionString, Action&lt;RedisNearCacheOptions&gt;? configure = null)</div>
+<p>Convenience overload that sets <code>RedisNearCacheOptions.ConnectionString</code>. An optional <code>configure</code> callback runs after that, so it can still set every other option.</p>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">public static IServiceCollection AddRedisNearCache(
+    this IServiceCollection services,
+    string connectionString,
+    Action&lt;RedisNearCacheOptions&gt;? configure = null);</code></pre></div></div>
+</div>
+</div>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="hybridcache">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Integration</div>
+<h2>HybridCache and IDistributedCache <a class="anchor" href="#hybridcache" aria-label="Link to this section">#</a></h2>
+<p class="lede">An optional package that adapts IRedisNearCache to the standard distributed-cache abstractions.</p>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">dotnet add package RedisNearCache.HybridCache</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>A separate package from the core library.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">Program.cs</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">services.AddRedisNearCache("localhost:6379");
+services.AddRedisNearCacheHybridCache();</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>This registers <code>RedisNearCacheDistributedCache</code> as both <code>IDistributedCache</code> and <code>IBufferDistributedCache</code>, backed by the <code>IRedisNearCache</code> that <code>AddRedisNearCache</code> already registered, and then calls <code>AddHybridCache</code> so that <code>Microsoft.Extensions.Caching.Hybrid.HybridCache</code> uses RedisNearCache as its distributed tier. Use <code>AddRedisNearCacheDistributedCache()</code> alone if you only want the <code>IDistributedCache</code>/<code>IBufferDistributedCache</code> adapters (for session state, output caching, etc.) without <code>HybridCache</code>.</p>
+<div class="member" id="addrednc-distributedcache">
+<div class="row">
+<div class="prose">
+<h3>AddRedisNearCacheDistributedCache<span class="pill">method</span> <a class="anchor" href="#addrednc-distributedcache" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">IServiceCollection AddRedisNearCacheDistributedCache(this IServiceCollection services)</div>
+<p>Registers <code>RedisNearCacheDistributedCache</code> as a singleton, exposed as both <code>IDistributedCache</code> and <code>IBufferDistributedCache</code>, backed by the <code>IRedisNearCache</code> that <code>AddRedisNearCache</code> must already have registered. Resolving either interface without a prior call to <code>AddRedisNearCache</code> throws <code>InvalidOperationException</code> when <code>IRedisNearCache</code> itself is resolved, not from this method.</p>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">public static IServiceCollection AddRedisNearCacheDistributedCache(
+    this IServiceCollection services);</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="addrednc-hybridcache">
+<div class="row">
+<div class="prose">
+<h3>AddRedisNearCacheHybridCache<span class="pill">method</span> <a class="anchor" href="#addrednc-hybridcache" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">IServiceCollection AddRedisNearCacheHybridCache(this IServiceCollection services, Action&lt;HybridCacheOptions&gt;? configure = null)</div>
+<p>Registers <code>RedisNearCacheDistributedCache</code> (via <code>AddRedisNearCacheDistributedCache</code>) and then calls <code>AddHybridCache</code>. Requires a prior call to <code>AddRedisNearCache</code>.</p><p><strong>Why <code>DisableLocalCache</code>.</strong> <code>HybridCache</code> keeps its own in-process L1 in front of whatever <code>IDistributedCache</code> it is given, and that L1 knows nothing about Redis invalidations: only RedisNearCache&#8217;s own L1 is evicted when the server invalidates a key. Two L1s where only one is coherent would let <code>HybridCache</code> keep serving a value RedisNearCache already evicted. So unless <code>configure</code> overrides it, this sets <code>HybridCacheOptions.DefaultEntryOptions.Flags</code> to <code>HybridCacheEntryFlags.DisableLocalCache</code>. Every <code>HybridCache</code> read then goes to <code>IDistributedCache</code>, i.e. RedisNearCache&#8217;s tracked L1, so a hit is still served in-process. Flags merge per call: a <code>HybridCacheEntryOptions</code> passed to <code>GetOrCreateAsync</code> with <code>Flags == null</code> inherits the default flags, so <code>GetOrCreateAsync(key, factory, new HybridCacheEntryOptions { Expiration = ... })</code> keeps the local cache disabled. If you pass explicit <code>Flags</code> per call, keep <code>DisableLocalCache</code> in them. A small <code>LocalCacheExpiration</code> would not have worked: a per-call <code>Expiration</code> silently becomes the local expiration too, which is how an earlier build of this adapter served stale values for the full entry lifetime.</p><div class="note"><p><strong>The factory may run twice before the background write lands.</strong> <code>HybridCache</code> writes a freshly computed value to the distributed tier in the background, so a second <code>GetOrCreateAsync</code> issued before that write lands (well under 10 ms locally) may run the factory again. Concurrent callers are still coalesced by <code>HybridCache</code>&#8217;s stampede protection. That is an occasional extra factory call, never a stale read.</p></div>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">public static IServiceCollection AddRedisNearCacheHybridCache(
+    this IServiceCollection services,
+    Action&lt;HybridCacheOptions&gt;? configure = null);</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="redisnearcachedistributedcache">
+<div class="row">
+<div class="prose">
+<h3>RedisNearCacheDistributedCache<span class="pill">class</span> <a class="anchor" href="#redisnearcachedistributedcache" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">public sealed class RedisNearCacheDistributedCache : IDistributedCache, IBufferDistributedCache</div>
+<p>Adapts <code>IRedisNearCache</code> to <code>IDistributedCache</code> and <code>IBufferDistributedCache</code>. Values are stored as raw <code>byte[]</code>/<code>ReadOnlySequence&lt;byte&gt;</code> through <code>IRedisNearCache.GetAsync&lt;T&gt;</code> and <code>SetAsync&lt;T&gt;</code> instantiated at <code>byte[]</code>; the default <code>IRedisNearCacheSerializer</code> passes <code>byte[]</code> through untouched, so no double-encoding happens. Every sync member (<code>Get</code>, <code>Set</code>, <code>Remove</code>, <code>TryGet</code>) simply calls its async counterpart and blocks with <code>.GetAwaiter().GetResult()</code>; prefer the async members.</p><p><strong>Sliding expiration limitation.</strong> Redis TTLs, and RedisNearCache&#8217;s <code>SetAsync</code>, have no notion of a sliding window. <code>DistributedCacheEntryOptions.SlidingExpiration</code> is mapped to a plain absolute expiry equal to the sliding window, applied once at write time, and is never extended by a later read.</p><p><strong><code>Refresh</code>/<code>RefreshAsync</code> are no-ops</strong> for this reason: the Redis TTL set at write time is authoritative until the key expires, is overwritten, or is deleted. Callers that need a true sliding window must re-<code>Set</code> on each access themselves.</p>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">expiry resolution</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">// DistributedCacheEntryOptions -&gt; TimeSpan? passed to SetAsync
+// 1. AbsoluteExpirationRelativeToNow, if set
+// 2. AbsoluteExpiration, converted to a relative duration
+// 3. SlidingExpiration, treated as an absolute expiry
+// null (never expires) if none of the three is set</code></pre></div></div>
+</div>
+</div>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="reconnects-cluster">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Resilience</div>
+<h2>Reconnects and cluster <a class="anchor" href="#reconnects-cluster" aria-label="Link to this section">#</a></h2>
+<p class="lede">Tracking is per-connection state on the server. A reconnect of either connection invalidates it.</p>
+
+<p>Tracking is state Redis holds per connection, so a reconnect of either of RedisNearCache&#8217;s own connections (on any node) invalidates that state.</p>
+<div class="table-wrap"><table><thead><tr><th>Event</th><th>What Redis does</th><th>What RedisNearCache does</th></tr></thead><tbody><tr><td>Interactive connection reconnects</td><td>Server drops tracking entirely (<code>CLIENT TRACKINGINFO</code> reports <code>flags=off</code>, <code>redirect=-1</code>).</td><td>Re-issues <code>CLIENT TRACKING ON REDIRECT</code> on that node, then flushes L1.</td></tr><tr><td>Subscriber connection reconnects</td><td>Server keeps redirecting to the now-dead old client id; invalidations are silently lost.</td><td>Looks up the new subscriber client id via <code>CLIENT LIST</code>, re-issues <code>CLIENT TRACKING OFF</code> then <code>ON REDIRECT &lt;new id&gt;</code>, then flushes L1.</td></tr><tr><td>Cluster topology change (a master added/rediscovered)</td><td>Slots may have moved to the new master.</td><td>Arms the new master, then flushes L1 (<code>ArmReason.TopologyChanged</code>); masters already armed are left alone.</td></tr><tr><td>Any connection failed but not yet restored</td><td>Nothing can be trusted.</td><td>Flushes L1 and serves every read straight from Redis (no caching) until that node is re-armed.</td></tr></tbody></table></div>
+<p>Every re-arm after the very first one, and every &#8220;tracking lost&#8221; event, flushes L1 completely: anything invalidated during the gap would otherwise be lost. <code>Statistics.Rearms</code> counts each re-arm issued after the initial pass, and <code>Statistics.Flushes</code> counts every whole-cache flush (a null invalidation/<code>FLUSHDB</code>, a lost connection, or a re-arm). On a cluster, each master node is armed and re-armed independently: losing one node&#8217;s connections flushes L1 (nothing can be trusted while any node is unarmed) but only that node is re-armed.</p>
+<h3>Pass-through mode</h3>
+<p>Caching is only enabled while every known master is believed armed. The moment any endpoint is lost, the facade stops populating and reading L1 for <em>every</em> key, not only that endpoint&#8217;s keys, and flushes what is already there; reads go straight to Redis until that endpoint re-arms. This is what <code>Ready</code>&#8217;s doc comment calls pass-through: nothing is stored locally, so nothing can go stale from the gap.</p>
+<h3>Background retry every 5 seconds</h3>
+<p>An arm that exhausts its fast retry ladder does not give up: RedisNearCache starts a background loop, at most one per endpoint, that retries the arm every 5 seconds until it succeeds, the endpoint stops being a master, or the cache is disposed. A successful background retry is always reported with <code>ArmReason.Recovered</code>, which flushes L1 the same way any other re-arm does, because reads that were in flight while the node was untracked cannot be trusted.</p>
+<h3>Topology changes and EndpointRemoved</h3>
+<p>On a cluster configuration change, RedisNearCache arms any master it has never armed (<code>ArmReason.TopologyChanged</code>) and leaves already-armed masters alone. If a previously known master stops being a master (or drops out of the deployment) and a retry loop is still chasing it, RedisNearCache stops retrying and raises an internal <code>EndpointRemoved</code> event so that a node which will never come back does not keep the whole cache stuck in pass-through forever.</p>
+<h3>Replicas are ignored</h3>
+<p>Only masters are armed. A replica is never a valid arm target: <code>CLIENT TRACKING</code> is issued per master node, and RedisNearCache&#8217;s internal check for &#8220;is this a master we track&#8221; excludes replicas outright, whether or not the replica is currently connected.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">log line: re-arm</span><span class="cb-lang">text</span></div><pre><code class="language-text">info: RedisNearCache.Tracking.TrackingArmer[0]
+      RedisNearCache armed CLIENT TRACKING on Unspecified/localhost:6379 redirecting to client 3562 (Initial)</code></pre></div>
+<p class="rail-note">See <a href="#operations">Operations</a> for the full set of log categories and what to watch.</p></div>
+</div>
+</section>
+<section class="section" id="operations">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Running it</div>
+<h2>Operations <a class="anchor" href="#operations" aria-label="Link to this section">#</a></h2>
+<p class="lede">Logging categories, statistics to graph, detecting a lost endpoint, and sizing L1.</p>
+
+<p>RedisNearCache does not register logging itself; if the host never called <code>AddLogging</code>, it silently uses a no-op logger. Wire up <code>ILoggerFactory</code> in your host to see any of this.</p>
+<h3>Logging categories</h3>
+<div class="table-wrap"><table><thead><tr><th>Category</th><th>What it logs</th></tr></thead><tbody><tr><td><code>RedisNearCache.Internal.RedisNearCacheConnection</code></td><td>One <code>Information</code> line on connect: the client name and endpoints of the private multiplexer.</td></tr><tr><td><code>RedisNearCache.Tracking.TrackingArmer</code></td><td>The most operationally important category. <code>Information</code> for every successful arm/re-arm (with the endpoint, redirect client id, and <code>ArmReason</code>) and for <code>ConnectionRestored</code>/topology-change events triggering a re-arm. <code>Warning</code> for a retry attempt, for &#8220;no connected master to arm&#8221;, for giving up after the retry ladder is exhausted, and for a lost connection (<code>ConnectionFailed</code>). <code>Debug</code>/<code>Trace</code> for verification detail (<code>CLIENT TRACKINGINFO</code> replies, skipped replicas).</td></tr><tr><td><code>RedisNearCache.Tracking.InvalidationListener</code></td><td><code>Information</code> once, on subscribing. <code>Debug</code> for a null (<code>FLUSHDB</code>/<code>FLUSHALL</code>) invalidation. <code>Trace</code> for every single-key invalidation (high-volume; do not run at <code>Trace</code> in production unless actively diagnosing). <code>Error</code> if handling a message throws (should not happen).</td></tr><tr><td><code>RedisNearCache.Caching.RedisNearCache</code></td><td><code>Error</code> if the initial <code>StartAsync</code> (listener + armer) fails entirely, i.e. the near cache will never be coherent for at least one endpoint.</td></tr></tbody></table></div>
+<div class="note"><p><strong>What to watch in production.</strong> <code>Warning</code>-level messages from <code>TrackingArmer</code> are the signal that something is wrong: a node that could not be armed after retries, or a connection that dropped and has not come back. A steady stream of <code>Information</code>-level &#8220;re-arming&#8221; messages (rather than occasional ones around deploys/restarts) suggests something is repeatedly killing the private connections.</p></div>
+<h3>Statistics to graph</h3>
+<p><code>IRedisNearCache.Statistics</code> exposes six thread-safe counters. Sample them periodically (they are cumulative, so graph the rate/delta, not the raw value) rather than trying to log every change.</p>
+<div class="table-wrap"><table><thead><tr><th>Counter</th><th>What a change means</th><th>What to watch for</th></tr></thead><tbody><tr><td><code>Hits</code></td><td>A read served entirely from L1, no Redis call.</td><td>The primary payoff metric. Compare against <code>Misses</code> for a hit ratio.</td></tr><tr><td><code>Misses</code></td><td>A read that went to Redis (first read of a key, or after eviction/expiry).</td><td>A sudden sustained rise (with a proportional <code>Flushes</code>/<code>Rearms</code> rise) usually means something is invalidating or flushing more than expected.</td></tr><tr><td><code>Invalidations</code></td><td>A per-key invalidation message received from the server.</td><td>Should track your actual external write volume against tracked keys. Unexpectedly high counts on a specific key are the signal to move it out of <code>KeyPrefixes</code>.</td></tr><tr><td><code>Flushes</code></td><td>A whole-cache L1 clear: a null invalidation, a lost connection, or any re-arm after the first.</td><td>Should be rare in steady state. A rising rate means reconnects are happening repeatedly; check <code>TrackingArmer</code> warnings for why.</td></tr><tr><td><code>Rearms</code></td><td><code>CLIENT TRACKING</code> was (re)issued on an endpoint after its initial arm.</td><td>Same signal as <code>Flushes</code> (every re-arm causes a flush) but isolates the reconnect-driven case from <code>FLUSHDB</code>/<code>FLUSHALL</code>.</td></tr><tr><td><code>RaceDiscards</code></td><td>A Redis reply was thrown away because an invalidation for that key arrived while the read was still in flight.</td><td>Expected to be occasionally non-zero under concurrent read/write load on the same key; a value comparable to <code>Misses</code> suggests either very hot keys or unusually high latency to Redis.</td></tr></tbody></table></div>
+<h3>Detecting a lost or unarmed endpoint</h3>
+<p>There is no dedicated &#8220;is everything armed&#8221; property, but you can reconstruct the current state from the pieces the library already exposes.</p><ul><li><strong>Logs.</strong> <code>TrackingArmer</code> logs <code>Warning</code> for <code>ConnectionFailed</code> and for giving up on the retry ladder. Alert on these.</li><li><strong>Statistics.</strong> A rising <code>Flushes</code>/<code>Rearms</code> rate, or <code>Hits</code> dropping to near zero while <code>Misses</code> stays high, both indicate pass-through mode on at least one endpoint.</li><li><strong><code>Ready</code>.</strong> Awaiting <code>cache.Ready</code> only tells you whether <em>at least one</em> master armed during startup; it does not fault for a single node that failed to arm among several, and it does not report a later loss. Treat a completed <code>Ready</code> as &#8220;the cache is usable&#8221;, not &#8220;every node is armed&#8221;.</li><li><strong>Direct check against Redis.</strong> <code>CLIENT LIST</code> filtered to RedisNearCache&#8217;s client name (<code>ClientNamePrefix</code>, default <code>rnc-&lt;guid&gt;</code>) and the <code>P</code> (pub/sub subscriber) flag tells you whether the subscriber connection currently exists; <code>CLIENT TRACKINGINFO</code> on the interactive connection reports whether tracking is on and what it currently redirects to.</li></ul>
+<h3>Sizing L1</h3>
+<p><code>L1SizeLimit</code> (default <code>10_000</code>) counts entries, not bytes: every stored value costs a size of 1 regardless of how large it is. There is no automatic memory-based eviction, so size the limit based on (expected working-set key count) rather than a memory budget, and separately estimate memory as (number of entries you expect resident) &#215; (average serialized value size). If your key space includes large or infrequently-reused values you would rather not hold in-process at all, use <code>KeyPrefixes</code> to opt only the keys worth caching into L1.</p><p><code>L1MaxAge</code> (default 5 minutes) is a time-based safety net independent of size: it bounds how long a value can survive after a missed invalidation, not a sizing lever by itself. Setting it very high increases the blast radius of anything that does get missed; setting it very low pushes more traffic back to Redis even when tracking is working correctly.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">CLIENT LIST filtered</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">redis-cli CLIENT LIST | grep 'name=rnc-'</code></pre></div></div>
+</div>
+</section>
+<section class="section" id="limitations">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Boundaries</div>
+<h2>Limitations <a class="anchor" href="#limitations" aria-label="Link to this section">#</a></h2>
+
+
+<ul><li><strong>RESP3 push tracking is not used.</strong> StackExchange.Redis 3.x collapses RESP3 to a single connection and swallows the invalidation push frames on it, so RedisNearCache always forces RESP2 for its own connection.</li><li><strong>No <code>OPTIN</code>/<code>OPTOUT</code> tracking mode.</strong> <code>CLIENT CACHING YES</code> must be sent immediately adjacent to the next command on the wire, which is not guaranteed on a multiplexed connection. Selection of what gets cached is done in the library instead, via <code>KeyPrefixes</code>.</li><li><strong>Garnet is not supported.</strong> Garnet does not implement <code>CLIENT TRACKING</code>.</li><li><strong>TTL expiry is only reflected in L1 once Redis actually expires the key.</strong> Redis&#8217;s active expiry cycle, not the TTL deadline itself, is what triggers the invalidation push; there can be a gap between a key&#8217;s TTL elapsing and Redis noticing and sending the invalidation. <code>L1MaxAge</code> is the safety net for this and for any other missed invalidation.</li><li><strong>Per-write invalidation cost on hot keys.</strong> Every write to a tracked key causes Redis to push an invalidation to every reader that had it tracked; a very hot key can mean a lot of pushes. Use <code>KeyPrefixes</code> to opt only the keys you actually want cached into L1, so writes to everything else cost nothing extra.</li><li><strong><code>Ready</code> only faults if no master could be armed at all.</strong> If some masters armed and others did not, <code>Ready</code> completes, but the cache stays in pass-through until every master is armed. Unarmed masters are retried in the background every 5 seconds. Watch <code>Statistics.Hits</code>: it stays flat while the cache is in pass-through.</li><li><strong>Sentinel, ElastiCache, and Azure Managed Redis are not yet tested.</strong> The tests in this repository run against a plain standalone Redis 7.4 container and a 3-master Redis Cluster started via <code>cluster-up.sh</code>. Nothing in the design specifically depends on the absence of Sentinel or a managed offering, but no test exercises those configurations, so this is genuinely untested rather than a documented guarantee.</li></ul>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="performance">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Numbers</div>
+<h2>Performance <a class="anchor" href="#performance" aria-label="Link to this section">#</a></h2>
+<p class="lede">Quoted from bench/RedisNearCache.Bench/README.md; see that file for full methodology.</p>
+
+<p>Both modes need a Redis server reachable at <code>localhost:6379</code> (the repo&#8217;s <code>docker compose</code> container).</p>
+<h3>Zero-traffic demo</h3>
+<p><code>--demo</code> seeds a key, reads it once through the near cache (a miss), then reads it 1,000 more times and checks the server&#8217;s <code>cmdstat_get</code> counter delta.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">output</span><span class="cb-lang">text</span></div><pre><code class="language-text">1000 reads of 'demo:near-cache:zero-traffic' through the near cache (all should be L1 hits):
+  cmdstat_get calls before : 263325
+  cmdstat_get calls after  : 263325
+  delta (Redis GETs issued): 0  (expected 0)
+
+Write-to-eviction latency  : 1688.0 µs
+
+Statistics: hits=1000 misses=1 invalidations=1 flushes=0 rearms=0 raceDiscards=0</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>All 1,000 repeated reads were served from L1 with zero Redis traffic; the one external write (from a second, separate multiplexer standing in for another client) evicted the local copy in 1688.0 &#181;s, which is the invalidation push&#8217;s round trip: write, Redis, <code>__redis__:invalidate</code>, subscriber, L1 evicted.</p>
+<h3>BenchmarkDotNet suite</h3>
+<p>Run on an Apple M4 Pro against a local single-node Redis container (<code>Toolchain=InProcessEmitToolchain</code>, <code>RunStrategy=Monitoring</code>, 10 iterations).</p>
+<div class="table-wrap"><table><thead><tr><th>Method</th><th>Kind</th><th class="num">Mean</th><th class="num">Allocated</th></tr></thead><tbody><tr><td><code>Plain_StringGet</code></td><td>String</td><td class="num">173.717 &#181;s</td><td class="num">1360 B</td></tr><tr><td><code>NearCache_Hit</code></td><td>String</td><td class="num">1.604 &#181;s</td><td class="num">2144 B</td></tr><tr><td><code>NearCache_Miss</code></td><td>String</td><td class="num">198.658 &#181;s</td><td class="num">9088 B</td></tr><tr><td><code>NearCache_TryGetLocal</code></td><td>String</td><td class="num">1.325 &#181;s</td><td class="num">2072 B</td></tr><tr><td><code>Plain_StringGet</code></td><td>Json</td><td class="num">276.979 &#181;s</td><td class="num">5456 B</td></tr><tr><td><code>NearCache_Hit</code></td><td>Json</td><td class="num">3.967 &#181;s</td><td class="num">424 B</td></tr><tr><td><code>NearCache_Miss</code></td><td>Json</td><td class="num">280.596 &#181;s</td><td class="num">6472 B</td></tr><tr><td><code>NearCache_TryGetLocal</code></td><td>Json</td><td class="num">2.875 &#181;s</td><td class="num">352 B</td></tr></tbody></table></div>
+<p><code>NearCache_Hit</code> and <code>NearCache_TryGetLocal</code> are roughly <strong>100x faster</strong> than a plain Redis round trip in this run, because they never leave the process. <code>NearCache_Miss</code> lands close to (and, for the string case, a little above) <code>Plain_StringGet</code>, since both do a real Redis round trip; the near cache&#8217;s overhead on the miss path is locking, in-flight bookkeeping, and deserialization. <code>RunStrategy.Monitoring</code> with only 10 iterations means run-to-run variance is higher than a long <code>Throughput</code> run would show; this is a deliberate trade-off to keep the whole suite finishing in well under a minute.</p>
+<h3>Load test</h3>
+<p><code>--load</code> is a production-shaped run: many application instances, each with its own private multiplexer (two tracked connections), many concurrent readers per instance, and foreign writers whose every <code>SET</code> fans out an invalidation to every instance that has the key tracked. Ends with a staleness audit of every instance&#8217;s L1 against Redis. Run on an Apple M4 Pro against the repo&#8217;s local Redis 7.4 container, 2026-09-13.</p><p>Profile: 20 instances (41 server connections), 8 readers per instance reading as fast as they can, 4 writers at 2,000 foreign writes/s, 10,000 keys of 512 bytes with 80% of traffic on 500 hot keys, 30 s.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">dotnet run -c Release --project bench/RedisNearCache.Bench -- --load            # near cache
+dotnet run -c Release --project bench/RedisNearCache.Bench -- --load --baseline # plain StackExchange.Redis
+dotnet run -c Release --project bench/RedisNearCache.Bench -- --load --chaos    # kills a quarter of connections at T/2
+# knobs: --instances 20 --readers 8 --writers 4 --writes-per-sec 2000 --keys 10000
+#        --hot-keys 500 --hot-fraction 0.8 --seconds 30 --value-bytes 512</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>The three run modes.</p>
+<div class="table-wrap"><table><thead><tr><th></th><th>Near cache</th><th>Plain StackExchange.Redis</th><th>Near cache + chaos</th></tr></thead><tbody><tr><td>Reads</td><td>41.1 M (1,369,673/s)</td><td>5.7 M (190,756/s)</td><td>42.3 M (1,407,049/s)</td></tr><tr><td>Hit ratio</td><td>95.8 %</td><td>n/a</td><td>95.5 %</td></tr><tr><td>Hit latency p50 / p99 / p999</td><td>0.8 / 24.8 / 4,089 &#181;s</td><td>n/a</td><td>0.8 / 29.8 / 3,408 &#181;s</td></tr><tr><td>Miss latency p50 / p99 / p999</td><td>1,643 / 12,210 / 36,459 &#181;s</td><td>793 / 1,643 / 2,366 &#181;s (all reads)</td><td>1,370 / 8,479 / 25,319 &#181;s</td></tr><tr><td>Foreign writes</td><td>60,040 (2,000/s)</td><td>60,035 (2,000/s)</td><td>60,120 (2,000/s)</td></tr><tr><td>Server GET commands</td><td>1.73 M (57,582/s)</td><td>5.72 M (190,756/s)</td><td>1.90 M (63,316/s)</td></tr><tr><td>Server total commands</td><td>1.79 M (59,585/s)</td><td>5.78 M (192,758/s)</td><td>1.96 M (65,323/s)</td></tr><tr><td>Server network output</td><td>922 MB</td><td>2,839 MB</td><td>994 MB</td></tr><tr><td>Invalidations received</td><td>1.07 M (35,532/s, 17.8 per write)</td><td>n/a</td><td>0.83 M (27,579/s, 13.8 per write)</td></tr><tr><td>Race discards</td><td>4,393</td><td>n/a</td><td>3,879</td></tr><tr><td>Flushes / re-arms</td><td>0 / 0</td><td>n/a</td><td>20 / 10</td></tr><tr><td>Tracking keys on server</td><td>10,025</td><td>n/a</td><td>10,051</td></tr><tr><td>L1 entries audited</td><td>184,246</td><td>n/a</td><td>134,963</td></tr><tr><td>Stale L1 entries after quiescence</td><td><strong>0</strong></td><td>n/a</td><td><strong>0</strong></td></tr></tbody></table></div>
+<p>What the numbers say:</p><ul><li>With the same 20 clients, the near cache served 7.2x the reads while sending the server 3.2x fewer commands and 3x less network output. The server&#8217;s <code>GET</code> rate is the miss rate, 4% of reads.</li><li>Every foreign write reached, on average, 14 to 18 of the 20 instances as an invalidation (the 500 hot keys are tracked by almost everyone). 35k invalidations/s were absorbed with zero stale entries in the audit.</li><li>The chaos run killed both connections of 5 instances at T/2. Each raised <code>TrackingLost</code> for both connections, reconnected, and was re-armed (<code>InteractiveRestored</code> and <code>SubscriptionRestored</code>) within about 120 ms; the sampled hit ratio dipped by under a point and recovered in the next 5 s window.</li><li>Miss latency in the near-cache runs is worse than the baseline&#8217;s read latency (p99 12 ms vs 1.6 ms). That is a load-generator artefact: 160 readers spin at 1.4 M reads/s on a 14-core machine, so the continuation of a network read waits for a thread-pool slot. A service that does real work between reads would not see this. The hit path is unaffected (p50 0.8 &#181;s).</li><li>Race discards ran at about 1 per 10,000 reads. Each costs one extra round trip on the next read; none cost correctness.</li><li>Observed once in five near-cache runs and not reproduced: the server closed all 40 tracked sockets at once (<code>SocketClosed</code> on both connection types of every instance, no <code>CLIENT KILL</code> issued). Every instance raised <code>TrackingLost</code>, reconnected and re-armed, and the audit still found 0 stale entries.</li></ul>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="samples">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Try it</div>
+<h2>Samples <a class="anchor" href="#samples" aria-label="Link to this section">#</a></h2>
+<p class="lede">Two runnable samples that show IRedisNearCache invalidated by something outside the process.</p>
+
+<p>Both connect to <code>localhost:6379</code>. Start the standalone Redis container first, from the repo root.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">docker compose up -d</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>Bring up Redis.</p>
+<h3>MinimalApi</h3>
+<p>An ASP.NET Core minimal API (<code>samples/MinimalApi</code>) with:</p><ul><li><code>GET /products/{id}</code> &#8212; reads through <code>IRedisNearCache.GetAsync&lt;Product&gt;("product:{id}")</code>; on a miss it falls back to an in-memory <code>ProductRepository</code> (a fake data store with a simulated 50 ms lookup delay) and then <code>SetAsync</code>s the result back into Redis.</li><li><code>PUT /products/{id}</code> &#8212; writes a <code>Product</code> via <code>SetAsync</code>.</li><li><code>GET /stats</code> &#8212; returns <code>IRedisNearCache.Statistics</code> as JSON.</li><li><code>GET /hybrid/{id}</code> &#8212; the same read, through <code>Microsoft.Extensions.Caching.Hybrid.HybridCache</code> (backed by RedisNearCache via <code>AddRedisNearCacheHybridCache()</code>).</li></ul>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">dotnet run --project samples/MinimalApi --urls http://localhost:5199</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>Run it on a free port.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">curl http://localhost:5199/products/1
+curl http://localhost:5199/products/1
+curl http://localhost:5199/stats
+docker exec redis-near-cache-redis redis-cli SET product:1 '{"id":1,"name":"changed"}'
+curl http://localhost:5199/products/1
+curl http://localhost:5199/stats</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>From a second terminal, curl it a couple of times, then invalidate the key from <em>outside</em> the app (a plain <code>redis-cli SET</code>, nothing that goes through this process) and curl again. The third call reflects the change because the server pushed an invalidation over <code>CLIENT TRACKING</code> and evicted the app&#8217;s L1 entry.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">captured output</span><span class="cb-lang">text</span></div><pre><code class="language-text">=== GET /products/1 (1st) ===
+{"id":1,"name":"Widget"}
+HTTP 200
+
+=== GET /products/1 (2nd) ===
+{"id":1,"name":"Widget"}
+HTTP 200
+
+=== GET /stats ===
+{"hits":1,"misses":1,"invalidations":0,"flushes":0,"rearms":0,"raceDiscards":0}
+HTTP 200
+
+=== external write ===
+docker exec redis-near-cache-redis redis-cli SET product:1 '{"id":1,"name":"changed"}'
+OK
+
+=== GET /products/1 (3rd, after external write) ===
+{"id":1,"name":"changed"}
+HTTP 200
+
+=== GET /stats (final) ===
+{"hits":1,"misses":2,"invalidations":1,"flushes":0,"rearms":0,"raceDiscards":0}
+HTTP 200</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>The 2nd call is an L1 hit (<code>hits</code> goes from 0 to 1, <code>misses</code> stays at 1). After the external <code>redis-cli SET</code>, the 3rd call already returns <code>"changed"</code>: <code>invalidations</code> goes from 0 to 1 (the server pushed one), and the GET after it counts as a miss again because the near cache had to go back to Redis to re-populate L1 for that key. Note: because <code>SetAsync</code> (used by <code>PUT /products/{id}</code> and by the repository-fallback path on <code>GET /products/{id}</code>) evicts L1 rather than populating it, the read immediately after a write is always a miss; the <em>next</em> read after that is what gets served from L1.</p>
+<h3>Worker</h3>
+<p>A <code>BackgroundService</code> (<code>samples/Worker</code>) that polls the key <code>config:feature-flags</code> through the near cache every 500 ms and logs whether that tick was an L1 hit or a Redis miss, plus a full <code>Statistics</code> snapshot every 5 seconds.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">dotnet run --project samples/Worker</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>Run it.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">docker exec redis-near-cache-redis redis-cli SET config:feature-flags '{"beta":true}'</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>From a second terminal, change the watched key at any point and watch the very next tick pick it up.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">captured output</span><span class="cb-lang">text</span></div><pre><code class="language-text">info: RedisNearCache.Tracking.TrackingArmer[0]
+      RedisNearCache armed CLIENT TRACKING on Unspecified/localhost:6379 redirecting to client 3562 (Initial)
+info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
+      MISS config:feature-flags = &lt;null&gt;  (cumulative hits=0 misses=1)
+      ... (17 more MISS ticks while the key does not exist yet) ...
+info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
+      Statistics: hits=0 misses=11 invalidations=0 flushes=0 rearms=0 raceDiscards=0
+      ... (redis-cli SET config:feature-flags '{"beta":true}' run here) ...
+info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
+      MISS config:feature-flags = {"beta":true}  (cumulative hits=0 misses=19)
+info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
+      hit  config:feature-flags = {"beta":true}  (cumulative hits=1 misses=19)
+info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
+      Statistics: hits=3 misses=19 invalidations=1 flushes=0 rearms=0 raceDiscards=0</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p><code>config:feature-flags</code> did not exist yet, so every tick is a miss (RedisNearCache never stores a null value in L1, so a missing key stays a miss on every poll) until the external <code>redis-cli SET</code> partway through. The first tick after the SET (<code>misses=19</code>) is still a miss, the read that goes to Redis and populates L1, but it already returns the new value. Every tick after that is a hit until the key is written again from outside.</p>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="faq">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Questions</div>
+<h2>FAQ <a class="anchor" href="#faq" aria-label="Link to this section">#</a></h2>
+
+
+<div class="member" id="faq-1"><div class="row"><div class="prose"><h3>Do my writers need to change? <a class="anchor" href="#faq-1" aria-label="Link to this question">#</a></h3><p>No. Any client, in any language, doing a plain <code>SET</code>, <code>DEL</code>, <code>MSET</code>, or a <code>redis-cli</code> command by hand causes Redis itself to push an invalidation to every connection tracking that key. RedisNearCache does not require writers to publish anything or use the same library.</p></div><div class="rail"></div></div></div>
+<div class="member" id="faq-2"><div class="row"><div class="prose"><h3>Can I use my existing IConnectionMultiplexer? <a class="anchor" href="#faq-2" aria-label="Link to this question">#</a></h3><p>Your existing multiplexer is never touched, reconfigured, or depended on. RedisNearCache opens its own private multiplexer (cloned connection settings, forced to RESP2 with admin mode). Your own connection can stay on whatever protocol and configuration it already uses.</p></div><div class="rail"></div></div></div>
+<div class="member" id="faq-3"><div class="row"><div class="prose"><h3>Why does RedisNearCache need its own connection instead of using mine? <a class="anchor" href="#faq-3" aria-label="Link to this question">#</a></h3><p>Two reasons: <code>CLIENT TRACKING</code> and <code>CLIENT LIST</code> require <code>AllowAdmin=true</code>, which most applications do not (and should not) set on their main connection; and every read issued on a tracked connection is tracked by Redis, whether or not it is something you actually want cached. Giving RedisNearCache its own connection means only cache reads are tracked, and your main connection&#8217;s admin surface is untouched.</p></div><div class="rail"></div></div></div>
+<div class="member" id="faq-4"><div class="row"><div class="prose"><h3>Why RESP2 instead of RESP3? <a class="anchor" href="#faq-4" aria-label="Link to this question">#</a></h3><p>StackExchange.Redis 3.x is RESP3 by default, but under RESP3 the library collapses to a single connection per node and swallows the <code>invalidate</code> push frames internally. The spike measured this directly: the server reports tracking as on, but zero invalidation messages ever reach the application. RESP2 is the only protocol under which StackExchange.Redis opens a separate subscriber connection, which is what RedisNearCache uses as the <code>REDIRECT</code> target.</p></div><div class="rail"></div></div></div>
+<div class="member" id="faq-5"><div class="row"><div class="prose"><h3>Why does it need admin mode (AllowAdmin=true)? <a class="anchor" href="#faq-5" aria-label="Link to this question">#</a></h3><p><code>CLIENT TRACKING ON/OFF</code>, <code>CLIENT TRACKINGINFO</code>, and <code>CLIENT LIST</code> are all gated behind admin mode in StackExchange.Redis; without it they throw <code>RedisCommandException: not available unless admin mode is enabled</code>. This only applies to RedisNearCache&#8217;s own private connection, not yours.</p></div><div class="rail"></div></div></div>
+<div class="member" id="faq-6"><div class="row"><div class="prose"><h3>What if Redis restarts, or my connection drops? <a class="anchor" href="#faq-6" aria-label="Link to this question">#</a></h3><p>RedisNearCache re-arms automatically. An interactive-connection reconnect means the server dropped tracking entirely; a subscriber-connection reconnect means the server is still redirecting to a now-dead client id and would otherwise silently lose every invalidation. Both cases are handled: RedisNearCache re-issues <code>CLIENT TRACKING</code> (finding the new subscriber id via <code>CLIENT LIST</code> when needed) and flushes L1. While any node is down and not yet re-armed, every read goes straight to Redis and nothing is cached (pass-through), so the cache can never serve something stale from that window. This is exercised directly by the integration tests, including killing both connections back to back (<code>Chaos/BothConnectionsKilledTests</code>) and restarting a whole cluster node (<code>Chaos/NodeRestartClusterTests</code>).</p></div><div class="rail"></div></div></div>
+<div class="member" id="faq-7"><div class="row"><div class="prose"><h3>What if Redis crashes and does not come back? <a class="anchor" href="#faq-7" aria-label="Link to this question">#</a></h3><p><code>IRedisNearCache.Ready</code> only faults if <em>no</em> master could be armed at all after the retry ladder is exhausted; in that case the cache stays permanently in pass-through rather than throwing on every call. If Redis is unreachable, the reads themselves will fail the same way they would through a plain StackExchange.Redis connection. RedisNearCache does not add its own resilience layer on top of that.</p></div><div class="rail"></div></div></div>
+<div class="member" id="faq-8"><div class="row"><div class="prose"><h3>Does it work with Redis Cluster? <a class="anchor" href="#faq-8" aria-label="Link to this question">#</a></h3><p>Yes. Tracking is per node, so RedisNearCache&#8217;s armer repeats the arm/re-arm dance independently on every connected master, using that node&#8217;s own subscriber connection as the redirect target. A lost or restarted node re-arms on its own; the other nodes are unaffected. This is covered by <code>tests/RedisNearCache.Tests/ClusterPerNodeInvalidationTests.cs</code>, <code>ClusterKillOneNodeInteractiveRearmsTests.cs</code>, and <code>Chaos/NodeRestartClusterTests.cs</code>.</p></div><div class="rail"></div></div></div>
+<div class="member" id="faq-9"><div class="row"><div class="prose"><h3>Does it work with Sentinel, ElastiCache, or Azure Managed Redis? <a class="anchor" href="#faq-9" aria-label="Link to this question">#</a></h3><p><strong>Not yet tested.</strong> The tests in this repository run against a plain standalone Redis 7.4 container and a 3-master Redis Cluster started via <code>cluster-up.sh</code>. Nothing in the design specifically depends on the absence of Sentinel or a managed offering (it works through StackExchange.Redis&#8217;s own topology handling and per-master <code>CLIENT TRACKING</code>), but no test exercises those configurations, so this is genuinely untested rather than a documented guarantee.</p></div><div class="rail"></div></div></div>
+<div class="member" id="faq-10"><div class="row"><div class="prose"><h3>How much memory does L1 use? <a class="anchor" href="#faq-10" aria-label="Link to this question">#</a></h3><p>L1 is a <code>Microsoft.Extensions.Caching.Memory.MemoryCache</code> where every entry costs a size of 1 against <code>RedisNearCacheOptions.L1SizeLimit</code> (default <code>10_000</code>). There is no accounting for the byte size of values, so memory use is roughly (number of cached entries) &#215; (average serialized value size), bounded above by <code>L1SizeLimit</code> entries. Use <code>KeyPrefixes</code> to limit which keys are eligible for L1 at all if you have large or very numerous values you do not want held locally.</p></div><div class="rail"></div></div></div>
+<div class="member" id="faq-11"><div class="row"><div class="prose"><h3>What happens to a key's TTL? <a class="anchor" href="#faq-11" aria-label="Link to this question">#</a></h3><p>RedisNearCache does not track expiry deadlines itself. When Redis&#8217;s own active expiry cycle actually removes an expired key, that is a normal deletion from Redis&#8217;s point of view and it is invalidated like any other write. Because active expiry can lag the TTL deadline, there can be a small window where L1 still holds a value whose TTL has technically passed. <code>L1MaxAge</code> (default 5 minutes) is the safety net for this and for any other missed invalidation.</p></div><div class="rail"></div></div></div>
+<div class="member" id="faq-12"><div class="row"><div class="prose"><h3>Can I invalidate a key without touching Redis? <a class="anchor" href="#faq-12" aria-label="Link to this question">#</a></h3><p>Yes, <code>EvictLocal(key)</code> removes only the local L1 copy without going to Redis. This is separate from <code>RemoveAsync</code>, which deletes the key in Redis too.</p></div><div class="rail"></div></div></div>
+<div class="member" id="faq-13"><div class="row"><div class="prose"><h3>Does SetAsync populate L1 immediately? <a class="anchor" href="#faq-13" aria-label="Link to this question">#</a></h3><p>No. <code>SetAsync</code> writes to Redis and evicts any existing L1 copy of the key; the next <code>GetAsync&lt;T&gt;</code> re-reads it from Redis and re-tracks it. Write-through population of L1 is explicitly out of scope for v1.</p></div><div class="rail"></div></div></div>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<footer class="site-foot">
+<p>RedisNearCache is MIT licensed. Source, issues, and the full README live at
+<a href="https://github.com/magna-nz/redis-near-cache" target="_blank" rel="noopener">github.com/magna-nz/redis-near-cache</a>.</p>
+</footer>
+</div>
+</div>
+<script>
+  window.__mermaidTheme = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default';
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+  if (window.mermaid) {
+    mermaid.initialize({ startOnLoad: true, theme: window.__mermaidTheme, securityLevel: 'strict' });
+  }
+</script>
+<script src="site.js"></script>
+</body>
+</html>

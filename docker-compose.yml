@@ -5,3 +5,10 @@ services:
     ports:
       - "6379:6379"
     command: ["redis-server", "--save", "", "--appendonly", "no"]
+  replica:
+    image: redis:7.4
+    container_name: redis-near-cache-replica
+    depends_on: [redis]
+    ports:
+      - "6380:6380"
+    command: ["redis-server", "--port", "6380", "--replicaof", "redis", "6379", "--save", "", "--appendonly", "no", "--replica-announce-ip", "127.0.0.1", "--replica-announce-port", "6380"]
