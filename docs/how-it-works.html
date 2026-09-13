@@ -1,0 +1,361 @@
+<title>RedisNearCache Mechanics</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --paper: #F6F7F9;
+    --ink: #1B2431;
+    --muted: #5B6B7F;
+    --rule: #D3D9E1;
+    --panel: #FFFFFF;
+    --crimson: #C0392B;
+    --teal: #1F7A6D;
+    --slate: #3E5470;
+    --code-bg: #EDF0F4;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #12161C; --ink: #E6E9EE; --muted: #9AA7B6; --rule: #2C3542; --panel: #1A2029;
+      --crimson: #E2604F; --teal: #4FB8A6; --slate: #8FA6C2; --code-bg: #222A35; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #12161C; --ink: #E6E9EE; --muted: #9AA7B6; --rule: #2C3542; --panel: #1A2029;
+    --crimson: #E2604F; --teal: #4FB8A6; --slate: #8FA6C2; --code-bg: #222A35; color-scheme: dark;
+  }
+  body { background: var(--paper); color: var(--ink); font-family: "Source Sans 3", "Segoe UI", system-ui, sans-serif; font-size: 17px; line-height: 1.55; margin: 0; }
+  main { max-width: 76ch; margin: 0 auto; padding: 48px 24px 96px; }
+  h1, h2, h3 { font-family: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif; text-wrap: balance; line-height: 1.15; margin: 0; }
+  h1 { font-size: 2.4rem; font-weight: 700; letter-spacing: -0.01em; }
+  h2 { font-size: 1.5rem; font-weight: 700; margin-top: 56px; padding-top: 20px; border-top: 1px solid var(--rule); }
+  h3 { font-size: 1.1rem; font-weight: 700; margin-top: 28px; }
+  p { margin: 14px 0; max-width: 68ch; }
+  .lede { font-size: 1.2rem; color: var(--muted); margin-top: 12px; max-width: 60ch; }
+  .eyebrow { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  code, pre { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 0.86em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  figure { margin: 28px 0; }
+  figure svg { max-width: 100%; height: auto; display: block; color: var(--ink); }
+  figcaption { font-size: 0.92rem; color: var(--muted); margin-top: 10px; max-width: 68ch; }
+  .diagram { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 16px; overflow-x: auto; }
+  pre.mermaid { background: transparent; margin: 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.95rem; margin: 18px 0; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+  .wrap { overflow-x: auto; }
+  .key { display: flex; gap: 22px; flex-wrap: wrap; font-size: 0.9rem; color: var(--muted); margin: 8px 0 0; }
+  .key span::before { content: ""; display: inline-block; width: 22px; height: 3px; margin-right: 8px; vertical-align: middle; }
+  .key .k-inv::before { background: var(--crimson); }
+  .key .k-hit::before { background: var(--teal); }
+  .key .k-plain::before { background: var(--ink); opacity: .7; }
+  ol.steps { padding-left: 1.3em; }
+  ol.steps li { margin: 8px 0; }
+  strong { font-weight: 600; }
+</style>
+<main>
+  <div class="eyebrow">RedisNearCache · design notes · 2026-09-13</div>
+  <h1>RedisNearCache Mechanics</h1>
+  <p class="lede">A near cache whose entries are invalidated by the Redis server itself. This page shows the parts, the message flow, and the failure cases that shaped the design.</p>
+
+  <h2>The one-sentence version</h2>
+  <p>Your app keeps an in-process copy of the Redis values it reads. Redis remembers which keys each tracked connection has read, and when <em>any</em> client writes one of those keys, Redis pushes a message naming it, and the local copy is thrown away. Nothing in the write path has to cooperate. A Java service, a Go job, or someone at <code>redis-cli</code> all invalidate you the same way.</p>
+
+  <h2>Why not an app-level backplane</h2>
+  <p>FusionCache and the proposed HybridCache backplane solve staleness with pub/sub that the <em>writer</em> publishes to. That only works when every writer uses the same library. Server-assisted tracking moves the responsibility to the one place every write already passes through.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 250" role="img" aria-label="Two approaches side by side: with a pub/sub backplane the writer must publish an invalidation; with server-assisted tracking Redis itself sends the invalidation for any writer.">
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker>
+          <marker id="arc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--crimson)"/></marker>
+        </defs>
+        <g font-family="JetBrains Mono, monospace" font-size="12" fill="currentColor">
+          <!-- left: backplane -->
+          <text x="20" y="22" font-weight="500">A. Pub/sub backplane</text>
+          <rect x="20" y="40" width="130" height="40" rx="3" fill="none" stroke="currentColor"/>
+          <text x="85" y="65" text-anchor="middle">.NET writer</text>
+          <rect x="20" y="180" width="130" height="40" rx="3" fill="none" stroke="currentColor"/>
+          <text x="85" y="205" text-anchor="middle">Go writer</text>
+          <rect x="250" y="110" width="110" height="40" rx="3" fill="none" stroke="currentColor"/>
+          <text x="305" y="135" text-anchor="middle">Redis</text>
+          <rect x="250" y="40" width="110" height="40" rx="3" fill="none" stroke="currentColor" stroke-dasharray="4 3"/>
+          <text x="305" y="65" text-anchor="middle">channel</text>
+          <rect x="20" y="110" width="130" height="40" rx="3" fill="none" stroke="var(--teal)"/>
+          <text x="85" y="135" text-anchor="middle" fill="var(--teal)">.NET reader + L1</text>
+          <line x1="150" y1="60" x2="248" y2="60" stroke="var(--crimson)" marker-end="url(#arc)"/>
+          <text x="199" y="52" text-anchor="middle" fill="var(--crimson)" font-size="11">publish</text>
+          <line x1="150" y1="70" x2="248" y2="122" stroke="currentColor" marker-end="url(#ar)"/>
+          <text x="172" y="98" font-size="11">SET</text>
+          <line x1="250" y1="80" x2="152" y2="118" stroke="var(--crimson)" marker-end="url(#arc)"/>
+          <text x="232" y="103" text-anchor="end" fill="var(--crimson)" font-size="11">evict</text>
+          <line x1="150" y1="200" x2="248" y2="146" stroke="currentColor" marker-end="url(#ar)"/>
+          <text x="180" y="185" font-size="11">SET</text>
+          <text x="20" y="242" fill="var(--crimson)" font-size="11">Go writer never publishes → reader stays stale</text>
+          <!-- divider -->
+          <line x1="430" y1="10" x2="430" y2="240" stroke="var(--rule)"/>
+          <!-- right: server-assisted -->
+          <text x="460" y="22" font-weight="500">B. Server-assisted (this package)</text>
+          <rect x="460" y="40" width="130" height="40" rx="3" fill="none" stroke="currentColor"/>
+          <text x="525" y="65" text-anchor="middle">.NET writer</text>
+          <rect x="460" y="180" width="130" height="40" rx="3" fill="none" stroke="currentColor"/>
+          <text x="525" y="205" text-anchor="middle">Go writer</text>
+          <rect x="690" y="110" width="110" height="40" rx="3" fill="none" stroke="currentColor"/>
+          <text x="745" y="135" text-anchor="middle">Redis</text>
+          <text x="745" y="98" text-anchor="middle" font-size="11" fill="var(--muted)">tracks keys per conn</text>
+          <rect x="460" y="110" width="130" height="40" rx="3" fill="none" stroke="var(--teal)"/>
+          <text x="525" y="135" text-anchor="middle" fill="var(--teal)">.NET reader + L1</text>
+          <line x1="590" y1="70" x2="688" y2="122" stroke="currentColor" marker-end="url(#ar)"/>
+          <text x="612" y="98" font-size="11">SET</text>
+          <line x1="590" y1="200" x2="688" y2="146" stroke="currentColor" marker-end="url(#ar)"/>
+          <text x="620" y="185" font-size="11">SET</text>
+          <line x1="688" y1="130" x2="592" y2="130" stroke="var(--crimson)" marker-end="url(#arc)"/>
+          <text x="640" y="123" text-anchor="middle" fill="var(--crimson)" font-size="11">invalidate key</text>
+          <text x="460" y="242" fill="var(--teal)" font-size="11">Any writer → Redis sends the invalidation</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption>In A the reader is only as fresh as the most disciplined writer. In B the server is the single source of invalidations.</figcaption>
+  </figure>
+
+  <h2>The parts</h2>
+  <p>The package never touches your existing multiplexer. It opens one private StackExchange.Redis multiplexer, forced to RESP2 and admin mode, which gives it two connections per Redis node: an interactive connection for reads, and a subscriber connection that Redis is told to send invalidations to.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 900 400" role="img" aria-label="Architecture: your code calls IRedisNearCache, which serves from L1 or reads over the private interactive connection; Redis sends invalidations to the private subscriber connection which evicts from L1; your own multiplexer and any other writer send writes to Redis directly.">
+        <defs>
+          <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker>
+          <marker id="a2c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--crimson)"/></marker>
+          <marker id="a2t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--teal)"/></marker>
+        </defs>
+        <g font-family="JetBrains Mono, monospace" font-size="12" fill="currentColor">
+          <!-- app boundary -->
+          <rect x="20" y="20" width="560" height="360" rx="6" fill="none" stroke="var(--rule)" stroke-dasharray="6 4"/>
+          <text x="34" y="42" fill="var(--muted)" font-size="11">YOUR PROCESS</text>
+          <!-- your code -->
+          <rect x="40" y="70" width="130" height="44" rx="3" fill="none" stroke="currentColor"/>
+          <text x="105" y="97" text-anchor="middle">Your code</text>
+          <!-- facade -->
+          <rect x="220" y="60" width="200" height="130" rx="3" fill="none" stroke="currentColor"/>
+          <text x="320" y="82" text-anchor="middle" font-weight="500">IRedisNearCache</text>
+          <rect x="240" y="98" width="160" height="34" rx="3" fill="none" stroke="var(--teal)"/>
+          <text x="320" y="120" text-anchor="middle" fill="var(--teal)">L1  MemoryCache</text>
+          <rect x="240" y="142" width="160" height="34" rx="3" fill="none" stroke="currentColor"/>
+          <text x="320" y="164" text-anchor="middle">in-flight set</text>
+          <!-- private mux -->
+          <rect x="220" y="220" width="200" height="120" rx="3" fill="none" stroke="currentColor"/>
+          <text x="320" y="242" text-anchor="middle" font-weight="500">private multiplexer</text>
+          <text x="320" y="258" text-anchor="middle" font-size="11" fill="var(--muted)">RESP2 · allowAdmin · own name</text>
+          <rect x="240" y="270" width="160" height="26" rx="3" fill="none" stroke="currentColor"/>
+          <text x="320" y="288" text-anchor="middle" font-size="11">interactive conn (tracked)</text>
+          <rect x="240" y="304" width="160" height="26" rx="3" fill="none" stroke="var(--crimson)"/>
+          <text x="320" y="322" text-anchor="middle" font-size="11" fill="var(--crimson)">subscriber conn (redirect)</text>
+          <!-- your mux -->
+          <rect x="40" y="260" width="130" height="60" rx="3" fill="none" stroke="currentColor"/>
+          <text x="105" y="285" text-anchor="middle">Your multiplexer</text>
+          <text x="105" y="303" text-anchor="middle" font-size="11" fill="var(--muted)">untouched</text>
+          <!-- redis -->
+          <rect x="700" y="200" width="170" height="140" rx="3" fill="none" stroke="currentColor"/>
+          <text x="785" y="224" text-anchor="middle" font-weight="500">Redis 6+ / Valkey</text>
+          <text x="785" y="246" text-anchor="middle" font-size="11" fill="var(--muted)">tracking table:</text>
+          <text x="785" y="262" text-anchor="middle" font-size="11" fill="var(--muted)">key → client ids</text>
+          <text x="785" y="292" text-anchor="middle" font-size="11">CLIENT TRACKING ON</text>
+          <text x="785" y="308" text-anchor="middle" font-size="11">REDIRECT &lt;sub id&gt;</text>
+          <!-- other writers -->
+          <rect x="700" y="60" width="170" height="60" rx="3" fill="none" stroke="currentColor"/>
+          <text x="785" y="84" text-anchor="middle">Other writers</text>
+          <text x="785" y="102" text-anchor="middle" font-size="11" fill="var(--muted)">redis-cli, Java, Go, Lua</text>
+          <!-- arrows -->
+          <line x1="170" y1="92" x2="218" y2="92" stroke="currentColor" marker-end="url(#a2)"/>
+          <text x="194" y="84" text-anchor="middle" font-size="11">GetAsync</text>
+          <line x1="320" y1="190" x2="320" y2="218" stroke="currentColor" marker-end="url(#a2)"/>
+          <text x="330" y="208" font-size="11">GET on miss</text>
+          <line x1="400" y1="283" x2="698" y2="283" stroke="currentColor" marker-end="url(#a2)"/>
+          <text x="549" y="276" text-anchor="middle" font-size="11">GET key  (server tracks it)</text>
+          <line x1="698" y1="317" x2="402" y2="317" stroke="var(--crimson)" marker-end="url(#a2c)"/>
+          <text x="549" y="332" text-anchor="middle" font-size="11" fill="var(--crimson)">message __redis__:invalidate [key]</text>
+          <path d="M240 317 L200 317 L200 115 L238 115" fill="none" stroke="var(--crimson)" marker-end="url(#a2c)"/>
+          <text x="196" y="230" text-anchor="end" font-size="11" fill="var(--crimson)">evict</text>
+          <line x1="170" y1="290" x2="698" y2="290" stroke="currentColor" stroke-dasharray="4 3"/>
+          <text x="440" y="356" text-anchor="middle" font-size="11" fill="var(--muted)">writes from your multiplexer (dashed) go straight to Redis; they invalidate like any other writer</text>
+          <line x1="785" y1="120" x2="785" y2="198" stroke="currentColor" marker-end="url(#a2)"/>
+          <text x="795" y="162" font-size="11">SET key</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption>Only reads that go through the package are tracked, because only the package's interactive connection is tracked. Writes can come from anywhere.</figcaption>
+    <div class="key"><span class="k-plain">reads and writes</span><span class="k-inv">invalidation</span><span class="k-hit">local cache</span></div>
+  </figure>
+
+  <h2>A read, a hit, and an invalidation</h2>
+  <figure>
+    <div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant App as Your code
+    participant NC as RedisNearCache
+    participant L1
+    participant I as interactive conn
+    participant S as subscriber conn
+    participant R as Redis
+    participant W as Any writer
+    App->>NC: GetAsync("user:42")
+    NC->>L1: TryGet
+    L1-->>NC: miss
+    NC->>NC: inflight.Begin(user:42)
+    NC->>I: GET user:42
+    I->>R: GET user:42
+    Note over R: remembers user:42 was read by this connection
+    R-->>I: value v1
+    I-->>NC: value v1
+    NC->>NC: invalidated while in flight? no
+    NC->>L1: Set(user:42, v1)
+    NC-->>App: v1
+    App->>NC: GetAsync("user:42")
+    NC->>L1: TryGet
+    L1-->>NC: hit
+    NC-->>App: v1 (no network)
+    W->>R: SET user:42 v2
+    R->>S: message __redis__:invalidate [user:42]
+    Note over R: forgets user:42 for this connection (one-shot)
+    S->>NC: KeyInvalidated(user:42)
+    NC->>L1: Remove(user:42)
+    App->>NC: GetAsync("user:42")
+    NC->>L1: TryGet
+    L1-->>NC: miss
+    NC->>I: GET user:42
+    I->>R: GET user:42
+    Note over R: tracks user:42 again
+    R-->>NC: value v2
+    NC->>L1: Set(user:42, v2)
+    NC-->>App: v2
+</pre>
+    </div>
+    <figcaption>Tracking is one-shot per key. After the invalidation Redis forgets the key until the next read re-tracks it. Step 10 is the race check described below.</figcaption>
+  </figure>
+
+  <h2>The in-flight race</h2>
+  <p>An invalidation can arrive between sending <code>GET</code> and storing its reply. Without a guard the stale reply would be cached with nothing left to evict it, because the server already sent its one invalidation. Each read records a version token when it starts; an invalidation bumps the key's version; the reply is stored only if the version is unchanged.</p>
+  <figure>
+    <div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    participant NC as RedisNearCache
+    participant L1
+    participant R as Redis
+    participant W as Any writer
+    NC->>NC: token = inflight.Begin(k)  (version 7)
+    NC->>R: GET k
+    R-->>NC: v1 (in transit)
+    W->>R: SET k v2
+    R->>NC: invalidate [k]
+    NC->>NC: inflight.MarkInvalidated(k)  (version 8)
+    NC->>L1: Remove(k)  (nothing there yet)
+    Note over NC: reply v1 arrives
+    NC->>NC: WasInvalidated(k, token)? version 8 ≠ 7 → yes
+    NC->>NC: discard v1, Statistics.RaceDiscards++
+    Note over NC: return v1 to the caller (it was true when read); next read fetches v2
+</pre>
+    </div>
+    <figcaption>The reply is still returned to the caller, which is correct for a read that was valid when issued. It is simply not cached.</figcaption>
+  </figure>
+
+  <h2>Reconnects, the part that actually needs care</h2>
+  <p>Tracking is per-connection state on the server. The spike showed two silent failure modes, both handled by re-arming and flushing.</p>
+  <table>
+    <thead><tr><th>What breaks</th><th>What the server does</th><th>What we do</th></tr></thead>
+    <tbody>
+      <tr><td>Interactive connection drops and reconnects</td><td>New connection, tracking off (<code>TRACKINGINFO</code> flags=off, redirect=-1). Reads succeed untracked.</td><td>On <code>ConnectionRestored(Interactive)</code>: re-issue <code>CLIENT TRACKING ON REDIRECT</code>, flush L1.</td></tr>
+      <tr><td>Subscriber connection drops and reconnects</td><td>New client id. The interactive connection still redirects to the <em>dead</em> id. Invalidations vanish with no error.</td><td>On <code>ConnectionRestored(Subscription)</code>: look up the new id in <code>CLIENT LIST</code>, <code>TRACKING OFF</code> then <code>ON REDIRECT &lt;new id&gt;</code>, flush L1.</td></tr>
+      <tr><td>Any connection failed, not yet restored</td><td>Nothing can be trusted.</td><td>Flush L1; serve from Redis until re-armed.</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    participant A as TrackingArmer
+    participant L1
+    participant I as interactive conn (id 26)
+    participant S as subscriber conn (id 27 → 58)
+    participant R as Redis
+    Note over R: redirect target for id 26 is 27
+    R-xS: connection killed
+    S->>R: reconnect, CLIENT ID = 58
+    Note over R: id 26 still redirects to dead 27
+    S-->>A: ConnectionRestored(Subscription)
+    A->>L1: Clear()  (anything missed is gone)
+    A->>R: CLIENT LIST (via interactive)
+    R-->>A: our subscriber = 58
+    A->>R: CLIENT TRACKING OFF
+    A->>R: CLIENT TRACKING ON REDIRECT 58
+    R-->>A: OK
+    A-->>L1: Armed(SubscriptionRestored)
+</pre>
+    </div>
+    <figcaption>Measured in the spike: the subscriber came back in about 60 ms with a new id while the server kept redirecting to the old one.</figcaption>
+  </figure>
+
+  <h3>Per-endpoint state</h3>
+  <figure>
+    <div class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> Unarmed
+    Unarmed --> Arming: StartAsync / find subscriber id
+    Arming --> Armed: TRACKING ON REDIRECT ok
+    Arming --> Arming: subscriber not visible yet, backoff retry
+    Armed --> Lost: ConnectionFailed (either type)
+    Lost --> Arming: ConnectionRestored
+    Armed --> Arming: ConnectionRestored (server dropped or re-pointed)
+    note right of Armed: L1 trusted
+    note right of Lost: L1 flushed, reads pass through
+</pre>
+    </div>
+    <figcaption>One state machine per master node. Every transition into Arming after the first clears L1.</figcaption>
+  </figure>
+
+  <h2>Cluster</h2>
+  <p>Client ids and tracking tables live on each node, and a node sends invalidations only for keys it owns. The private multiplexer already keeps an interactive and a subscriber connection per master, so the armer repeats the same dance per node with that node's subscriber id.</p>
+  <figure>
+    <div class="diagram">
+<pre class="mermaid">
+flowchart LR
+    subgraph P[private multiplexer]
+      direction TB
+      A1[interactive → 7100]
+      S1[subscriber id 11]
+      A2[interactive → 7101]
+      S2[subscriber id 7]
+      A3[interactive → 7102]
+      S3[subscriber id 7]
+    end
+    subgraph C[cluster]
+      N1[(master 7100<br/>slots 0-5460)]
+      N2[(master 7101<br/>slots 5461-10922)]
+      N3[(master 7102<br/>slots 10923-16383)]
+    end
+    A1 -- "TRACKING ON REDIRECT 11" --> N1
+    A2 -- "TRACKING ON REDIRECT 7" --> N2
+    A3 -- "TRACKING ON REDIRECT 7" --> N3
+    N1 -. "invalidate spike:c1" .-> S1
+    N2 -. "invalidate spike:c3" .-> S2
+    N3 -. "invalidate spike:c2" .-> S3
+</pre>
+    </div>
+    <figcaption>Ids from the spike's cluster run: two nodes both handed out id 7, which is why an id is only meaningful together with its node.</figcaption>
+  </figure>
+
+  <h2>What was ruled out, and why</h2>
+  <table>
+    <thead><tr><th>Option</th><th>Finding</th></tr></thead>
+    <tbody>
+      <tr><td>Use your existing multiplexer</td><td>Every <code>CLIENT TRACKING</code> and <code>CLIENT LIST</code> call needs <code>allowAdmin</code>, and every read on it would be tracked, cache or not.</td></tr>
+      <tr><td>RESP3 push messages (the 3.x default)</td><td>StackExchange.Redis collapses to one connection and drops the <code>invalidate</code> pushes. Server says tracking is on; zero messages arrive.</td></tr>
+      <tr><td>Lua to bypass admin mode</td><td><code>CLIENT TRACKING</code> is flagged <code>noscript</code>.</td></tr>
+      <tr><td><code>OPTIN</code> / <code>CLIENT CACHING YES</code></td><td>Must be adjacent on the wire to the next command; impossible on a multiplexed connection. Selection lives in the package instead.</td></tr>
+      <tr><td>Raw-socket sidecar per node</td><td>Works, kept as fallback. It re-implements TLS, auth, topology and reconnects that the library already provides.</td></tr>
+      <tr><td>Garnet</td><td>Does not implement <code>CLIENT TRACKING</code>. Redis 6+ and Valkey do.</td></tr>
+    </tbody>
+  </table>
+</main>

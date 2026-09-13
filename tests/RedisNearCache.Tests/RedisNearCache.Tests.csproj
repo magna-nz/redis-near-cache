@@ -11,5 +11,10 @@
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <!-- Not centrally pinned in Directory.Packages.props (only the .Abstractions package is); the test
+         project needs the concrete ServiceCollection/BuildServiceProvider, so the version is overridden
+         here to match the pinned Microsoft.Extensions.*.Abstractions version (10.0.12) rather than
+         touching the shared props file. -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
   </ItemGroup>
 </Project>
