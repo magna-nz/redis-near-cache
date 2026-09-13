@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Start Redis (standalone + 3-master cluster)
+        run: |
+          docker compose up -d
+          ./cluster-up.sh
+          docker exec redis-near-cache-redis redis-cli ping
+      - name: Build
+        run: dotnet build -c Release -nologo
+      - name: Test
+        run: dotnet test tests/RedisNearCache.Tests -c Release --no-build -nologo --logger "trx;LogFileName=results.trx"
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: tests/RedisNearCache.Tests/TestResults/*.trx
+      - name: Pack
+        run: dotnet pack src/RedisNearCache/RedisNearCache.csproj src/RedisNearCache.HybridCache/RedisNearCache.HybridCache.csproj -c Release --no-build -o artifacts
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: artifacts/*.nupkg

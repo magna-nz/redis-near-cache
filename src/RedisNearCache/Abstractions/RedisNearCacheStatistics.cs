@@ -25,6 +25,7 @@ public sealed class RedisNearCacheStatistics
     internal void Rearm() => Interlocked.Increment(ref _rearms);
     internal void RaceDiscard() => Interlocked.Increment(ref _raceDiscards);
 
+    /// <summary>One-line summary of all counters.</summary>
     public override string ToString() =>
         $"hits={Hits} misses={Misses} invalidations={Invalidations} flushes={Flushes} rearms={Rearms} raceDiscards={RaceDiscards}";
 }

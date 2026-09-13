@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>RedisNearCache.Samples.MinimalApi</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/RedisNearCache/RedisNearCache.csproj" />
+    <ProjectReference Include="../../src/RedisNearCache.HybridCache/RedisNearCache.HybridCache.csproj" />
+  </ItemGroup>
+</Project>
