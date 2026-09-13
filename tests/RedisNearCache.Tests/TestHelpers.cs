@@ -54,4 +54,20 @@ internal static class TestHelpers
         }
         return result;
     }
+
+    /// <summary>
+    /// Reads the key until the read is served AND the value is held in L1. Needed right after a re-arm:
+    /// two back-to-back re-arms (interactive, then subscriber) each gate caching for their own duration,
+    /// so the first read after observing "re-armed" may legitimately not be cached yet.
+    /// </summary>
+    public static async Task<bool> ReadUntilCachedAsync(IRedisNearCache cache, string key, string expected, TimeSpan? timeout = null)
+    {
+        return await Poll.UntilAsync(async () =>
+        {
+            string? value;
+            try { value = await cache.GetAsync<string>(key); }
+            catch (StackExchange.Redis.RedisException) { return false; }
+            return value == expected && cache.TryGetLocal<string>(key, out _);
+        }, timeout ?? TimeSpan.FromSeconds(10));
+    }
 }

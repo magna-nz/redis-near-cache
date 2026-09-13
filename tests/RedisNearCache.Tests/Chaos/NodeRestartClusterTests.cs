@@ -83,8 +83,7 @@ public class NodeRestartClusterTests : IClassFixture<ClusterCacheFixture>
         foreach (var (_, key) in keyByEndpoint)
         {
             await ChaosSupport.WithReconnectRetryAsync(async () => await _fx.Cache.SetAsync(key, "v1"), TimeSpan.FromSeconds(30));
-            Assert.Equal("v1", await ChaosSupport.WithReconnectRetryAsync(async () => await _fx.Cache.GetAsync<string>(key), TimeSpan.FromSeconds(30)));
-            Assert.True(_fx.Cache.TryGetLocal<string>(key, out _), $"{key} was not cached after the restart.");
+            Assert.True(await TestHelpers.ReadUntilCachedAsync(_fx.Cache, key, "v1", TimeSpan.FromSeconds(30)), $"{key} was not cached after the restart.");
         }
 
         // The restarted node first, then the other two: all three must still deliver invalidations.

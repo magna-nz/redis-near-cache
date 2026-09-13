@@ -30,8 +30,7 @@ public class KillAllOurConnectionsRepeatedlyTests : IClassFixture<StandaloneCach
         {
             var key = TestHelpers.Key($"kill-round{round}");
             await ChaosSupport.WithReconnectRetryAsync(async () => await _fx.Cache.SetAsync(key, "v1"));
-            Assert.Equal("v1", await ChaosSupport.WithReconnectRetryAsync(async () => await _fx.Cache.GetAsync<string>(key)));
-            Assert.True(_fx.Cache.TryGetLocal<string>(key, out _), $"round {round}: key was not cached before the kill.");
+            Assert.True(await TestHelpers.ReadUntilCachedAsync(_fx.Cache, key, "v1"), $"round {round}: key was not cached before the kill.");
 
             var rearmsBefore = _fx.Cache.Statistics.Rearms;
             var oldRedirect = _fx.Armer.RedirectTargets[endpoint];
@@ -57,9 +56,15 @@ public class KillAllOurConnectionsRepeatedlyTests : IClassFixture<StandaloneCach
             Assert.True(rearmed, $"round {round}: tracking was not re-armed at the live subscriber id after both connections were killed.");
             Assert.True(_fx.Cache.Statistics.Rearms > rearmsBefore, $"round {round}: Statistics.Rearms did not grow.");
 
-            // The kill flushed L1 (every non-Initial arm clears it), so re-read before proving eviction.
-            Assert.Equal("v1", await ChaosSupport.WithReconnectRetryAsync(async () => await _fx.Cache.GetAsync<string>(key)));
-            Assert.True(_fx.Cache.TryGetLocal<string>(key, out _), $"round {round}: key was not re-cached after the re-arm.");
+            // The kill flushed L1 (every non-Initial arm clears it), and the second of the two back-to-back
+            // re-arms (interactive, then subscriber) may still be gating caching when the first one is observed,
+            // so poll until a read is cached again rather than asserting on the first read.
+            var recached = await Poll.UntilAsync(async () =>
+            {
+                var v = await ChaosSupport.WithReconnectRetryAsync(async () => await _fx.Cache.GetAsync<string>(key));
+                return v == "v1" && _fx.Cache.TryGetLocal<string>(key, out _);
+            }, TimeSpan.FromSeconds(10));
+            Assert.True(recached, $"round {round}: key was not re-cached after the re-arm.");
 
             RedisCli.Standalone("SET", key, "v2");
             var evicted = await Poll.UntilAsync(() => !_fx.Cache.TryGetLocal<string>(key, out _), TimeSpan.FromSeconds(10));

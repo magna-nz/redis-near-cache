@@ -63,8 +63,7 @@ public class ClusterRecoveryTests : IClassFixture<ClusterCacheFixture>
         foreach (var (endpoint, key) in keyByEndpoint)
         {
             await Chaos.ChaosSupport.WithReconnectRetryAsync(async () => await _fx.Cache.SetAsync(key, "v1"));
-            Assert.Equal("v1", await Chaos.ChaosSupport.WithReconnectRetryAsync(async () => await _fx.Cache.GetAsync<string>(key)));
-            Assert.True(_fx.Cache.TryGetLocal<string>(key, out _), $"key for {endpoint} was not cached after recovery.");
+            Assert.True(await TestHelpers.ReadUntilCachedAsync(_fx.Cache, key, "v1"), $"key for {endpoint} was not cached after recovery.");
             var hitsBefore = _fx.Cache.Statistics.Hits;
             Assert.Equal("v1", await _fx.Cache.GetAsync<string>(key));
             Assert.Equal(hitsBefore + 1, _fx.Cache.Statistics.Hits);

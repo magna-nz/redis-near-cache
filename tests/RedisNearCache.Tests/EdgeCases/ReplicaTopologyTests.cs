@@ -106,8 +106,7 @@ public class MasterConnectionKillWithReplicaTests
             };
 
             await cache.SetAsync(key, "v1");
-            Assert.Equal("v1", await cache.GetAsync<string>(key));
-            Assert.True(cache.TryGetLocal<string>(key, out _));
+            Assert.True(await TestHelpers.ReadUntilCachedAsync(cache, key, "v1"), "key was not cached after the master re-arm.");
 
             var rearmsBefore = cache.Statistics.Rearms;
             var interactiveId = (long)await masterServer.ExecuteAsync("CLIENT", "ID");
