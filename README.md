@@ -151,15 +151,16 @@ adapters (for session state, output caching, etc.) without `HybridCache`.
 `HybridCache` keeps its own in-process L1 in front of whatever `IDistributedCache` it is given, and that L1
 knows nothing about Redis invalidations: only RedisNearCache's own L1 is evicted when the server invalidates
 a key. To avoid two L1s where only one is coherent, `AddRedisNearCacheHybridCache` sets
-`HybridCacheOptions.DefaultEntryOptions.LocalCacheExpiration` to **10 milliseconds** by default (unless your
-`configure` callback overrides it). `TimeSpan.Zero` cannot be used (`HybridCache`'s underlying `MemoryCache`
-throws for a non-positive relative expiration), and the true smallest positive `TimeSpan` (one tick) is not
-reliable in practice: `HybridCache` persists a newly-computed value to the distributed cache in the
-background rather than awaiting it, so a second `GetOrCreateAsync` immediately afterwards can race that
-still-in-flight write and re-run the factory even though nothing invalidated the entry. Ten milliseconds was
-enough margin for that background write to reliably land first in repeated local testing; it still bounds
-how long a value can survive in `HybridCache`'s own untracked L1 to something small relative to
-`L1MaxAge`'s five-minute default.
+`HybridCacheOptions.DefaultEntryOptions.Flags` to `HybridCacheEntryFlags.DisableLocalCache` (unless your
+`configure` callback overrides it). Every `HybridCache` read then goes to `IDistributedCache`, which is
+RedisNearCache's tracked L1, so nothing is lost: a hit is still served in-process. One consequence: `HybridCache`
+writes a freshly computed value to the distributed tier in the background, so a second `GetOrCreateAsync` issued
+before that write lands (well under 10 ms locally) may run the factory again. Concurrent callers are still
+coalesced by `HybridCache`'s stampede protection. That is an occasional extra factory call, never a stale read. Flags merge per call, so
+`GetOrCreateAsync(key, factory, new HybridCacheEntryOptions { Expiration = ... })` keeps the local cache
+disabled. If you pass explicit `Flags` per call, keep `DisableLocalCache` in them. (A small
+`LocalCacheExpiration` would not have worked: a per-call `Expiration` silently becomes the local expiration
+too, which is how an earlier build of this adapter served stale values for the full entry lifetime.)
 
 **Sliding expiration limitation.** Redis TTLs, and RedisNearCache's `SetAsync`, have no notion of a sliding
 window. `DistributedCacheEntryOptions.SlidingExpiration` is mapped to a plain absolute expiry equal to the

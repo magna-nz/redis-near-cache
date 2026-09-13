@@ -48,6 +48,7 @@ internal sealed class RedisNearCache : IRedisNearCache
         _listener.FlushAll += OnFlushAll;
         _armer.Armed += OnArmed;
         _armer.TrackingLost += OnTrackingLost;
+        _armer.EndpointRemoved += OnEndpointRemoved;
 
         Ready = StartAsync();
     }
@@ -68,10 +69,9 @@ internal sealed class RedisNearCache : IRedisNearCache
         }
     }
 
-    // Ordering rule for every handler below: mark the in-flight tracker FIRST, then touch L1.
-    // A read that stores its reply between the two steps re-checks the tracker after storing (see GetAsync),
-    // so mark-then-clear closes every interleaving; clear-then-mark leaves the "store after clear, re-check
-    // before mark" window open and the stale entry survives.
+    // Ordering rule: mark the in-flight tracker FIRST, then touch L1. A read that stores its reply between the
+    // two steps re-checks the tracker after storing (see GetAsync), so mark-then-clear closes every
+    // interleaving; clear-then-mark leaves the "store after clear, re-check before mark" window open.
 
     private void OnKeyInvalidated(string key)
     {
@@ -80,7 +80,8 @@ internal sealed class RedisNearCache : IRedisNearCache
         Statistics.Invalidation();
     }
 
-    private void OnFlushAll()
+    /// <summary>The one whole-cache flush. Every path that cannot trust L1 comes through here.</summary>
+    private void FlushLocal()
     {
         _inflight.MarkAllInvalidated();
         _options.TestHooks.InsideFlushHandler?.Invoke();
@@ -88,32 +89,40 @@ internal sealed class RedisNearCache : IRedisNearCache
         Statistics.Flush();
     }
 
+    private void OnFlushAll() => FlushLocal();
+
     private void OnArmed(TrackingArmedEvent e)
     {
-        _lostEndpoints.TryRemove(e.EndPoint, out _);
         if (e.Reason != ArmReason.Initial)
         {
-            _inflight.MarkAllInvalidated();
-            _options.TestHooks.InsideFlushHandler?.Invoke();
-            _l1.Clear();
-            Statistics.Flush();
+            FlushLocal();
             Statistics.Rearm();
         }
+        // Re-enable caching only AFTER the flush, so no concurrent read can hit an entry the flush discards.
+        _lostEndpoints.TryRemove(e.EndPoint, out _);
+        _degraded = false;
     }
 
     private void OnTrackingLost(EndPoint endPoint)
     {
-        // Nothing can be trusted while tracking is down on any endpoint: flush, and stop populating L1
-        // until every lost endpoint has been re-armed (see CachingEnabled).
+        // Nothing can be trusted while tracking is down on any endpoint: stop populating L1 first, then flush.
         _lostEndpoints[endPoint] = true;
-        _inflight.MarkAllInvalidated();
-        _options.TestHooks.InsideFlushHandler?.Invoke();
-        _l1.Clear();
-        Statistics.Flush();
+        FlushLocal();
+    }
+
+    private void OnEndpointRemoved(EndPoint endPoint)
+    {
+        // The node left the deployment; it will never be re-armed, so it must not keep us in pass-through.
+        if (_lostEndpoints.TryRemove(endPoint, out _)) FlushLocal();
     }
 
     /// <summary>L1 may only be read or populated while tracking is believed to be armed everywhere.</summary>
     private bool CachingEnabled => !_degraded && _lostEndpoints.IsEmpty;
+
+    private void ThrowIfDisposed()
+    {
+        if (Volatile.Read(ref _disposed) == 1) throw new ObjectDisposedException(nameof(RedisNearCache));
+    }
 
     private bool MatchesPrefixes(string key)
     {
@@ -136,19 +145,30 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     public async ValueTask<T?> GetAsync<T>(string key, CancellationToken cancellationToken = default)
     {
-        try
+        ThrowIfDisposed();
+        if (!Ready.IsCompletedSuccessfully)
         {
-            await Ready.WaitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch
-        {
-            // Tracking could not be armed. Degrade to a pass-through: every read goes to Redis, nothing is
-            // cached, so we can never serve stale data. The failure was already logged by StartAsync.
-            _degraded = true;
+            if (Ready.IsCompleted)
+            {
+                // Faulted or cancelled startup: degrade to a pass-through (every read goes to Redis, nothing is
+                // cached) until the armer's background retry raises Armed. No exception per call.
+                _degraded = true;
+            }
+            else
+            {
+                try
+                {
+                    await Ready.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch
+                {
+                    _degraded = true; // already logged by StartAsync
+                }
+            }
         }
 
         if (CachingEnabled && _l1.TryGet(key, out var cached))
@@ -205,34 +225,51 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     public async ValueTask SetAsync<T>(string key, T value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)
     {
+        ThrowIfDisposed();
         byte[] bytes = _options.Serializer.Serialize(value);
         var db = _connection.Multiplexer.GetDatabase();
         // Tracking is armed with NOLOOP, so the server will not echo this write back as an invalidation.
         // Any read of this key in flight before or during the write must therefore be discarded by us:
         // mark before the write (reads already on the wire) and after it (reads that raced the send).
-        _inflight.MarkInvalidated(key);
-        _l1.Remove(key);
-        await db.StringSetAsync(key, bytes, expiry, When.Always).WaitAsync(cancellationToken).ConfigureAwait(false);
+        InvalidateLocal(key);
+        try
+        {
+            await db.StringSetAsync(key, bytes, expiry, When.Always).WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Even if the reply never came back (timeout, cancellation) the write may have landed.
+            InvalidateLocal(key);
+        }
+    }
+
+    /// <summary>Marks the key for any read in flight, then drops the L1 copy. Order matters; see the note above the handlers.</summary>
+    private void InvalidateLocal(string key)
+    {
         _inflight.MarkInvalidated(key);
         _l1.Remove(key);
     }
 
     public async ValueTask<bool> RemoveAsync(string key, CancellationToken cancellationToken = default)
     {
+        ThrowIfDisposed();
         var db = _connection.Multiplexer.GetDatabase();
-        _inflight.MarkInvalidated(key);
-        _l1.Remove(key);
-        bool removed = await db.KeyDeleteAsync(key).WaitAsync(cancellationToken).ConfigureAwait(false);
-        _inflight.MarkInvalidated(key);
-        _l1.Remove(key);
-        return removed;
+        InvalidateLocal(key);
+        try
+        {
+            return await db.KeyDeleteAsync(key).WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            InvalidateLocal(key);
+        }
     }
 
     public void EvictLocal(string key) => _l1.Remove(key);
 
     public bool TryGetLocal<T>(string key, out T? value)
     {
-        if (_l1.TryGet(key, out var bytes))
+        if (CachingEnabled && Volatile.Read(ref _disposed) == 0 && _l1.TryGet(key, out var bytes))
         {
             value = _options.Serializer.Deserialize<T>(bytes);
             return true;
@@ -253,8 +290,11 @@ internal sealed class RedisNearCache : IRedisNearCache
         _listener.FlushAll -= OnFlushAll;
         _armer.Armed -= OnArmed;
         _armer.TrackingLost -= OnTrackingLost;
+        _armer.EndpointRemoved -= OnEndpointRemoved;
 
+        // Disposing the armer cancels any arm in flight, so a startup racing this dispose finishes promptly.
         await _armer.DisposeAsync().ConfigureAwait(false);
+        try { await Ready.ConfigureAwait(false); } catch { /* faulted or cancelled startup is fine here */ }
         await _listener.DisposeAsync().ConfigureAwait(false);
         _l1.Dispose();
         await _connection.DisposeAsync().ConfigureAwait(false);

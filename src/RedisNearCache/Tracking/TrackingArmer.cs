@@ -91,6 +91,12 @@ internal sealed class TrackingArmer : ITrackingArmer
     /// <inheritdoc />
     public event Action<EndPoint>? TrackingLost;
 
+    /// <inheritdoc />
+    public event Action<EndPoint>? EndpointRemoved;
+
+    /// <summary>Endpoints that currently have a background slow-retry loop; at most one loop per endpoint.</summary>
+    private readonly ConcurrentDictionary<EndPoint, byte> _retrying = new();
+
     /// <summary>
     /// Snapshot of the redirect client id currently believed to be armed on each endpoint. An entry survives a
     /// connection failure (it is the last id we armed) until the endpoint is re-armed; <see cref="TrackingLost"/>
@@ -217,10 +223,16 @@ internal sealed class TrackingArmer : ITrackingArmer
 
         try
         {
+            // Any arm after the initial pass means tracking on this node is, or is about to be, unreliable
+            // (OFF is issued before ON). Say so first, so the facade stops populating L1 for the whole attempt,
+            // including the backoff ladder and a failed TRACKINGINFO verification.
+            if (reason != ArmReason.Initial) Raise(TrackingLost, endPoint, nameof(TrackingLost));
+
             Exception? lastError = null;
             for (var attempt = 0; attempt <= RetryDelays.Length; attempt++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (Volatile.Read(ref _disposed) == 1) return new ObjectDisposedException(nameof(TrackingArmer));
                 if (attempt > 0)
                 {
                     var delay = RetryDelays[attempt - 1];
@@ -262,7 +274,7 @@ internal sealed class TrackingArmer : ITrackingArmer
     /// </summary>
     private async Task<bool> TryArmAsync(EndPoint endPoint, ArmReason reason, CancellationToken cancellationToken)
     {
-        if (Volatile.Read(ref _disposed) == 1) return true;
+        if (Volatile.Read(ref _disposed) == 1) throw new ObjectDisposedException(nameof(TrackingArmer));
 
         var server = _connection.Multiplexer.GetServer(endPoint);
         if (!server.IsConnected)
@@ -381,6 +393,7 @@ internal sealed class TrackingArmer : ITrackingArmer
         try
         {
             if (Volatile.Read(ref _disposed) == 1 || e.EndPoint is not { } endPoint) return;
+            if (!IsTrackedMaster(endPoint)) return;
 
             // Interactive reconnect: the server dropped tracking entirely (TRACKINGINFO flags=off, redirect=-1).
             // Subscription reconnect: the subscriber came back with a NEW client id and the server is still
@@ -413,10 +426,21 @@ internal sealed class TrackingArmer : ITrackingArmer
         {
             if (Volatile.Read(ref _disposed) == 1 || e.EndPoint is not { } endPoint) return;
             if (e.ConnectionType is not (ConnectionType.Interactive or ConnectionType.Subscription)) return;
+            if (!IsTrackedMaster(endPoint))
+            {
+                _logger.LogDebug("RedisNearCache ignored a {ConnectionType} failure on {EndPoint}: not a master we track", e.ConnectionType, endPoint);
+                return;
+            }
 
             _logger.LogWarning(e.Exception, "RedisNearCache lost the {ConnectionType} connection to {EndPoint} ({FailureType}); tracking is not active until it is re-armed",
                 e.ConnectionType, endPoint, e.FailureType);
+            // The server dropped tracking with the connection: forget the redirect id so nothing mistakes
+            // this node for armed. ConnectionRestored normally re-arms it; the slow loop below is the
+            // safety net for a node that never comes back (it raises EndpointRemoved once the node is no
+            // longer a master) and exits quietly if the restore path armed the node first.
+            _redirectTargets.TryRemove(endPoint, out _);
             Raise(TrackingLost, endPoint, nameof(TrackingLost));
+            RetryLater(endPoint, ArmReason.Recovered);
         }
         catch (Exception ex)
         {
@@ -431,11 +455,17 @@ internal sealed class TrackingArmer : ITrackingArmer
         {
             if (Volatile.Read(ref _disposed) == 1) return;
 
-            foreach (var endPoint in MasterEndPoints())
+            var masters = MasterEndPoints();
+            foreach (var endPoint in masters)
             {
                 if (_redirectTargets.ContainsKey(endPoint)) continue;
                 _logger.LogInformation("RedisNearCache saw a configuration change adding master {EndPoint}; arming CLIENT TRACKING", endPoint);
                 QueueArm(endPoint, ArmReason.TopologyChanged);
+            }
+            foreach (var endPoint in _redirectTargets.Keys.ToArray())
+            {
+                if (masters.Contains(endPoint) || IsKnownMaster(endPoint)) continue;
+                RemoveEndpoint(endPoint);
             }
         }
         catch (Exception ex)
@@ -462,7 +492,7 @@ internal sealed class TrackingArmer : ITrackingArmer
             try
             {
                 var error = await ArmWithRetryAsync(endPoint, reason, token).ConfigureAwait(false);
-                if (error is not null) MarkLostAndRetryLater(endPoint, reason);
+                if (error is not null && error is not ObjectDisposedException) MarkLostAndRetryLater(endPoint, reason);
             }
             catch (OperationCanceledException)
             {
@@ -480,16 +510,27 @@ internal sealed class TrackingArmer : ITrackingArmer
 
     /// <summary>
     /// An arm exhausted its retries. Forget the (dead) redirect id so the endpoint is not mistaken for armed,
-    /// raise <see cref="TrackingLost"/> so the facade stops caching, and keep retrying every
-    /// <see cref="SlowRetryInterval"/> until it succeeds or we are disposed.
+    /// raise <see cref="TrackingLost"/> so the facade stops caching, and keep retrying in the background.
     /// </summary>
     private void MarkLostAndRetryLater(EndPoint endPoint, ArmReason reason)
     {
         _redirectTargets.TryRemove(endPoint, out _);
         Raise(TrackingLost, endPoint, nameof(TrackingLost));
+        RetryLater(endPoint, reason);
+    }
+
+    /// <summary>
+    /// Starts (at most one per endpoint) a loop that re-tries the arm every <see cref="SlowRetryInterval"/>
+    /// until it succeeds, the endpoint stops being a master (then <see cref="EndpointRemoved"/> is raised), or
+    /// we are disposed. A recovery is always reported as <see cref="ArmReason.Recovered"/> so the facade
+    /// flushes: reads in flight while the node was untracked must be discarded.
+    /// </summary>
+    private void RetryLater(EndPoint endPoint, ArmReason originalReason)
+    {
+        if (!_retrying.TryAdd(endPoint, 0)) return; // a loop is already running for this endpoint
 
         CancellationToken token;
-        try { token = _shutdown.Token; } catch (ObjectDisposedException) { return; }
+        try { token = _shutdown.Token; } catch (ObjectDisposedException) { _retrying.TryRemove(endPoint, out _); return; }
 
         _ = Task.Run(async () =>
         {
@@ -498,8 +539,16 @@ internal sealed class TrackingArmer : ITrackingArmer
                 while (!token.IsCancellationRequested)
                 {
                     await Task.Delay(SlowRetryInterval, token).ConfigureAwait(false);
-                    _logger.LogInformation("RedisNearCache retrying CLIENT TRACKING arm on {EndPoint} ({Reason}) after the backoff ladder was exhausted", endPoint, reason);
-                    if (await ArmWithRetryAsync(endPoint, reason, token).ConfigureAwait(false) is null) return;
+                    if (_redirectTargets.ContainsKey(endPoint)) return; // armed meanwhile by the restore path
+                    if (!IsKnownMaster(endPoint))
+                    {
+                        _logger.LogInformation("RedisNearCache stopped retrying {EndPoint}: it is no longer a master of this deployment", endPoint);
+                        RemoveEndpoint(endPoint);
+                        return;
+                    }
+                    _logger.LogInformation("RedisNearCache retrying CLIENT TRACKING arm on {EndPoint} (originally {Reason})", endPoint, originalReason);
+                    var error = await ArmWithRetryAsync(endPoint, ArmReason.Recovered, token).ConfigureAwait(false);
+                    if (error is null || error is ObjectDisposedException) return;
                 }
             }
             catch (OperationCanceledException)
@@ -510,7 +559,47 @@ internal sealed class TrackingArmer : ITrackingArmer
             {
                 _logger.LogWarning(ex, "RedisNearCache background re-arm of {EndPoint} stopped unexpectedly", endPoint);
             }
+            finally
+            {
+                _retrying.TryRemove(endPoint, out _);
+            }
         }, CancellationToken.None);
+    }
+
+    private void RemoveEndpoint(EndPoint endPoint)
+    {
+        _redirectTargets.TryRemove(endPoint, out _);
+        _logger.LogInformation("RedisNearCache forgot endpoint {EndPoint}", endPoint);
+        Raise(EndpointRemoved, endPoint, nameof(EndpointRemoved));
+    }
+
+    /// <summary>True when the endpoint is a master we armed or a currently connected master (replicas never qualify).</summary>
+    private bool IsTrackedMaster(EndPoint endPoint)
+    {
+        try
+        {
+            var server = _connection.Multiplexer.GetServer(endPoint);
+            if (server.IsReplica) return false;
+            return _redirectTargets.ContainsKey(endPoint) || MasterEndPoints().Contains(endPoint);
+        }
+        catch (Exception)
+        {
+            return _redirectTargets.ContainsKey(endPoint);
+        }
+    }
+
+    /// <summary>True when the multiplexer still knows the endpoint as a (possibly disconnected) master.</summary>
+    private bool IsKnownMaster(EndPoint endPoint)
+    {
+        try
+        {
+            var server = _connection.Multiplexer.GetServer(endPoint);
+            return !server.IsReplica;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     // --- helpers --------------------------------------------------------------------------------------

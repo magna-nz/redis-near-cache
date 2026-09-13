@@ -15,6 +15,8 @@ internal enum ArmReason
     Manual,
     /// <summary>A master appeared after a cluster configuration change; slots may have moved, so L1 is flushed.</summary>
     TopologyChanged,
+    /// <summary>A background retry succeeded on an endpoint whose earlier arm had failed; L1 is flushed.</summary>
+    Recovered,
 }
 
 /// <summary>Raised after CLIENT TRACKING ON REDIRECT succeeded on one endpoint.</summary>
@@ -36,8 +38,14 @@ internal interface ITrackingArmer : IAsyncDisposable
     /// <summary>Raised after each successful arm, initial or re-arm. Consumers flush L1 for any reason other than Initial.</summary>
     event Action<TrackingArmedEvent>? Armed;
 
-    /// <summary>Raised when tracking on an endpoint is known to be lost (connection failed) and not yet re-armed.</summary>
+    /// <summary>
+    /// Raised when tracking on an endpoint is known or about to be unreliable: its connection failed, or a
+    /// non-initial arm attempt is starting. Consumers stop populating L1 until <see cref="Armed"/> for that endpoint.
+    /// </summary>
     event Action<EndPoint>? TrackingLost;
+
+    /// <summary>Raised when an endpoint is no longer a master of this deployment; consumers forget it entirely.</summary>
+    event Action<EndPoint>? EndpointRemoved;
 
     /// <summary>Current redirect client id per endpoint, for diagnostics and tests.</summary>
     IReadOnlyDictionary<EndPoint, long> RedirectTargets { get; }
