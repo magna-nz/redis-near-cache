@@ -19,6 +19,12 @@ public static class Program
             return 0;
         }
 
+        if (args.Contains("--load"))
+        {
+            await LoadTest.RunAsync(args);
+            return 0;
+        }
+
         var remainingArgs = args.Where(a => a != "--demo").ToArray();
 
         // This machine does not have the dotnet SDK on PATH (only at ~/.dotnet/dotnet), so BenchmarkDotNet's

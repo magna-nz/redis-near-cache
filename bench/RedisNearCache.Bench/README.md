@@ -144,3 +144,57 @@ single-node Redis container. `NearCache_Miss` lands close to (and, on the string
 bookkeeping and deserialization. Because `RunStrategy.Monitoring` takes one measurement per iteration with
 only 10 iterations, run-to-run variance (`Error`/`StdDev`) is higher than a long `Throughput` run would show;
 this is a deliberate trade-off to keep the whole suite finishing in well under a minute.
+
+## Load test (`--load`)
+
+A production-shaped run: many application instances, each with its own private multiplexer (two tracked
+connections), many concurrent readers per instance, and foreign writers whose every `SET` fans out an
+invalidation to every instance that has the key tracked. Ends with a staleness audit of every instance's
+L1 against Redis. Run on an Apple M4 Pro against the repo's local Redis 7.4 container, 2026-09-13.
+
+```bash
+dotnet run -c Release --project bench/RedisNearCache.Bench -- --load            # near cache
+dotnet run -c Release --project bench/RedisNearCache.Bench -- --load --baseline # plain StackExchange.Redis
+dotnet run -c Release --project bench/RedisNearCache.Bench -- --load --chaos    # kills a quarter of the connections at T/2
+# knobs: --instances 20 --readers 8 --writers 4 --writes-per-sec 2000 --keys 10000 --hot-keys 500 --hot-fraction 0.8 --seconds 30 --value-bytes 512
+```
+
+Profile: 20 instances (41 server connections), 8 readers per instance reading as fast as they can,
+4 writers at 2,000 foreign writes/s, 10,000 keys of 512 bytes with 80% of traffic on 500 hot keys, 30 s.
+
+| | Near cache | Plain StackExchange.Redis | Near cache + chaos |
+|---|---:|---:|---:|
+| Reads | 41.1 M (1,369,673/s) | 5.7 M (190,756/s) | 42.3 M (1,407,049/s) |
+| Hit ratio | 95.8 % | n/a | 95.5 % |
+| Hit latency p50 / p99 / p999 | 0.8 / 24.8 / 4,089 µs | n/a | 0.8 / 29.8 / 3,408 µs |
+| Miss latency p50 / p99 / p999 | 1,643 / 12,210 / 36,459 µs | 793 / 1,643 / 2,366 µs (all reads) | 1,370 / 8,479 / 25,319 µs |
+| Foreign writes | 60,040 (2,000/s) | 60,035 (2,000/s) | 60,120 (2,000/s) |
+| Server GET commands | 1.73 M (57,582/s) | 5.72 M (190,756/s) | 1.90 M (63,316/s) |
+| Server total commands | 1.79 M (59,585/s) | 5.78 M (192,758/s) | 1.96 M (65,323/s) |
+| Server network output | 922 MB | 2,839 MB | 994 MB |
+| Invalidations received | 1.07 M (35,532/s, 17.8 per write) | n/a | 0.83 M (27,579/s, 13.8 per write) |
+| Race discards | 4,393 | n/a | 3,879 |
+| Flushes / re-arms | 0 / 0 | n/a | 20 / 10 |
+| Tracking keys on server | 10,025 | n/a | 10,051 |
+| L1 entries audited | 184,246 | n/a | 134,963 |
+| Stale L1 entries after quiescence | **0** | n/a | **0** |
+
+What the numbers say:
+
+- With the same 20 clients, the near cache served 7.2x the reads while sending the server 3.2x fewer
+  commands and 3x less network output. The server's `GET` rate is the miss rate, 4% of reads.
+- Every foreign write reached, on average, 14 to 18 of the 20 instances as an invalidation (the 500 hot keys
+  are tracked by almost everyone). 35k invalidations/s were absorbed with zero stale entries in the audit.
+- The chaos run killed both connections of 5 instances at T/2. Each raised `TrackingLost` for both
+  connections, reconnected, and was re-armed (`InteractiveRestored` and `SubscriptionRestored`) within
+  about 120 ms; the sampled hit ratio dipped by under a point and recovered in the next 5 s window.
+- Miss latency in the near-cache runs is worse than the baseline's read latency (p99 12 ms vs 1.6 ms).
+  That is a load-generator artefact: 160 readers spin at 1.4 M reads/s on a 14-core machine, so the
+  continuation of a network read waits for a thread-pool slot. A service that does real work between
+  reads would not see this. The hit path is unaffected (p50 0.8 µs).
+- Race discards (a reply discarded because an invalidation for that key arrived while the read was in
+  flight) ran at about 1 per 10,000 reads. Each costs one extra round trip on the next read; none cost
+  correctness.
+- Observed once in five near-cache runs and not reproduced: the server closed all 40 tracked sockets at
+  once (`SocketClosed` on both connection types of every instance, no `CLIENT KILL` issued). Every
+  instance raised `TrackingLost`, reconnected and re-armed, and the audit still found 0 stale entries.
