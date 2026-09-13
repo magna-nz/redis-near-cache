@@ -1,0 +1,6 @@
+bin/
+obj/
+*.user
+.DS_Store
+BenchmarkDotNet.Artifacts/
+TestResults/

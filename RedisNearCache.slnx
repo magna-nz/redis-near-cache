@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RedisNearCache.HybridCache/RedisNearCache.HybridCache.csproj" />
+    <Project Path="src/RedisNearCache/RedisNearCache.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RedisNearCache.Tests/RedisNearCache.Tests.csproj" />
+  </Folder>
+</Solution>
