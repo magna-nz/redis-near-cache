@@ -17,8 +17,9 @@ public sealed class RedisNearCacheOptions
 
     /// <summary>
     /// Key prefixes that RedisNearCache will cache locally. Reads of keys outside these prefixes still go to Redis
-    /// through RedisNearCache but are not stored in L1 (and therefore cost nothing to invalidate).
-    /// Empty (default) means every key read through RedisNearCache is cached.
+    /// through RedisNearCache but are not stored in L1. This does not change server-side tracking: every key read
+    /// through RedisNearCache is still tracked, so writes to it still push invalidations. To avoid those, read the
+    /// key through your own multiplexer instead. Empty (default) means every key read through RedisNearCache is cached.
     /// </summary>
     public IList<string> KeyPrefixes { get; } = new List<string>();
 
