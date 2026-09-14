@@ -1,7 +1,7 @@
 <div align="center">
   <img src="docs/mark.svg" alt="RedisNearCache mark" width="104" />
   <h1>RedisNearCache</h1>
-  <p><strong>Client-side caching for StackExchange.Redis. Keeps the values you read in memory and drops them the moment Redis says they changed.</strong></p>
+  <p><strong>Client-side caching on top of StackExchange.Redis. Keeps the values you read in memory and drops them the moment Redis says they changed.</strong></p>
   <p>
     <a href="https://github.com/magna-nz/redis-near-cache/actions/workflows/ci.yml"><img src="https://github.com/magna-nz/redis-near-cache/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
     <a href="https://www.nuget.org/packages/RedisNearCache"><img src="https://img.shields.io/nuget/v/RedisNearCache?label=nuget" alt="NuGet" /></a>
@@ -16,8 +16,8 @@
 
 Redis 6 can tell a client when a key it has read changes (`CLIENT TRACKING`). RedisNearCache uses that to
 keep a local copy of what you read: a hit is served from memory, and a write from anywhere evicts the copy a
-few milliseconds later. It runs on StackExchange.Redis 3.x over its own connection, so nothing about your
-existing setup changes.
+few milliseconds later. It is a package you add next to StackExchange.Redis, not a replacement for it: your existing multiplexer
+keeps doing everything it does today, and RedisNearCache opens one extra connection for the tracked reads.
 
 Redis added this in version 6 back in 2020. StackExchange.Redis [never picked it up](https://github.com/StackExchange/StackExchange.Redis/issues/1461),
 and the 3.x rewrite still ships without it. Rather than fork the library, RedisNearCache sits on top of it: a
