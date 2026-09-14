@@ -12,6 +12,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Suites that must have run (and passed at least this many tests) in every integration job; see
+  # .github/scripts/check-suites-ran.sh. Managed is added per job because its count depends on the server.
+  RNC_REQUIRED_SUITES: Core=1 Chaos=1 EdgeCases=1 Compat=1 Resilience=1 HybridCache=1 Sentinel=4
+
 jobs:
   unit:
     name: unit tests (no Redis)
@@ -34,8 +39,11 @@ jobs:
           path: tests/RedisNearCache.UnitTests/TestResults/*.trx
 
   integration:
+    # The job names are the required status checks in the "Require tests on main" ruleset; renaming a job
+    # means updating the ruleset in the same change, or every PR waits forever for a check that never reports.
     name: integration tests (Redis, replica, cluster)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -43,12 +51,18 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
-      - name: Start Redis 7.4 (standalone, replica, TLS) and the 6-node cluster
+      - name: Start Redis 7.4 (standalone, replica, TLS, cluster, Sentinel, restricted, hostname cluster)
         run: ./up.sh
       - name: Build
         run: dotnet build -c Release -nologo
-      - name: Integration, chaos, edge-case, compat and resilience tests
+      - name: Integration, chaos, edge-case, compat, resilience, Sentinel and managed-style tests
         run: dotnet test tests/RedisNearCache.Tests -c Release --no-build -nologo --filter "Category!=Soak" --logger "trx;LogFileName=integration.trx"
+      - name: Check every suite ran
+        if: always()
+        run: .github/scripts/check-suites-ran.sh tests/RedisNearCache.Tests/TestResults/integration.trx ${{ env.RNC_REQUIRED_SUITES }} Managed=3
+      - name: Container logs
+        if: failure()
+        run: .github/scripts/dump-container-logs.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -58,6 +72,7 @@ jobs:
   matrix:
     name: integration on ${{ matrix.image }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -71,12 +86,19 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
-      - name: Start ${{ matrix.image }} (standalone, replica, TLS, cluster)
+      - name: Start ${{ matrix.image }} (standalone, replica, TLS, cluster, Sentinel, managed-style)
         run: ./up.sh
       - name: Build
         run: dotnet build -c Release -nologo
       - name: Integration tests against ${{ matrix.image }}
         run: dotnet test tests/RedisNearCache.Tests -c Release --no-build -nologo --filter "Category!=Soak" --logger "trx;LogFileName=integration-${{ strategy.job-index }}.trx"
+      # Managed=1: the hostname-announcing cluster needs Redis 7.0+, so on redis:6.2 only the restricted-commands test runs.
+      - name: Check every suite ran
+        if: always()
+        run: .github/scripts/check-suites-ran.sh tests/RedisNearCache.Tests/TestResults/integration-${{ strategy.job-index }}.trx ${{ env.RNC_REQUIRED_SUITES }} Managed=1
+      - name: Container logs
+        if: failure()
+        run: .github/scripts/dump-container-logs.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:

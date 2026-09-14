@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Fix: a Sentinel master that is killed no longer keeps the cache in pass-through forever. An unreachable node
+  now stops counting as a master once another master is connected, or, in a cluster, once it owns no slots.
+  Endpoints are matched by host and port, so hostname-announcing clusters work.
+- Fix: losing or removing an endpoint we had armed always flushes L1, even if the multiplexer already flags it
+  as a replica. After a graceful Sentinel failover, a value read from the demoted master could previously
+  be served stale.
+- Fix: a re-arm that finds the node demoted to replica forgets it (flush, leave pass-through) instead of
+  returning silently.
+- Tests: 20 new unit tests. 8 new Docker-backed integration tests (101 total): Sentinel (arming, invalidation,
+  graceful and `kill -9` failover), plus managed-style emulation (ElastiCache-style disabled admin commands, a
+  hostname-announcing cluster) and an opt-in `RNC_EXTERNAL_REDIS` test against a real managed endpoint.
+- CI: every integration job checks that each suite actually ran, dumps container logs on failure and times out
+  after 45 minutes. `ci-local.sh` runs the same checks locally.
+
 ## 0.4.0 (2026-09-14)
 
 - Cluster failover: the private multiplexer now checks topology every 5 s, so a promoted master is armed
