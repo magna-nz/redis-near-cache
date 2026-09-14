@@ -31,6 +31,11 @@ internal sealed class RedisNearCacheConnection : IAsyncDisposable
         cfg.Protocol = RedisProtocol.Resp2;
         cfg.AllowAdmin = true;
         cfg.ClientName = $"{options.ClientNamePrefix}-{Guid.NewGuid():N}";
+        // After a cluster failover StackExchange.Redis follows MOVED without raising ConfigurationChanged;
+        // it only learns the new master at its periodic topology check (60 s by default). Until then the
+        // promoted node is untracked. Check every 5 s on the private multiplexer (cheap: one ROLE/CLUSTER
+        // NODES per node) unless the caller already asked for something shorter.
+        if (cfg.ConfigCheckSeconds <= 0 || cfg.ConfigCheckSeconds > 5) cfg.ConfigCheckSeconds = 5;
         return cfg;
     }
 

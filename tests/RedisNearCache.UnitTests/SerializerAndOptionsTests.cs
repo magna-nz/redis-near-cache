@@ -51,6 +51,7 @@ public class SerializerAndOptionsTests
         Assert.Equal(RedisProtocol.Resp2, cfg.Protocol);
         Assert.True(cfg.AllowAdmin);
         Assert.StartsWith("rnc-", cfg.ClientName);
+        Assert.Equal(5, cfg.ConfigCheckSeconds); // fast topology checks so a cluster failover is armed promptly
         Assert.NotSame(callers, cfg);
         Assert.Equal(RedisProtocol.Resp3, callers.Protocol);
         Assert.False(callers.AllowAdmin);
