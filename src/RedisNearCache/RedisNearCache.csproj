@@ -3,7 +3,7 @@
     <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <RootNamespace>RedisNearCache</RootNamespace>
     <PackageId>RedisNearCache</PackageId>
-    <Description>Server-assisted client-side caching (Redis CLIENT TRACKING) layered on StackExchange.Redis.</Description>
+    <Description>Client-side caching for StackExchange.Redis. Keeps the values you read in memory and drops them the moment Redis says they changed.</Description>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <IsAotCompatible Condition="'$(TargetFramework)' == 'net10.0'">false</IsAotCompatible>
   </PropertyGroup>
