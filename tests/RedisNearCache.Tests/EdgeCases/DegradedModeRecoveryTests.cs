@@ -38,12 +38,25 @@ public class DegradedModeRecoveryTests
     public DegradedModeRecoveryTests(ITestOutputHelper output) => _out = output;
 
     /// <summary>
+    /// Denying a single subcommand (<c>-client|tracking</c>) needs Redis 7.0: Redis 6.x accepts the rule but
+    /// does not enforce it, so the "arm fails" precondition of these tests cannot be set up there.
+    /// </summary>
+    private bool ServerSupportsSubcommandDeny()
+    {
+        var major = EdgeCaseSupport.ServerMajorVersion();
+        if (major >= 7) return true;
+        _out.WriteLine($"skipped: server major version {major} cannot deny a single subcommand via ACL (needs 7.0+)");
+        return false;
+    }
+
+    /// <summary>
     /// The half of the contract that holds today: startup faults, reads keep working through Redis, nothing is
     /// served locally, and the background loop does keep retrying and does eventually arm the node.
     /// </summary>
     [Fact]
     public async Task DegradedModeServesEveryReadFromRedisAndKeepsRetrying()
     {
+        if (!ServerSupportsSubcommandDeny()) return;
         DenyTracking();
         EdgeCaseProvider? handle = null;
         var key = TestHelpers.Key("degraded-passthrough");
@@ -95,6 +108,7 @@ public class DegradedModeRecoveryTests
     [Fact]
     public async Task DegradedModeRecoversWhenTrackingBecomesPossible()
     {
+        if (!ServerSupportsSubcommandDeny()) return;
         DenyTracking();
         EdgeCaseProvider? handle = null;
         var key = TestHelpers.Key("degraded-recovery");

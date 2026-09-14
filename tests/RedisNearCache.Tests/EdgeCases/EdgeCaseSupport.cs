@@ -67,6 +67,22 @@ internal static class EdgeCaseSupport
     /// with redis-cli (i.e. not through the multiplexer under test, which would be a moving target while
     /// its own connections are being killed).
     /// </summary>
+    /// <summary>Major version of the standalone server (Redis or Valkey), from INFO server.</summary>
+    public static int ServerMajorVersion()
+    {
+        var info = RedisCli.Standalone("INFO", "server");
+        foreach (var line in info.Split('\n'))
+        {
+            var t = line.Trim();
+            if (t.StartsWith("redis_version:", StringComparison.Ordinal) || t.StartsWith("valkey_version:", StringComparison.Ordinal))
+            {
+                var v = t[(t.IndexOf(':') + 1)..];
+                if (int.TryParse(v.Split('.')[0], out var major)) return major;
+            }
+        }
+        return 0;
+    }
+
     public static IReadOnlyList<long> ClientIdsNamed(string clientList, string clientName)
     {
         var ids = new List<long>();
