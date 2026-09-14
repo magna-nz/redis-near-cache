@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (2026-09-14)
 
 - Fix: a Sentinel master that is killed no longer keeps the cache in pass-through forever. An unreachable node
   now stops counting as a master once another master is connected, or, in a cluster, once it owns no slots.
