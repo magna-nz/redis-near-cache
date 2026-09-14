@@ -9,15 +9,19 @@
     <RepositoryType>git</RepositoryType>
     <RepositoryUrl>https://github.com/magna-nz/redis-near-cache</RepositoryUrl>
     <PackageProjectUrl>https://github.com/magna-nz/redis-near-cache</PackageProjectUrl>
-    <PackageTags>redis;valkey;cache;client-side-caching;near-cache;client-tracking;stackexchange.redis;hybridcache</PackageTags>
+    <PackageTags>redis;valkey;cache;caching;client-side-caching;client-side-cache;near-cache;client-tracking;stackexchange.redis;hybridcache;idistributedcache;distributed-cache;memory-cache;l1-cache</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <Copyright>Copyright (c) Daniel Anderson</Copyright>
+    <PackageReleaseNotes>https://github.com/magna-nz/redis-near-cache/releases</PackageReleaseNotes>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <Version>0.1.0</Version>
   </PropertyGroup>
   <ItemGroup Condition="'$(IsPackable)' != 'false'">
-    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="/" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)docs/nuget-readme.md" Pack="true" PackagePath="/README.md" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)docs/icon.png" Pack="true" PackagePath="/" Visible="false" />
     <None Include="$(MSBuildThisFileDirectory)LICENSE" Pack="true" PackagePath="/" Visible="false" />
   </ItemGroup>
 </Project>
