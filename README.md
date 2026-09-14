@@ -102,9 +102,8 @@ on the **[documentation site](https://magna-nz.github.io/redis-near-cache/)**.
 ## Development
 
 ```sh
-docker compose up -d      # Redis 7.4 on :6379 with a replica on :6380
-./cluster-up.sh           # 3-master cluster on :7100-7102
-dotnet test tests/RedisNearCache.Tests
+./up.sh                   # every container the tests need (standalone, replica, TLS, cluster, Sentinel, managed-style)
+dotnet test tests/RedisNearCache.Tests --filter "Category!=Soak"
 ```
 
 ## License
