@@ -23,6 +23,11 @@ Redis added this in version 6 back in 2020. StackExchange.Redis [never picked it
 and the 3.x rewrite still ships without it. Rather than fork the library, RedisNearCache sits on top of it: a
 second connection that it owns does the tracking, and your existing one keeps working exactly as before.
 
+Not tied to StackExchange.Redis? [Respire](https://github.com/thomhurst/Respire) is a newer .NET client with
+this built in over RESP3, and [FreeRedis](https://github.com/2881099/FreeRedis) has had it for years. Both
+are whole clients, so adopting them means changing every Redis call. RedisNearCache is for code that already
+runs on StackExchange.Redis and should stay there.
+
 <div align="center">
   <img src="docs/architecture-diagram.svg" alt="Your code reads through RedisNearCache; misses go over a tracked private connection; Redis pushes invalidations to a private subscriber connection which evicts the local copy" width="820" />
   <br />
