@@ -156,8 +156,10 @@ public static class Program
             .AddExporter(MarkdownExporter.GitHub, JsonExporter.Full)
             .AddFilter(filters);
 
-        BenchmarkRunner.Run(typeof(HitBenchmarks<>), hitConfig, Array.Empty<string>());
-        BenchmarkRunner.Run(typeof(MissBenchmarks<>), missConfig, Array.Empty<string>());
+        // The Type[] overloads: the single-Type overload calls SingleOrDefault on the summaries and throws once a
+        // generic class expands to more than one closed type (both payloads), after running them.
+        BenchmarkRunner.Run(new[] { typeof(HitBenchmarks<>) }, hitConfig, Array.Empty<string>());
+        BenchmarkRunner.Run(new[] { typeof(MissBenchmarks<>) }, missConfig, Array.Empty<string>());
     }
 
     /// <summary>
