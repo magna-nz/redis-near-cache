@@ -30,7 +30,8 @@ Integration tests expect all of them to be running. `ExternalManagedEndpointTest
 - Never touch, configure, or depend on the caller's multiplexer. All Redis traffic for caching goes through
   the private `RedisNearCacheConnection` (RESP2, admin mode, own client name).
 - Tracking is one-shot per key: after an invalidation the server forgets the key until it is read again.
-- Any reconnect of either connection type on any node means: re-arm that node, then flush L1.
+- Any reconnect of either connection type on any master means: re-arm that node, then flush L1. A pre-armed
+  replica's reconnect only drops its pre-arm (nothing in L1 came from it); the next 5 s sweep re-arms it.
 - A read whose key was invalidated while the reply was in flight must not populate L1.
 - No repo-wide git operations from subagents. Commits are made by the coordinator.
 - Warnings are errors in `src/`.

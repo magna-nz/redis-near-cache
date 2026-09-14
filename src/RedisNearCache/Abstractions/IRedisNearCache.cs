@@ -26,6 +26,12 @@ public interface IRedisNearCache : IAsyncDisposable
     /// <summary>Evicts the L1 copy only. Redis is not touched.</summary>
     void EvictLocal(string key);
 
+    /// <summary>
+    /// Drops every L1 entry. Redis is not touched. A read in flight across the call never stores its reply. Use it
+    /// after an operation the server does not invalidate for, such as <c>SWAPDB</c>.
+    /// </summary>
+    void EvictAllLocal();
+
     /// <summary>Returns true and the L1 value when the key is currently cached locally. Never touches Redis.</summary>
     bool TryGetLocal<T>(string key, out T? value);
 
@@ -39,4 +45,14 @@ public interface IRedisNearCache : IAsyncDisposable
     /// armed at all, in which case the cache stays in that pass-through mode permanently.
     /// </summary>
     Task Ready { get; }
+
+    /// <summary>
+    /// True while tracking is armed on every master and L1 is being read and populated. False while the cache is
+    /// in pass-through: before the initial arm finishes, after a connection or master was lost and until it is
+    /// re-armed or forgotten, or permanently if no master could ever be armed.
+    /// </summary>
+    bool IsCoherent { get; }
+
+    /// <summary>Completes when <see cref="IsCoherent"/> is true, immediately if it already is.</summary>
+    Task WaitForCoherenceAsync(CancellationToken cancellationToken = default);
 }

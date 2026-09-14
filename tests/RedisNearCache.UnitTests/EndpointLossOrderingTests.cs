@@ -31,7 +31,7 @@ public class EndpointLossOrderingTests
             var mux = new FakeMultiplexer("rnc-unit");
             topology(mux);
             var connection = FakeRedis.Connection(mux);
-            var armer = new TrackingArmer(connection, NullLogger<TrackingArmer>.Instance);
+            var armer = new TrackingArmer(connection, NullLogger<TrackingArmer>.Instance, Timeout.InfiniteTimeSpan);
             var rig = new Rig
             {
                 Mux = mux,

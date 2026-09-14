@@ -34,12 +34,25 @@ internal sealed class L1Cache : IDisposable
         return false;
     }
 
-    public void Set(string key, byte[] value)
+    /// <summary>
+    /// Stores the entry for at most <see cref="RedisNearCacheOptions.L1MaxAge"/>, or for <paramref name="maxAge"/>
+    /// when that is shorter (the key's remaining server-side TTL). A non-positive <paramref name="maxAge"/> stores
+    /// nothing: the key is already due to expire.
+    /// </summary>
+    public void Set(string key, byte[] value, TimeSpan? maxAge = null)
     {
         var entryOptions = new MemoryCacheEntryOptions { Size = 1 };
-        if (_maxAge != Timeout.InfiniteTimeSpan)
+        TimeSpan? lifetime = _maxAge == Timeout.InfiniteTimeSpan ? null : _maxAge;
+        if (maxAge is { } cap && (lifetime is null || cap < lifetime.Value)) lifetime = cap;
+        if (lifetime is { } age)
         {
-            entryOptions.AbsoluteExpirationRelativeToNow = _maxAge;
+            if (age <= TimeSpan.Zero)
+            {
+                _cache.Remove(key);
+                return;
+            }
+
+            entryOptions.AbsoluteExpirationRelativeToNow = age;
         }
 
         _cache.Set(key, value, entryOptions);

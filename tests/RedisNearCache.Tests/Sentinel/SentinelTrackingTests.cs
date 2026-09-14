@@ -61,12 +61,25 @@ public class SentinelTrackingTests
             Assert.Contains("redirect " + redirect.Value, trackingInfo, StringComparison.Ordinal);
             Assert.Contains("[on", trackingInfo, StringComparison.Ordinal);
 
-            // Replicas are never armed: no connection of ours carries the tracking flag there.
+            // Replicas are pre-armed (so a promotion needs no re-arm), but they are never armed masters: they appear in
+            // ReplicaRedirectTargets only, and the redirect there is that replica's own subscriber connection.
             foreach (var replica in SentinelSupport.DataPorts.Where(port => port != master))
             {
+                Assert.True(p.Multiplexer.GetServers().Any(s => s.EndPoint is not null && Resilience.ResilienceSupport.PortOf(s.EndPoint) == replica),
+                    $"the private multiplexer does not list replica {replica}: {SentinelSupport.DescribeMultiplexer(p.Multiplexer)}");
+                Assert.True(await Poll.UntilAsync(
+                        () => p.Armer.ReplicaRedirectTargets.Keys.Any(ep => Resilience.ResilienceSupport.PortOf(ep) == replica),
+                        TimeSpan.FromSeconds(15), TimeSpan.FromMilliseconds(200)),
+                    $"replica {replica} was not pre-armed: {string.Join(",", p.Armer.ReplicaRedirectTargets.Select(kv => $"{kv.Key}=>{kv.Value}"))}");
+                var replicaRedirect = p.Armer.ReplicaRedirectTargets.Single(kv => Resilience.ResilienceSupport.PortOf(kv.Key) == replica).Value;
                 var replicaLines = await SentinelSupport.ClientLinesAsync(replica, p.Connection.ClientName);
-                Assert.DoesNotContain(replicaLines, l => SentinelSupport.Field(l, "flags")?.Contains('t', StringComparison.Ordinal) == true);
+                var replicaSubscribers = replicaLines
+                    .Where(l => SentinelSupport.Field(l, "flags")?.Contains('P', StringComparison.Ordinal) == true)
+                    .Select(l => long.Parse(SentinelSupport.Field(l, "id")!, System.Globalization.CultureInfo.InvariantCulture));
+                Assert.Contains(replicaRedirect, replicaSubscribers);
+                Assert.Contains(replicaLines, l => SentinelSupport.Field(l, "flags")?.Contains('t', StringComparison.Ordinal) == true);
             }
+            Assert.Equal([master], SentinelSupport.ArmedPorts(p.Armer));
         }
         catch
         {

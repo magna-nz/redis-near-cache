@@ -17,11 +17,17 @@ user writes ──► user's own multiplexer / any client ──► Redis ──
 1. `RedisNearCacheConnection` opens a **private** `ConnectionMultiplexer` from a clone of the caller's
    options with `Protocol=Resp2`, `AllowAdmin=true` and a unique `ClientName`.
 2. `TrackingArmer`, per master node: `CLIENT LIST` → find our subscriber connection (name + `P` flag) →
-   `CLIENT TRACKING OFF` → `CLIENT TRACKING ON REDIRECT <subscriber id>` on that node's interactive connection.
+   `CLIENT TRACKING OFF` → `CLIENT TRACKING ON REDIRECT <subscriber id> OPTOUT NOLOOP` on that node's interactive
+   connection. Every connected replica whose replication link is up is armed ahead of time the same way (no
+   preceding `OFF`, followed by `ROLE` on the same connection to confirm it is still a replica), so a failover
+   promotion needs no re-arm. A pre-armed replica whose link goes down is disarmed at the next 5 s sweep: a full
+   resync empties its keyspace, and the server reports that to tracking clients as the null invalidation a
+   `FLUSHDB` sends, which would flush L1 for nothing.
 3. `InvalidationListener` subscribes to `__redis__:invalidate`; each message names one key (or is null = flush).
 4. `L1Cache` stores values read through the private multiplexer; reads of tracked keys served locally.
-5. Only keys read through RedisNearCache are tracked, because only its connection is tracked. Prefix opt-in
-   further limits what is stored in L1.
+5. Only keys read through RedisNearCache are tracked, because only its connection is tracked. When `KeyPrefixes`
+   is non-empty, a read of a key outside it is preceded by `CLIENT CACHING NO` inside a `MULTI`/`EXEC` (so the
+   two commands stay adjacent on the wire), which stops the server tracking it as well as keeping it out of L1.
 
 ## Why these choices (from the spike)
 
@@ -34,7 +40,7 @@ user writes ──► user's own multiplexer / any client ──► Redis ──
 | Flush L1 on every re-arm | Anything invalidated during the gap was lost. |
 | Flush L1 when an endpoint is lost or removed | Its tracking may be gone with no invalidation ever sent (see Endpoint lifecycle). |
 | In-flight set | An invalidation can arrive between sending GET and storing the reply. Reply is discarded if the key was invalidated meanwhile. |
-| No `OPTIN`/`OPTOUT` | `CLIENT CACHING YES` must be adjacent on the wire to the next command; impossible on a multiplexed connection. |
+| `OPTOUT`, not `OPTIN` | `CLIENT CACHING YES`/`NO` only needs to be adjacent to the next command, which a `MULTI`/`EXEC` guarantees even on a multiplexed connection (verified on Redis 7.4 and through StackExchange.Redis 3.2). `OPTOUT` keeps the common, cacheable read a single `GET`; `OPTIN` would wrap every cacheable read in a four-command transaction instead. |
 | No Garnet | Garnet does not implement `CLIENT TRACKING`. Valkey and Redis 6+ do. |
 
 ## Components and ownership
@@ -56,11 +62,19 @@ GetAsync<T>(key):
   if L1.TryGet(key) → Statistics.Hit; return
   Statistics.Miss
   inflight.Begin(key)                      // records a version/token
-  bytes = await privateDb.StringGetAsync(key)
+  cacheable = key matches KeyPrefixes (or KeyPrefixes is empty)
+  if not cacheable and caching enabled:
+    bytes = await privateDb via MULTI / CLIENT CACHING NO / GET / EXEC   // adjacent on the wire: not tracked
+  else if cacheable and caching enabled and RespectServerTtl:
+    bytes, ttlMs = await privateDb pipelined GET(key) + PTTL(key)        // one round trip
+  else:
+    bytes = await privateDb.StringGetAsync(key)                          // pass-through: plain, tracked GET
   await TestHooks.AfterRedisReadBeforeStore?(key)
   if bytes is null → inflight.End(key); return default
-  if inflight.WasInvalidated(key) → Statistics.RaceDiscard; do not store
-  else if key matches prefixes → L1.Set(key, bytes, MaxAge)
+  if cacheable:
+    cap = ttlMs switch { null or -1 → MaxAge, < 0 (vanished between GET and PTTL) → discard, ms → min(MaxAge, ms) }
+    if cap is discard or inflight.WasInvalidated(key) → Statistics.RaceDiscard; do not store
+    else → L1.Set(key, bytes, cap)
   inflight.End(key)
   return Serializer.Deserialize<T>(bytes)
 ```
@@ -77,7 +91,7 @@ The armer raises three lifecycle events per endpoint; the facade mirrors them in
 | Event | Raised when | Facade |
 |---|---|---|
 | `TrackingLost` | a connection of a tracked endpoint (armed, waited on, or a connected master) failed, an arm gave up, or any non-initial arm starts | add to lost set, flush |
-| `Armed` | `CLIENT TRACKING ON REDIRECT` verified | flush unless Initial, then remove from lost set |
+| `Armed` | `CLIENT TRACKING ON REDIRECT` verified, or a pre-armed replica promoted (`Promoted`: no re-arm) | flush unless Initial, then remove from lost set |
 | `EndpointRemoved` | an endpoint we armed or lost is no longer a master of the deployment | flush (always), then remove from lost set |
 
 L1 is read and populated only while the lost set is empty (**pass-through rule**). Every `TrackingLost` is
@@ -107,8 +121,10 @@ be a master forever:
   `CLUSTER NODES` yields `127.0.0.1:7201`. No readable view → stays a master.
 
 A graceful cluster failover (`CLUSTER FAILOVER`) keeps our connections: the old master is flagged replica at the
-next topology check and removed (flush), and the promoted one is armed with `TopologyChanged` (flush).
+next topology check and removed (flush). The promoted one, if it was pre-armed while still a replica, is reported
+as `Promoted` (no re-arm, so the reads it served since the failover stay tracked, and no pass-through gap; L1 is
+flushed once for the entries read from the demoted master); otherwise it is armed with `TopologyChanged` (flush).
 
 ## Not in v1
 
-RESP3 push tracking, opt-in/opt-out modes, Garnet, write-through population of L1 (`SetAsync` evicts and lets the next read re-track).
+RESP3 push tracking, `OPTIN` tracking, Garnet, write-through population of L1 (`SetAsync` evicts and lets the next read re-track).

@@ -6,7 +6,9 @@ Redis 6 can tell a client when a key it has read changes (`CLIENT TRACKING`). Re
 
 StackExchange.Redis [never picked up client tracking](https://github.com/StackExchange/StackExchange.Redis/issues/1461), and the 3.x rewrite still ships without it. RedisNearCache sits on top of it rather than forking it.
 
-Needs Redis 6 or newer, or Valkey. Garnet does not implement `CLIENT TRACKING`.
+Needs Redis 6 or newer, or Valkey. Garnet does not implement `CLIENT TRACKING`, and neither Redis
+Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis Software) nor ElastiCache Serverless are
+supported.
 
 ## Install
 
