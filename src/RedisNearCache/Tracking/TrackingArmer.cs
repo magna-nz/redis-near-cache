@@ -94,8 +94,21 @@ internal sealed class TrackingArmer : ITrackingArmer
     /// <inheritdoc />
     public event Action<EndPoint>? EndpointRemoved;
 
-    /// <summary>Endpoints that currently have a background slow-retry loop; at most one loop per endpoint.</summary>
-    private readonly ConcurrentDictionary<EndPoint, byte> _retrying = new();
+    /// <summary>
+    /// Endpoints that currently have a background slow-retry loop; at most one loop per endpoint. The value is the
+    /// owning loop's marker, so a loop that is exiting never removes the entry of a loop started after it.
+    /// </summary>
+    private readonly ConcurrentDictionary<EndPoint, object> _retrying = new();
+
+    /// <summary>
+    /// Endpoints for which <see cref="TrackingLost"/> was the last lifecycle event raised, i.e. the facade is in
+    /// pass-through waiting on them. Every such endpoint must eventually get <see cref="Armed"/> or
+    /// <see cref="EndpointRemoved"/>. Mutated and raised together under <see cref="_lifecycle"/>, so the order the
+    /// facade sees events in always matches this set, even when two threads raise for the same endpoint.
+    /// </summary>
+    private readonly ConcurrentDictionary<EndPoint, byte> _lost = new();
+
+    private readonly object _lifecycle = new();
 
     /// <summary>
     /// Snapshot of the redirect client id currently believed to be armed on each endpoint. An entry survives a
@@ -196,6 +209,7 @@ internal sealed class TrackingArmer : ITrackingArmer
         }
 
         _redirectTargets.Clear();
+        _lost.Clear();
         foreach (var gate in _gates.Values) gate.Dispose();
         _gates.Clear();
         _shutdown.Dispose();
@@ -226,7 +240,7 @@ internal sealed class TrackingArmer : ITrackingArmer
             // Any arm after the initial pass means tracking on this node is, or is about to be, unreliable
             // (OFF is issued before ON). Say so first, so the facade stops populating L1 for the whole attempt,
             // including the backoff ladder and a failed TRACKINGINFO verification.
-            if (reason != ArmReason.Initial) Raise(TrackingLost, endPoint, nameof(TrackingLost));
+            if (reason != ArmReason.Initial) MarkLost(endPoint, forgetRedirect: false);
 
             Exception? lastError = null;
             for (var attempt = 0; attempt <= RetryDelays.Length; attempt++)
@@ -285,7 +299,18 @@ internal sealed class TrackingArmer : ITrackingArmer
 
         if (server.IsReplica)
         {
-            _logger.LogDebug("RedisNearCache skipped arming {EndPoint}: it is a replica", endPoint);
+            // Nothing to arm on a replica. If we had armed it, or told the facade it was lost (every non-initial
+            // arm does), it was a master and has been demoted: forget it, which flushes L1 and releases the facade
+            // from pass-through. Returning without an event would leave the facade waiting for it forever.
+            if (_redirectTargets.ContainsKey(endPoint) || _lost.ContainsKey(endPoint))
+            {
+                _logger.LogInformation("RedisNearCache found {EndPoint} is a replica now ({Reason}); forgetting it", endPoint, reason);
+                RemoveEndpoint(endPoint);
+            }
+            else
+            {
+                _logger.LogDebug("RedisNearCache skipped arming {EndPoint}: it is a replica", endPoint);
+            }
             return true;
         }
 
@@ -304,10 +329,14 @@ internal sealed class TrackingArmer : ITrackingArmer
 
         if (!await VerifyAsync(server, endPoint, redirectId, cancellationToken).ConfigureAwait(false)) return false;
 
-        _redirectTargets[endPoint] = redirectId;
         _logger.LogInformation("RedisNearCache armed CLIENT TRACKING on {EndPoint} redirecting to client {RedirectClientId} ({Reason})",
             endPoint, redirectId, reason);
-        Raise(Armed, new TrackingArmedEvent(endPoint, redirectId, reason), nameof(Armed));
+        lock (_lifecycle)
+        {
+            _redirectTargets[endPoint] = redirectId;
+            _lost.TryRemove(endPoint, out _);
+            Raise(Armed, new TrackingArmedEvent(endPoint, redirectId, reason), nameof(Armed));
+        }
         return true;
     }
 
@@ -437,9 +466,8 @@ internal sealed class TrackingArmer : ITrackingArmer
             // The server dropped tracking with the connection: forget the redirect id so nothing mistakes
             // this node for armed. ConnectionRestored normally re-arms it; the slow loop below is the
             // safety net for a node that never comes back (it raises EndpointRemoved once the node is no
-            // longer a master) and exits quietly if the restore path armed the node first.
-            _redirectTargets.TryRemove(endPoint, out _);
-            Raise(TrackingLost, endPoint, nameof(TrackingLost));
+            // longer a master) and exits quietly if the endpoint was armed or forgotten first.
+            MarkLost(endPoint, forgetRedirect: true);
             RetryLater(endPoint, ArmReason.Recovered);
         }
         catch (Exception ex)
@@ -448,7 +476,12 @@ internal sealed class TrackingArmer : ITrackingArmer
         }
     }
 
-    /// <summary>Cluster topology changed: arm any master we have never armed. Known endpoints are left alone.</summary>
+    /// <summary>
+    /// Topology changed: arm any connected master we have not armed, and forget every endpoint we armed or lost
+    /// that is no longer a master (demoted to replica, dropped by the multiplexer, or - outside a cluster -
+    /// disconnected while another master is connected). A disconnected cluster master needs the slot map, which
+    /// is a network call, so it is left to the background retry loop.
+    /// </summary>
     private void OnConfigurationChanged(object? sender, EndPointEventArgs e)
     {
         try
@@ -462,9 +495,15 @@ internal sealed class TrackingArmer : ITrackingArmer
                 _logger.LogInformation("RedisNearCache saw a configuration change adding master {EndPoint}; arming CLIENT TRACKING", endPoint);
                 QueueArm(endPoint, ArmReason.TopologyChanged);
             }
-            foreach (var endPoint in _redirectTargets.Keys.ToArray())
+
+            var candidates = _redirectTargets.Keys.Concat(_lost.Keys).Distinct().Where(ep => !masters.Contains(ep)).ToArray();
+            if (candidates.Length == 0) return;
+            var servers = ServerViews();
+            if (servers.Count == 0) return; // no view of the deployment: never forget endpoints on the strength of nothing
+            foreach (var endPoint in candidates)
             {
-                if (masters.Contains(endPoint) || IsKnownMaster(endPoint)) continue;
+                if (MasterRole.FromMultiplexer(endPoint, servers) is not false) continue;
+                _logger.LogInformation("RedisNearCache saw a configuration change after which {EndPoint} is no longer a master of this deployment", endPoint);
                 RemoveEndpoint(endPoint);
             }
         }
@@ -514,23 +553,24 @@ internal sealed class TrackingArmer : ITrackingArmer
     /// </summary>
     private void MarkLostAndRetryLater(EndPoint endPoint, ArmReason reason)
     {
-        _redirectTargets.TryRemove(endPoint, out _);
-        Raise(TrackingLost, endPoint, nameof(TrackingLost));
+        MarkLost(endPoint, forgetRedirect: true);
         RetryLater(endPoint, reason);
     }
 
     /// <summary>
     /// Starts (at most one per endpoint) a loop that re-tries the arm every <see cref="SlowRetryInterval"/>
-    /// until it succeeds, the endpoint stops being a master (then <see cref="EndpointRemoved"/> is raised), or
-    /// we are disposed. A recovery is always reported as <see cref="ArmReason.Recovered"/> so the facade
-    /// flushes: reads in flight while the node was untracked must be discarded.
+    /// until the endpoint is armed, it stops being a master (then <see cref="EndpointRemoved"/> is raised), it
+    /// was forgotten by another path, or we are disposed. A recovery is always reported as
+    /// <see cref="ArmReason.Recovered"/> so the facade flushes: reads in flight while the node was untracked must
+    /// be discarded.
     /// </summary>
     private void RetryLater(EndPoint endPoint, ArmReason originalReason)
     {
-        if (!_retrying.TryAdd(endPoint, 0)) return; // a loop is already running for this endpoint
+        var marker = new object();
+        if (!_retrying.TryAdd(endPoint, marker)) return; // a loop is already running for this endpoint
 
         CancellationToken token;
-        try { token = _shutdown.Token; } catch (ObjectDisposedException) { _retrying.TryRemove(endPoint, out _); return; }
+        try { token = _shutdown.Token; } catch (ObjectDisposedException) { _retrying.TryRemove(KeyValuePair.Create(endPoint, marker)); return; }
 
         _ = Task.Run(async () =>
         {
@@ -539,8 +579,8 @@ internal sealed class TrackingArmer : ITrackingArmer
                 while (!token.IsCancellationRequested)
                 {
                     await Task.Delay(SlowRetryInterval, token).ConfigureAwait(false);
-                    if (_redirectTargets.ContainsKey(endPoint)) return; // armed meanwhile by the restore path
-                    if (!IsKnownMaster(endPoint))
+                    if (!_lost.ContainsKey(endPoint)) return; // armed or forgotten meanwhile: the facade is not waiting on it
+                    if (!await IsKnownMasterAsync(endPoint, token).ConfigureAwait(false))
                     {
                         _logger.LogInformation("RedisNearCache stopped retrying {EndPoint}: it is no longer a master of this deployment", endPoint);
                         RemoveEndpoint(endPoint);
@@ -561,45 +601,135 @@ internal sealed class TrackingArmer : ITrackingArmer
             }
             finally
             {
-                _retrying.TryRemove(endPoint, out _);
+                _retrying.TryRemove(KeyValuePair.Create(endPoint, marker));
+                // A failure that raced this loop's exit found the loop still registered and started none of its
+                // own; without this the endpoint would stay lost with nobody resolving it.
+                if (_lost.ContainsKey(endPoint) && !token.IsCancellationRequested && Volatile.Read(ref _disposed) == 0)
+                    RetryLater(endPoint, originalReason);
             }
         }, CancellationToken.None);
     }
 
-    private void RemoveEndpoint(EndPoint endPoint)
+    /// <summary>
+    /// Raises <see cref="TrackingLost"/> and records that the facade is now waiting on this endpoint. With
+    /// <paramref name="forgetRedirect"/> the redirect id is dropped too (the server no longer honours it).
+    /// </summary>
+    private void MarkLost(EndPoint endPoint, bool forgetRedirect)
     {
-        _redirectTargets.TryRemove(endPoint, out _);
-        _logger.LogInformation("RedisNearCache forgot endpoint {EndPoint}", endPoint);
-        Raise(EndpointRemoved, endPoint, nameof(EndpointRemoved));
+        lock (_lifecycle)
+        {
+            if (forgetRedirect) _redirectTargets.TryRemove(endPoint, out _);
+            _lost[endPoint] = 0;
+            Raise(TrackingLost, endPoint, nameof(TrackingLost));
+        }
     }
 
-    /// <summary>True when the endpoint is a master we armed or a currently connected master (replicas never qualify).</summary>
+    /// <summary>
+    /// Forgets an endpoint we armed or lost and raises <see cref="EndpointRemoved"/>, on which the facade flushes L1
+    /// (entries read from that node are no longer protected by anything) and stops waiting on it. A no-op for an
+    /// endpoint that is neither, so two paths deciding the same removal raise it once.
+    /// </summary>
+    private void RemoveEndpoint(EndPoint endPoint)
+    {
+        lock (_lifecycle)
+        {
+            var wasArmed = _redirectTargets.TryRemove(endPoint, out _);
+            var wasLost = _lost.TryRemove(endPoint, out _);
+            if (!wasArmed && !wasLost) return;
+            _logger.LogInformation("RedisNearCache forgot endpoint {EndPoint} (was {State})", endPoint, wasArmed ? "armed" : "lost");
+            Raise(EndpointRemoved, endPoint, nameof(EndpointRemoved));
+        }
+    }
+
+    /// <summary>
+    /// True when losing this endpoint's connections matters: we armed it or are waiting on it (whatever its role is
+    /// now - a node flagged replica before its connections drop still holds tracking state for entries in L1), or
+    /// it is a connected master.
+    /// </summary>
     private bool IsTrackedMaster(EndPoint endPoint)
     {
+        if (_redirectTargets.ContainsKey(endPoint) || _lost.ContainsKey(endPoint)) return true;
         try
         {
             var server = _connection.Multiplexer.GetServer(endPoint);
             if (server.IsReplica) return false;
-            return _redirectTargets.ContainsKey(endPoint) || MasterEndPoints().Contains(endPoint);
-        }
-        catch (Exception)
-        {
-            return _redirectTargets.ContainsKey(endPoint);
-        }
-    }
-
-    /// <summary>True when the multiplexer still knows the endpoint as a (possibly disconnected) master.</summary>
-    private bool IsKnownMaster(EndPoint endPoint)
-    {
-        try
-        {
-            var server = _connection.Multiplexer.GetServer(endPoint);
-            return !server.IsReplica;
+            return MasterEndPoints().Contains(endPoint);
         }
         catch (Exception)
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// True while the endpoint is still a master of the deployment (see <see cref="MasterRole"/>). For a disconnected
+    /// cluster master this asks a connected node for <c>CLUSTER NODES</c>; when no node can answer it stays a master.
+    /// </summary>
+    private async Task<bool> IsKnownMasterAsync(EndPoint endPoint, CancellationToken cancellationToken)
+    {
+        IServer[] servers;
+        try
+        {
+            servers = _connection.Multiplexer.GetServers();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "RedisNearCache could not enumerate servers to check whether {EndPoint} is still a master", endPoint);
+            return true;
+        }
+
+        if (servers.Length == 0) return true;
+        var local = MasterRole.FromMultiplexer(endPoint, ToViews(servers));
+        if (local is { } decided) return decided;
+
+        foreach (var server in servers.Where(s => s.IsConnected && s.EndPoint is not null && !s.EndPoint.Equals(endPoint)).OrderBy(s => s.IsReplica ? 1 : 0))
+        {
+            ClusterConfiguration? configuration;
+            try
+            {
+                configuration = await server.ClusterNodesAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "RedisNearCache could not read CLUSTER NODES from {Server}", server.EndPoint);
+                continue;
+            }
+
+            if (configuration is null) continue;
+            var nodes = configuration.Nodes
+                .Select(n => new ClusterNodeView(n.EndPoint, n.Hostname, n.IsReplica, n.Slots.Count > 0))
+                .ToList();
+
+            var known = MasterRole.FromClusterNodes(endPoint, nodes);
+            if (!known && endPoint is DnsEndPoint dns)
+            {
+                // Names did not match; the host may still resolve to the address the cluster reports for a slot owner.
+                try
+                {
+                    var addresses = await Dns.GetHostAddressesAsync(dns.Host, cancellationToken).ConfigureAwait(false);
+                    known = MasterRole.FromClusterNodes(endPoint, nodes, addresses);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "RedisNearCache could not resolve {Host} while checking whether {EndPoint} still owns slots", dns.Host, endPoint);
+                }
+            }
+
+            _logger.LogDebug("RedisNearCache CLUSTER NODES from {Server}: {EndPoint} {State}", server.EndPoint, endPoint,
+                known ? "still serves slots as a master" : "serves no slots as a master");
+            return known;
+        }
+
+        _logger.LogDebug("RedisNearCache could not read the cluster topology from any connected node; still treating {EndPoint} as a master", endPoint);
+        return true;
     }
 
     // --- helpers --------------------------------------------------------------------------------------
@@ -620,6 +750,31 @@ internal sealed class TrackingArmer : ITrackingArmer
         }
 
         return endPoints;
+    }
+
+    /// <summary>Snapshot of every server the multiplexer knows, for <see cref="MasterRole"/>. Empty on failure.</summary>
+    private List<ServerView> ServerViews()
+    {
+        try
+        {
+            return ToViews(_connection.Multiplexer.GetServers());
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "RedisNearCache could not enumerate servers");
+            return [];
+        }
+    }
+
+    private static List<ServerView> ToViews(IServer[] servers)
+    {
+        var views = new List<ServerView>(servers.Length);
+        foreach (var server in servers)
+        {
+            if (server.EndPoint is { } endPoint) views.Add(new ServerView(endPoint, server.IsConnected, server.IsReplica, server.ServerType));
+        }
+
+        return views;
     }
 
     private void Raise<T>(Action<T>? handler, T argument, string name)

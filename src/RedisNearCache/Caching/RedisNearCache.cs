@@ -115,8 +115,12 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     private void OnEndpointRemoved(EndPoint endPoint)
     {
-        // The node left the deployment; it will never be re-armed, so it must not keep us in pass-through.
-        if (_lostEndpoints.TryRemove(endPoint, out _)) FlushLocal();
+        // The node is no longer a master of the deployment (demoted, failed over, or gone). Entries read from it are
+        // protected by nothing now - its tracking may already be gone without an invalidation ever arriving - so
+        // flush unconditionally, even if tracking was never reported lost there. Then stop waiting on it: it will
+        // never be re-armed, so it must not keep us in pass-through. Flush first, re-enable after, as in OnArmed.
+        FlushLocal();
+        _lostEndpoints.TryRemove(endPoint, out _);
     }
 
     /// <summary>L1 may only be read or populated while tracking is believed to be armed everywhere.</summary>
