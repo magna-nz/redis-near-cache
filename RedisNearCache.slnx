@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/bench/">
     <Project Path="bench/RedisNearCache.Bench/RedisNearCache.Bench.csproj" />
+    <Project Path="bench/RedisNearCache.Bench.Report/RedisNearCache.Bench.Report.csproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/MinimalApi/MinimalApi.csproj" />

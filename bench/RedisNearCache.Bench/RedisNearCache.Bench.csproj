@@ -8,9 +8,18 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/RedisNearCache/RedisNearCache.csproj" />
+    <ProjectReference Include="../../src/RedisNearCache.HybridCache/RedisNearCache.HybridCache.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="BenchmarkDotNet" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <!-- Pinned explicitly so the 2.x-built packages below bind to the repo's StackExchange.Redis 3.x at runtime. -->
+    <PackageReference Include="StackExchange.Redis" />
+    <PackageReference Include="Microsoft.Extensions.Caching.Memory" />
+    <PackageReference Include="Microsoft.Extensions.Caching.Hybrid" />
+    <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" />
+    <PackageReference Include="ZiggyCreatures.FusionCache" />
+    <PackageReference Include="ZiggyCreatures.FusionCache.Serialization.SystemTextJson" />
+    <PackageReference Include="ZiggyCreatures.FusionCache.Backplane.StackExchangeRedis" />
   </ItemGroup>
 </Project>

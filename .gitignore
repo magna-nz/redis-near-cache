@@ -7,3 +7,4 @@ TestResults/
 certs/*.crt
 certs/*.key
 certs/*.srl
+bench/results/
