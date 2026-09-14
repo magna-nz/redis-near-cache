@@ -25,7 +25,8 @@ public class ClusterRecoveryTests : IClassFixture<ClusterCacheFixture>
     public async Task ClusterReadsAfterAllNodesKilledRecover()
     {
         var mux = _fx.Connection.Multiplexer;
-        var endpoints = mux.GetEndPoints();
+        // Masters only: replicas are never armed and have no redirect target.
+        var endpoints = _fx.Masters().Select(s => s.EndPoint!).ToArray();
         var anyServer = mux.GetServer(endpoints[0]);
         var keyByEndpoint = TestHelpers.KeyPerMaster(mux, anyServer, endpoints);
         Assert.Equal(3, keyByEndpoint.Count);

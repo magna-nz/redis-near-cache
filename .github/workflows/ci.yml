@@ -43,22 +43,58 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
-      - name: Start Redis 7.4 (standalone + replica) and the 3-master cluster
-        run: |
-          docker compose up -d
-          ./cluster-up.sh
-          for i in $(seq 1 30); do docker exec redis-near-cache-redis redis-cli ping 2>/dev/null | grep -q PONG && break; sleep 1; done
-          for i in $(seq 1 30); do docker exec redis-near-cache-replica redis-cli -p 6380 info replication 2>/dev/null | grep -q master_link_status:up && break; sleep 1; done
-          docker exec redis-near-cache-replica redis-cli -p 6380 info replication | grep master_link_status
+      - name: Start Redis 7.4 (standalone, replica, TLS) and the 6-node cluster
+        run: ./up.sh
       - name: Build
         run: dotnet build -c Release -nologo
-      - name: Integration, chaos and edge-case tests
-        run: dotnet test tests/RedisNearCache.Tests -c Release --no-build -nologo --logger "trx;LogFileName=integration.trx"
+      - name: Integration, chaos, edge-case, compat and resilience tests
+        run: dotnet test tests/RedisNearCache.Tests -c Release --no-build -nologo --filter "Category!=Soak" --logger "trx;LogFileName=integration.trx"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: integration-test-results
           path: tests/RedisNearCache.Tests/TestResults/*.trx
+
+  matrix:
+    name: integration on ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["redis:6.2", "redis:7.0", "redis:7.2", "redis:8", "valkey/valkey:8.1"]
+    env:
+      RNC_REDIS_IMAGE: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Start ${{ matrix.image }} (standalone, replica, TLS, cluster)
+        run: ./up.sh
+      - name: Build
+        run: dotnet build -c Release -nologo
+      - name: Integration tests against ${{ matrix.image }}
+        run: dotnet test tests/RedisNearCache.Tests -c Release --no-build -nologo --filter "Category!=Soak" --logger "trx;LogFileName=integration-${{ strategy.job-index }}.trx"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-results-${{ strategy.job-index }}
+          path: tests/RedisNearCache.Tests/TestResults/*.trx
+
+  soak:
+    name: soak tests (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: ./up.sh
+      - run: dotnet build -c Release -nologo
+      - run: dotnet test tests/RedisNearCache.Tests -c Release --no-build -nologo --filter "Category=Soak"
 
   pack:
     name: pack

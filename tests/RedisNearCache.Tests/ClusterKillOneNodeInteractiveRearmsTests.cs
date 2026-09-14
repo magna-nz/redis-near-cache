@@ -14,7 +14,8 @@ public class ClusterKillOneNodeInteractiveRearmsTests : IClassFixture<ClusterCac
     public async Task ClusterKillOneNodeInteractiveRearms()
     {
         var mux = _fx.Connection.Multiplexer;
-        var endpoints = mux.GetEndPoints();
+        // Masters only: replicas are never armed and have no redirect target.
+        var endpoints = _fx.Masters().Select(s => s.EndPoint!).ToArray();
         var targetEndpoint = endpoints.First(e => ((IPEndPoint)e).Port == ClusterCacheFixture.MasterPorts[0]);
         var targetPort = ((IPEndPoint)targetEndpoint).Port;
         var otherEndpoints = endpoints.Where(e => !e.Equals(targetEndpoint)).ToArray();

@@ -1,14 +1,25 @@
+# Test infrastructure. Override the server image for the whole stack with RNC_REDIS_IMAGE
+# (e.g. RNC_REDIS_IMAGE=valkey/valkey:8.1 ./up.sh). Run ./up.sh rather than `docker compose up`
+# so the TLS certificates exist before the containers start.
 services:
   redis:
-    image: redis:7.4
+    image: ${RNC_REDIS_IMAGE:-redis:7.4}
     container_name: redis-near-cache-redis
     ports:
       - "6379:6379"
     command: ["redis-server", "--save", "", "--appendonly", "no"]
   replica:
-    image: redis:7.4
+    image: ${RNC_REDIS_IMAGE:-redis:7.4}
     container_name: redis-near-cache-replica
     depends_on: [redis]
     ports:
       - "6380:6380"
     command: ["redis-server", "--port", "6380", "--replicaof", "redis", "6379", "--save", "", "--appendonly", "no", "--replica-announce-ip", "127.0.0.1", "--replica-announce-port", "6380"]
+  redis-tls:
+    image: ${RNC_REDIS_IMAGE:-redis:7.4}
+    container_name: redis-near-cache-tls
+    ports:
+      - "6390:6390"
+    volumes:
+      - ./certs:/certs:ro
+    command: ["redis-server", "--port", "0", "--tls-port", "6390", "--tls-cert-file", "/certs/redis.crt", "--tls-key-file", "/certs/redis.key", "--tls-ca-cert-file", "/certs/ca.crt", "--tls-auth-clients", "no", "--save", "", "--appendonly", "no"]

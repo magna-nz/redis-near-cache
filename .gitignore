@@ -4,3 +4,6 @@ obj/
 .DS_Store
 BenchmarkDotNet.Artifacts/
 TestResults/
+certs/*.crt
+certs/*.key
+certs/*.srl
