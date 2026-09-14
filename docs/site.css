@@ -1,6 +1,8 @@
 /* RedisNearCache documentation site.
-   Three columns: fixed navigation, prose, dark code rail.
-   Light by default, dark when the viewer asks for it. The code rail is always dark. */
+   Three columns: fixed navigation, prose, code rail.
+   Light by default, dark when the viewer asks for it. Code blocks are always dark;
+   the rail itself is the page background so a long prose run is not shadowed by
+   an empty dark band. */
 
 :root {
   color-scheme: light;
@@ -30,8 +32,7 @@
   --teal: #1f7a6d;
   --slate: #3e5470;
 
-  /* always dark */
-  --rail-bg: #1a1f36;
+  /* code blocks: always dark */
   --rail-rule: #2b3150;
   --code-bg: #12162b;
   --code-ink: #d7dcec;
@@ -145,18 +146,6 @@ code, pre, kbd { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Me
   align-items: start;
 }
 
-.codeband {
-  position: fixed;
-  top: var(--topbar-h);
-  right: 0;
-  bottom: 0;
-  width: calc(var(--code-col) + var(--main-pad));
-  background: var(--rail-bg);
-  border-left: 1px solid var(--rail-rule);
-  z-index: 0;
-  pointer-events: none;
-}
-
 /* ---------- navigation ---------- */
 
 .sidebar {
@@ -207,8 +196,11 @@ code, pre, kbd { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Me
 }
 
 .section { scroll-margin-top: calc(var(--topbar-h) + 8px); }
-.section > .row:first-child > .prose { padding-top: 44px; }
-.section + .section > .row:first-child > .prose { border-top: 1px solid var(--rule); margin-top: 44px; }
+/* The section divider and its top spacing belong to the whole row, so the first
+   code block starts level with the section's first line rather than above it. */
+.section > .row:first-child > .prose,
+.section > .row:first-child > .rail { padding-top: 44px; }
+.section + .section > .row:first-child { border-top: 1px solid var(--rule); margin-top: 44px; }
 
 .row {
   display: grid;
@@ -218,7 +210,15 @@ code, pre, kbd { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Me
 }
 
 .prose { min-width: 0; padding: 0 8px 20px 0; max-width: 72ch; }
-.rail { min-width: 0; padding: 0 0 20px; }
+.rail {
+  min-width: 0;
+  padding: 0 0 20px;
+  /* Stay beside the prose this code documents while it scrolls past. The row is
+     only as tall as its prose (align-items: start), so a short rail sticks and a
+     rail taller than the viewport simply scrolls with the page. */
+  position: sticky;
+  top: calc(var(--topbar-h) + 16px);
+}
 .rail:empty { padding: 0; }
 
 h1, h2, h3, h4 { color: var(--ink-strong); line-height: 1.25; text-wrap: balance; }
@@ -388,13 +388,13 @@ figcaption { font-size: 13.5px; color: var(--muted); margin-top: 10px; }
 .tok-punct { color: var(--tok-punct); }
 
 .rail-note {
-  color: var(--code-muted);
+  color: var(--muted);
   font-size: 12.5px;
   line-height: 1.6;
   margin: -6px 0 16px;
   padding: 0 2px;
 }
-.rail-note code { color: var(--code-ink); font-size: 0.92em; }
+.rail-note code { color: var(--ink); font-size: 0.92em; }
 
 /* ---------- footer ---------- */
 
@@ -420,7 +420,6 @@ figcaption { font-size: 13.5px; color: var(--muted); margin-top: 10px; }
 
 @media (max-width: 900px) {
   :root { --nav-col: 0px; --code-col: 0px; }
-  .codeband { display: none; }
   .layout { display: block; }
   .sidebar {
     position: static;
@@ -438,13 +437,15 @@ figcaption { font-size: 13.5px; color: var(--muted); margin-top: 10px; }
   .main { padding: 0 20px 80px; }
   .row { display: block; }
   .prose { max-width: none; padding-right: 0; }
-  .rail { padding-bottom: 4px; }
+  .rail { padding-bottom: 4px; position: static; }
   .section > .row:first-child > .prose { padding-top: 30px; }
-  .section + .section > .row:first-child > .prose { margin-top: 30px; }
+  .section > .row:first-child > .rail { padding-top: 0; }
+  .section + .section > .row:first-child { margin-top: 30px; }
   body { font-size: 15.5px; }
 }
 
 @media print {
-  .sidebar, .codeband, .topbar, .copy { display: none; }
+  .sidebar, .topbar, .copy { display: none; }
   .row { display: block; }
+  .rail { position: static; }
 }
