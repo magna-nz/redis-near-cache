@@ -101,16 +101,6 @@ docker compose up -d      # Redis 7.4 on :6379 with a replica on :6380
 dotnet test tests/RedisNearCache.Tests
 ```
 
-`tests/RedisNearCache.UnitTests` needs no Redis (tracker, L1, serializer, configuration, adapter mapping).
-`tests/RedisNearCache.Tests` are integration tests against those containers: reconnects, replica, cluster,
-races, stress, chaos, degraded mode and recovery. CI runs both on every push and pull request.
-
-## Releasing
-
-Publish a GitHub release whose tag is `vX.Y.Z` (or push that tag). CI runs the unit and integration tests,
-packs both packages at that version, pushes them to nuget.org through Trusted Publishing (the workflow's
-GitHub identity, no stored secret), and attaches the `.nupkg` files to the release.
-
 ## License
 
 MIT
