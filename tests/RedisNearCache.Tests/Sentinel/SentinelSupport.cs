@@ -36,53 +36,47 @@ internal static class SentinelSupport
     private static string P(int port) => port.ToString(CultureInfo.InvariantCulture);
 
     // --- redis-cli ------------------------------------------------------------------------------------------
+    // Everything that shells out is async (DockerProcess): these helpers are polled throughout a failover, while
+    // StackExchange.Redis's own Sentinel reconnect is holding pool threads.
 
     /// <summary>redis-cli against one port inside the sentinel container; throws on a non-zero exit.</summary>
-    public static string Cli(int port, params string[] args)
-    {
-        var full = new List<string> { "-p", P(port) };
-        full.AddRange(args);
-        return RedisCli.Run(Container, full.ToArray());
-    }
+    public static Task<string> CliAsync(int port, params string[] args) =>
+        RedisCli.RunAsync(Container, ["-p", P(port), .. args]);
 
     /// <summary>Non-throwing form, for polls and for servers that may be down.</summary>
-    public static (int ExitCode, string StdOut, string StdErr) TryCli(int port, params string[] args)
-    {
-        var full = new List<string> { "redis-cli", "-p", P(port) };
-        full.AddRange(args);
-        return DockerExec.Run(Container, full.ToArray());
-    }
+    public static Task<(int ExitCode, string StdOut, string StdErr)> TryCliAsync(int port, params string[] args) =>
+        DockerExec.RunAsync(Container, ["redis-cli", "-p", P(port), .. args]);
 
-    public static bool ContainerRunning()
+    public static async Task<bool> ContainerRunningAsync()
     {
-        var r = ResilienceSupport.Docker("inspect", "-f", "{{.State.Running}}", Container);
+        var r = await ResilienceSupport.DockerAsync("inspect", "-f", "{{.State.Running}}", Container);
         return r.ExitCode == 0 && r.StdOut.Trim() == "true";
     }
 
-    public static bool IsAlive(int port)
+    public static async Task<bool> IsAliveAsync(int port)
     {
-        var r = TryCli(port, "PING");
+        var r = await TryCliAsync(port, "PING");
         return r.ExitCode == 0 && r.StdOut.Contains("PONG", StringComparison.Ordinal);
     }
 
     // --- sentinel / replication view ------------------------------------------------------------------------
 
     /// <summary>The master port one sentinel reports for <c>mymaster</c>, or null if it does not answer.</summary>
-    public static int? ReportedMaster(int sentinelPort)
+    public static async Task<int?> ReportedMasterAsync(int sentinelPort)
     {
-        var r = TryCli(sentinelPort, "SENTINEL", "get-master-addr-by-name", ServiceName);
+        var r = await TryCliAsync(sentinelPort, "SENTINEL", "get-master-addr-by-name", ServiceName);
         if (r.ExitCode != 0) return null;
         var lines = r.StdOut.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         return lines.Length == 2 && int.TryParse(lines[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var port) ? port : null;
     }
 
     /// <summary>The master port when all three sentinels report the same one; otherwise null.</summary>
-    public static int? AgreedMaster()
+    public static async Task<int?> AgreedMasterAsync()
     {
         int? agreed = null;
         foreach (var s in SentinelPorts)
         {
-            if (ReportedMaster(s) is not { } port) return null;
+            if (await ReportedMasterAsync(s) is not { } port) return null;
             if (agreed is not null && agreed != port) return null;
             agreed = port;
         }
@@ -91,10 +85,10 @@ internal static class SentinelSupport
     }
 
     /// <summary><c>INFO replication</c> of one data server as key/value pairs; empty when the server is down.</summary>
-    public static Dictionary<string, string> Replication(int port)
+    public static async Task<Dictionary<string, string>> ReplicationAsync(int port)
     {
         var result = new Dictionary<string, string>(StringComparer.Ordinal);
-        var r = TryCli(port, "INFO", "replication");
+        var r = await TryCliAsync(port, "INFO", "replication");
         if (r.ExitCode != 0) return result;
         foreach (var line in r.StdOut.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
@@ -105,11 +99,12 @@ internal static class SentinelSupport
         return result;
     }
 
-    public static bool IsMaster(int port) => Replication(port).TryGetValue("role", out var role) && role == "master";
+    public static async Task<bool> IsMasterAsync(int port) =>
+        (await ReplicationAsync(port)).TryGetValue("role", out var role) && role == "master";
 
-    public static bool IsReplicaOf(int port, int masterPort)
+    public static async Task<bool> IsReplicaOfAsync(int port, int masterPort)
     {
-        var info = Replication(port);
+        var info = await ReplicationAsync(port);
         return info.TryGetValue("role", out var role) && role == "slave"
                && info.TryGetValue("master_port", out var mp) && mp == P(masterPort)
                && info.TryGetValue("master_link_status", out var link) && link == "up";
@@ -142,16 +137,16 @@ internal static class SentinelSupport
     /// failover in progress, not down), sees both other data servers as healthy replicas, and can reach quorum.
     /// Anything less and a <c>SENTINEL FAILOVER</c> may be refused or pick nothing.
     /// </summary>
-    public static bool SentinelsHealthy(int master)
+    public static async Task<bool> SentinelsHealthyAsync(int master)
     {
         foreach (var s in SentinelPorts)
         {
-            if (ReportedMaster(s) != master) return false;
+            if (await ReportedMasterAsync(s) != master) return false;
 
-            var m = TryCli(s, "SENTINEL", "master", ServiceName);
+            var m = await TryCliAsync(s, "SENTINEL", "master", ServiceName);
             if (m.ExitCode != 0 || PortsAndFlags(m.StdOut) is not [var (mPort, mFlags)] || mPort != master || mFlags != "master") return false;
 
-            var replicas = TryCli(s, "SENTINEL", "replicas", ServiceName);
+            var replicas = await TryCliAsync(s, "SENTINEL", "replicas", ServiceName);
             if (replicas.ExitCode != 0) return false;
             var seen = PortsAndFlags(replicas.StdOut);
             foreach (var port in DataPorts.Where(p => p != master))
@@ -159,20 +154,20 @@ internal static class SentinelSupport
                 if (!seen.Any(e => e.Port == port && e.Flags == "slave")) return false;
             }
 
-            var quorum = TryCli(s, "SENTINEL", "ckquorum", ServiceName);
+            var quorum = await TryCliAsync(s, "SENTINEL", "ckquorum", ServiceName);
             if (quorum.ExitCode != 0 || !quorum.StdOut.StartsWith("OK", StringComparison.Ordinal)) return false;
         }
 
         return true;
     }
 
-    public static string Describe()
+    public static async Task<string> DescribeAsync()
     {
         var parts = new List<string>();
-        foreach (var s in SentinelPorts) parts.Add($"sentinel {s} -> {ReportedMaster(s)?.ToString(CultureInfo.InvariantCulture) ?? "?"}");
+        foreach (var s in SentinelPorts) parts.Add($"sentinel {s} -> {(await ReportedMasterAsync(s))?.ToString(CultureInfo.InvariantCulture) ?? "?"}");
         foreach (var p in DataPorts)
         {
-            var info = Replication(p);
+            var info = await ReplicationAsync(p);
             if (info.Count == 0)
             {
                 parts.Add($"{p}: down");
@@ -194,28 +189,33 @@ internal static class SentinelSupport
     /// Brings the deployment to a known, failover-ready state and returns the current master port: restarts any
     /// data server that a previous test killed (as a replica of the agreed master), then waits until exactly one
     /// server is master, the other two replicate from it with the link up, and every sentinel is healthy (see
-    /// <see cref="SentinelsHealthy"/>). Throws with a description when that cannot be reached, so a broken
+    /// <see cref="SentinelsHealthyAsync"/>). Throws with a description when that cannot be reached, so a broken
     /// environment fails the test loudly instead of letting it pass vacuously.
     /// </summary>
     public static async Task<int> EnsureHealthyAsync(TimeSpan? timeout = null)
     {
-        if (!ContainerRunning())
+        if (!await ContainerRunningAsync())
             throw new InvalidOperationException($"container {Container} is not running; start it with ./sentinel-up.sh");
 
         var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(120));
         while (true)
         {
-            if (AgreedMaster() is { } master && IsMaster(master))
+            if (await AgreedMasterAsync() is { } master && await IsMasterAsync(master))
             {
-                foreach (var port in DataPorts.Where(p => p != master && !IsAlive(p)))
-                    RestartAsReplica(port, master);
+                var replicas = DataPorts.Where(p => p != master).ToArray();
+                foreach (var port in replicas)
+                {
+                    if (!await IsAliveAsync(port)) await RestartAsReplicaAsync(port, master);
+                }
 
-                if (DataPorts.Where(p => p != master).All(p => IsReplicaOf(p, master)) && SentinelsHealthy(master))
+                var replicating = true;
+                foreach (var port in replicas) replicating &= await IsReplicaOfAsync(port, master);
+                if (replicating && await SentinelsHealthyAsync(master))
                     return master;
             }
 
             if (DateTime.UtcNow >= deadline)
-                throw new InvalidOperationException("the sentinel deployment did not reach a healthy state: " + Describe() +
+                throw new InvalidOperationException("the sentinel deployment did not reach a healthy state: " + await DescribeAsync() +
                                                     "\n(re-create it with ./sentinel-up.sh)");
             await Task.Delay(TimeSpan.FromMilliseconds(500));
         }
@@ -223,14 +223,15 @@ internal static class SentinelSupport
 
     /// <summary>
     /// Asks a sentinel to fail over, retrying while it answers <c>-INPROG</c>/<c>-NOGOODSLAVE</c> (a previous
-    /// failover still settling). Returns the last reply.
+    /// failover still settling). Returns the last reply. Always asks the first sentinel, which therefore leads the
+    /// failover (a user-requested failover skips the election).
     /// </summary>
     public static async Task<(bool Ok, string Reply)> SentinelFailoverAsync(TimeSpan? timeout = null)
     {
         var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(30));
         while (true)
         {
-            var r = TryCli(SentinelPorts[0], "SENTINEL", "FAILOVER", ServiceName);
+            var r = await TryCliAsync(SentinelPorts[0], "SENTINEL", "FAILOVER", ServiceName);
             var reply = (r.StdOut + " " + r.StdErr).Trim();
             if (r.ExitCode == 0 && reply.StartsWith("OK", StringComparison.Ordinal)) return (true, reply);
             if (DateTime.UtcNow >= deadline) return (false, reply);
@@ -242,12 +243,37 @@ internal static class SentinelSupport
     public static async Task<int?> WaitForNewMasterAsync(int oldMaster, TimeSpan timeout)
     {
         int? found = null;
-        await Poll.UntilAsync(() =>
+        await Poll.UntilAsync(async () =>
         {
-            found = AgreedMaster() is { } m && m != oldMaster ? m : null;
+            found = await AgreedMasterAsync() is { } m && m != oldMaster ? m : null;
             return found is not null;
         }, timeout, TimeSpan.FromMilliseconds(200));
         return found;
+    }
+
+    /// <summary>
+    /// After a <c>SENTINEL FAILOVER</c> sent to the first sentinel: waits until either all sentinels agree on a new
+    /// master, or the failover is over without one - once <paramref name="failoverTimeout"/> has passed,
+    /// <paramref name="oldMaster"/> is again healthy master in every sentinel's view, including the leader's, whose
+    /// flags drop <c>failover_in_progress</c> only when it ends. The second outcome is Sentinel aborting its own forced
+    /// failover (<c>-failover-abort-slave-timeout</c>): a sentinel that has not seen the new epoch yet converts the
+    /// promoted replica back before the leader observes the promotion. Nothing the client does causes that, so the
+    /// failover test re-issues the failover instead of failing. Neither outcome within <paramref name="deadline"/>
+    /// returns (null, false).
+    /// </summary>
+    public static async Task<(int? NewMaster, bool Aborted)> WaitForFailoverOutcomeAsync(int oldMaster, TimeSpan failoverTimeout, TimeSpan deadline)
+    {
+        var clock = Stopwatch.StartNew();
+        int? found = null;
+        var aborted = false;
+        await Poll.UntilAsync(async () =>
+        {
+            found = await AgreedMasterAsync() is { } m && m != oldMaster ? m : null;
+            if (found is not null) return true;
+            aborted = clock.Elapsed > failoverTimeout && await SentinelsHealthyAsync(oldMaster);
+            return aborted;
+        }, deadline, TimeSpan.FromMilliseconds(200));
+        return (found, found is null && aborted);
     }
 
     // --- killing and restarting one data server --------------------------------------------------------------
@@ -256,13 +282,13 @@ internal static class SentinelSupport
     /// Hard failure: <c>kill -9</c> of the redis-server process listening on <paramref name="port"/> (pid read from
     /// <c>INFO server</c>, since the images ship no pgrep). No shutdown handshake, no final replication.
     /// </summary>
-    public static int Kill(int port)
+    public static async Task<int> KillAsync(int port)
     {
-        var info = Cli(port, "INFO", "server");
+        var info = await CliAsync(port, "INFO", "server");
         var pidLine = info.Split('\n', StringSplitOptions.TrimEntries).First(l => l.StartsWith("process_id:", StringComparison.Ordinal));
         var pid = int.Parse(pidLine["process_id:".Length..], NumberStyles.Integer, CultureInfo.InvariantCulture);
         // kill is a shell builtin in these images (there is no /bin/kill), hence bash -c.
-        var r = DockerExec.Run(Container, "bash", "-c", $"kill -9 {P(pid)}");
+        var r = await DockerExec.RunAsync(Container, "bash", "-c", $"kill -9 {P(pid)}");
         if (r.ExitCode != 0) throw new InvalidOperationException($"kill -9 {pid} ({port}) exited {r.ExitCode}: {r.StdErr}");
         return pid;
     }
@@ -272,18 +298,18 @@ internal static class SentinelSupport
     /// of <paramref name="masterPort"/> (the last <c>--replicaof</c> wins over the recorded one and over anything
     /// Sentinel's CONFIG REWRITE left in the config file).
     /// </summary>
-    public static void RestartAsReplica(int port, int masterPort)
+    public static async Task RestartAsReplicaAsync(int port, int masterPort)
     {
         var script = $"eval redis-server /sentinel/redis-{P(port)}.conf $(cat /sentinel/redis-{P(port)}.args) --replicaof 127.0.0.1 {P(masterPort)}";
-        var r = DockerExec.Run(Container, "bash", "-c", script);
+        var r = await DockerExec.RunAsync(Container, "bash", "-c", script);
         if (r.ExitCode != 0) throw new InvalidOperationException($"restarting {port} exited {r.ExitCode}: {r.StdOut} {r.StdErr}");
     }
 
     // --- client list -------------------------------------------------------------------------------------------
 
     /// <summary><c>CLIENT LIST</c> lines of one data server whose name is <paramref name="clientName"/>.</summary>
-    public static IReadOnlyList<string> ClientLines(int port, string clientName) =>
-        Cli(port, "CLIENT", "LIST")
+    public static async Task<IReadOnlyList<string>> ClientLinesAsync(int port, string clientName) =>
+        (await CliAsync(port, "CLIENT", "LIST"))
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(l => l.Contains($" name={clientName} ", StringComparison.Ordinal))
             .ToArray();
@@ -341,26 +367,27 @@ internal static class SentinelSupport
 
     /// <summary>Waits for a replica to hold <paramref name="expected"/> for a key, so a failover cannot lose it.</summary>
     public static Task<bool> ReplicatedAsync(int replicaPort, string key, string expected) =>
-        Poll.UntilAsync(() => TryCli(replicaPort, "GET", key).StdOut == expected, TimeSpan.FromSeconds(15), TimeSpan.FromMilliseconds(100));
+        Poll.UntilAsync(async () => (await TryCliAsync(replicaPort, "GET", key)).StdOut == expected, TimeSpan.FromSeconds(15), TimeSpan.FromMilliseconds(100));
 
     /// <summary>
     /// For failure messages: the value of each key on every data server, and our client's connections there
     /// (id, flags, redirect, last command).
     /// </summary>
-    public static string DescribeNodes(string clientName, params string[] keys)
+    public static async Task<string> DescribeNodesAsync(string clientName, params string[] keys)
     {
         var sb = new System.Text.StringBuilder();
         foreach (var port in DataPorts)
         {
-            if (!IsAlive(port))
+            if (!await IsAliveAsync(port))
             {
                 sb.AppendLine($"  {port}: down");
                 continue;
             }
 
-            var values = string.Join(", ", keys.Select(k => $"{k[^14..]}={TryCli(port, "GET", k).StdOut}"));
-            sb.AppendLine($"  {port} ({(IsMaster(port) ? "master" : "replica")}): {values}");
-            foreach (var line in ClientLines(port, clientName))
+            var values = new List<string>();
+            foreach (var k in keys) values.Add($"{k[^14..]}={(await TryCliAsync(port, "GET", k)).StdOut}");
+            sb.AppendLine($"  {port} ({(await IsMasterAsync(port) ? "master" : "replica")}): {string.Join(", ", values)}");
+            foreach (var line in await ClientLinesAsync(port, clientName))
                 sb.AppendLine($"    id={Field(line, "id")} flags={Field(line, "flags")} redir={Field(line, "redir") ?? "n/a"} cmd={Field(line, "cmd")} age={Field(line, "age")}");
         }
 

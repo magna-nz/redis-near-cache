@@ -19,7 +19,7 @@ public class SentinelTrackingTests
     public async Task ConnectingThroughSentinelArmsTheReportedMaster()
     {
         var master = await SentinelSupport.EnsureHealthyAsync();
-        _out.WriteLine("before: " + SentinelSupport.Describe());
+        _out.WriteLine("before: " + await SentinelSupport.DescribeAsync());
 
         var p = await SentinelSupport.BuildAsync();
         try
@@ -35,7 +35,7 @@ public class SentinelTrackingTests
 
             // Independent confirmation from redis-cli on the master: our subscriber connection (flag P) is the redirect
             // target, and one of our connections carries the tracking flag (t).
-            var lines = SentinelSupport.ClientLines(master, p.Connection.ClientName);
+            var lines = await SentinelSupport.ClientLinesAsync(master, p.Connection.ClientName);
             foreach (var line in lines) _out.WriteLine($"{master}: {line}");
             var subscriberIds = lines
                 .Where(l => SentinelSupport.Field(l, "flags")?.Contains('P', StringComparison.Ordinal) == true)
@@ -64,7 +64,7 @@ public class SentinelTrackingTests
             // Replicas are never armed: no connection of ours carries the tracking flag there.
             foreach (var replica in SentinelSupport.DataPorts.Where(port => port != master))
             {
-                var replicaLines = SentinelSupport.ClientLines(replica, p.Connection.ClientName);
+                var replicaLines = await SentinelSupport.ClientLinesAsync(replica, p.Connection.ClientName);
                 Assert.DoesNotContain(replicaLines, l => SentinelSupport.Field(l, "flags")?.Contains('t', StringComparison.Ordinal) == true);
             }
         }
@@ -89,7 +89,7 @@ public class SentinelTrackingTests
         try
         {
             var cache = p.Cache;
-            SentinelSupport.Cli(master, "SET", key, "v1");
+            await SentinelSupport.CliAsync(master, "SET", key, "v1");
 
             Assert.Equal("v1", await cache.GetAsync<string>(key));
             Assert.True(cache.TryGetLocal<string>(key, out var local) && local == "v1", "the first read did not populate L1.");
@@ -101,7 +101,7 @@ public class SentinelTrackingTests
             Assert.Equal(missesBefore, cache.Statistics.Misses);
 
             var invalidationsBefore = cache.Statistics.Invalidations;
-            SentinelSupport.Cli(master, "SET", key, "v2");
+            await SentinelSupport.CliAsync(master, "SET", key, "v2");
             var evicted = await Poll.UntilAsync(() => !cache.TryGetLocal<string>(key, out _), TimeSpan.FromSeconds(10));
             Assert.True(evicted, $"a foreign write on master {master} did not evict the key. stats={cache.Statistics}");
             Assert.True(cache.Statistics.Invalidations > invalidationsBefore);
@@ -116,7 +116,7 @@ public class SentinelTrackingTests
         finally
         {
             await p.DisposeAsync();
-            SentinelSupport.TryCli(master, "DEL", key);
+            await SentinelSupport.TryCliAsync(master, "DEL", key);
         }
     }
 }

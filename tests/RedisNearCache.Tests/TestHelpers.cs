@@ -66,7 +66,8 @@ internal static class TestHelpers
         {
             string? value;
             try { value = await cache.GetAsync<string>(key); }
-            catch (StackExchange.Redis.RedisException) { return false; }
+            // RedisTimeoutException derives from TimeoutException, not RedisException, so it is named separately.
+            catch (Exception ex) when (ex is StackExchange.Redis.RedisException or StackExchange.Redis.RedisTimeoutException) { return false; }
             return value == expected && cache.TryGetLocal<string>(key, out _);
         }, timeout ?? TimeSpan.FromSeconds(10));
     }
