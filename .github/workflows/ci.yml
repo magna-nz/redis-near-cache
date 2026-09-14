@@ -98,7 +98,8 @@ jobs:
 
   pack:
     name: pack
-    needs: [unit, integration]
+    # A release must pass on every supported server, not only Redis 7.4.
+    needs: [unit, integration, matrix]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

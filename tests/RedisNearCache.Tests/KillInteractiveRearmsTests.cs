@@ -31,8 +31,8 @@ public class KillInteractiveRearmsTests : IClassFixture<StandaloneCacheFixture>
         // Prove tracking actually works again: read, external write, evicted.
         var key = TestHelpers.Key("interactive-rearm");
         await _fx.Cache.SetAsync(key, "v1");
-        Assert.Equal("v1", await _fx.Cache.GetAsync<string>(key));
-        Assert.True(_fx.Cache.TryGetLocal<string>(key, out _));
+        // The second of the two re-arms may still be gating caching; poll until a read is cached again.
+        Assert.True(await TestHelpers.ReadUntilCachedAsync(_fx.Cache, key, "v1"), "key was not re-cached after the re-arm.");
 
         RedisCli.Standalone("SET", key, "v2");
         var evicted = await Poll.UntilAsync(() => !_fx.Cache.TryGetLocal<string>(key, out _));

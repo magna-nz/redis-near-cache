@@ -41,8 +41,7 @@ public class KillSubscriberRearmsTests : IClassFixture<StandaloneCacheFixture>
         // the dead subscriber id until re-armed. Prove an external write is still delivered after the re-arm.
         var key = TestHelpers.Key("subscriber-rearm");
         await _fx.Cache.SetAsync(key, "v1");
-        Assert.Equal("v1", await _fx.Cache.GetAsync<string>(key));
-        Assert.True(_fx.Cache.TryGetLocal<string>(key, out _));
+        Assert.True(await TestHelpers.ReadUntilCachedAsync(_fx.Cache, key, "v1"), "key was not re-cached after the re-arm.");
 
         RedisCli.Standalone("SET", key, "v2");
         var evicted = await Poll.UntilAsync(() => !_fx.Cache.TryGetLocal<string>(key, out _));
