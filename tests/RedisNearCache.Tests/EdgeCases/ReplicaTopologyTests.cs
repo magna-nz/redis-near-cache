@@ -121,9 +121,9 @@ public class MasterConnectionKillWithReplicaTests
                 $"killing the master's interactive connection did not re-arm it while a replica was present. stats={cache.Statistics}");
             _out.WriteLine($"after master kill: {cache.Statistics}");
 
-            // The re-arm flushed L1; reads must recover to hits and tracking must work again.
-            Assert.Equal("v1", await Chaos.ChaosSupport.WithReconnectRetryAsync(async () => await cache.GetAsync<string>(key)));
-            Assert.True(cache.TryGetLocal<string>(key, out _), "the key was not re-cached after the re-arm.");
+            // The re-arm flushed L1 and may still be gating caching for a moment; poll until a read is cached
+            // again, then reads must be hits and tracking must work again.
+            Assert.True(await TestHelpers.ReadUntilCachedAsync(cache, key, "v1"), "the key was not re-cached after the re-arm.");
             var hits = cache.Statistics.Hits;
             Assert.Equal("v1", await cache.GetAsync<string>(key));
             Assert.Equal(hits + 1, cache.Statistics.Hits);
