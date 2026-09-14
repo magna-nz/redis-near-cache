@@ -258,8 +258,8 @@ internal static class Program
             return;
         }
 
-        sb.AppendLine("| Topology | Server version | Contender | Reads/s | Local hit % | Stale reads | Stale entries |");
-        sb.AppendLine("|---|---|---|---:|---:|---:|---:|");
+        sb.AppendLine("| Topology | Server version | Contender | Write mode | Reads/s | Local hit % | Stale reads | Stale entries |");
+        sb.AppendLine("|---|---|---|---|---:|---:|---:|---:|");
 
         foreach (var r in topologies
                      .OrderBy(r => r.Topology, StringComparer.Ordinal)
@@ -267,7 +267,7 @@ internal static class Program
         {
             var localHit = r.LocalHitRatio.HasValue ? FormatPercent(r.LocalHitRatio.Value) : "n/a";
             var staleEntries = r.StaleEntriesAfterQuiescence.HasValue ? FormatCount(r.StaleEntriesAfterQuiescence.Value) : "n/a";
-            sb.AppendLine($"| {r.Topology} | {r.ServerVersion} | {r.Contender} | {FormatRate(r.ReadsPerSecond)} | {localHit} | {FormatCount(r.StaleReads)} | {staleEntries} |");
+            sb.AppendLine($"| {r.Topology} | {r.ServerVersion} | {r.Contender} | {r.WriteMode} | {FormatRate(r.ReadsPerSecond)} | {localHit} | {FormatCount(r.StaleReads)} | {staleEntries} |");
         }
 
         sb.AppendLine();
@@ -575,7 +575,7 @@ internal static class Program
                         continue;
                     }
 
-                    var ratio = baseline is not null && baseline.MeanNs > 0 ? (r.MeanNs / baseline.MeanNs).ToString("N3", CultureInfo.InvariantCulture) : "n/a";
+                    var ratio = baseline is not null && baseline.MeanNs > 0 ? FormatRatio(r.MeanNs / baseline.MeanNs) : "n/a";
                     sb.AppendLine($"| {r.Contender} | {r.Payload} | {FormatNanosAsMicros(r.MeanNs)} | {FormatNanosAsMicros(r.ErrorNs)} | {ratio} | {FormatBytes(r.AllocatedBytes)} |");
                 }
             }
@@ -862,7 +862,7 @@ internal static class Program
                     var ratio = string.Equals(contender, "Plain", StringComparison.OrdinalIgnoreCase)
                         ? "1.000 (baseline)"
                         : cmp is not null
-                            ? $"{cmp.Ratio.ToString("N3", CultureInfo.InvariantCulture)} [{cmp.CiLower.ToString("N3", CultureInfo.InvariantCulture)}, {cmp.CiUpper.ToString("N3", CultureInfo.InvariantCulture)}]"
+                            ? $"{FormatRatio(cmp.Ratio)} [{FormatRatio(cmp.CiLower)}, {FormatRatio(cmp.CiUpper)}]"
                             : "n/a";
                     var qValue = string.Equals(contender, "Plain", StringComparison.OrdinalIgnoreCase) ? "n/a" : cmp is not null ? FormatQValue(cmp.QValue) : "n/a";
 
@@ -918,11 +918,19 @@ internal static class Program
 
     private static string FormatMillisAsMicros(double millis) => FormatMicrosValue(millis * 1000.0);
 
-    private static string FormatMicrosValue(double micros) => $"{FormatMicros(micros)} µs";
+    // Sub-microsecond values (hit paths) read better, and keep their precision, in nanoseconds.
+    private static string FormatMicrosValue(double micros) => micros < 1
+        ? (micros * 1000).ToString("N1", CultureInfo.InvariantCulture) + " ns"
+        : $"{FormatMicros(micros)} µs";
 
     private static string FormatBytes(long bytes) => bytes >= 1024
         ? (bytes / 1024.0).ToString("N2", CultureInfo.InvariantCulture) + " KB"
         : bytes.ToString("N0", CultureInfo.InvariantCulture) + " B";
+
+    // Hit-path ratios against a network round trip are tiny; keep three significant digits instead of rounding to 0.000.
+    private static string FormatRatio(double ratio) => ratio >= 0.1
+        ? ratio.ToString("N3", CultureInfo.InvariantCulture)
+        : ratio.ToString("G3", CultureInfo.InvariantCulture);
 
     private static string FormatQValue(double q) => q < 0.001
         ? q.ToString("E1", CultureInfo.InvariantCulture)
@@ -954,7 +962,9 @@ internal static class Program
 
     private static string FormatRate(double v) => v.ToString("N0", CultureInfo.InvariantCulture);
 
-    private static string FormatMicros(double v) => v < 10
+    private static string FormatMicros(double v) => v < 1
+        ? v.ToString("N2", CultureInfo.InvariantCulture)
+        : v < 10
         ? v.ToString("N1", CultureInfo.InvariantCulture)
         : v.ToString("N0", CultureInfo.InvariantCulture);
 
