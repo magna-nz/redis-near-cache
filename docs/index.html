@@ -23,7 +23,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar" aria-label="Sections">
-<div class="nav-group"><ul><li><a href="#introduction">Introduction</a></li><li><a href="#quickstart">Quickstart</a></li><li><a href="#how-it-works">How it works</a></li><li><a href="#configuration">Configuration</a></li><li><a href="#api-reference">API reference</a><ul class="sub-nav"><li><a href="#getasync">GetAsync</a></li><li><a href="#setasync">SetAsync</a></li><li><a href="#removeasync">RemoveAsync</a></li><li><a href="#evictlocal">EvictLocal</a></li><li><a href="#trygetlocal">TryGetLocal</a></li><li><a href="#statistics">Statistics</a></li><li><a href="#ready">Ready</a></li><li><a href="#redisnearcachestatistics">RedisNearCacheStatistics</a></li><li><a href="#iredisnearcacheserializer">IRedisNearCacheSerializer</a></li><li><a href="#jsonredisnearcacheserializer">JsonRedisNearCacheSerializer</a></li><li><a href="#addrednc-configure">AddRedisNearCache(configure)</a></li><li><a href="#addrednc-connectionstring">AddRedisNearCache(connString)</a></li></ul></li><li><a href="#hybridcache">HybridCache</a><ul class="sub-nav"><li><a href="#addrednc-distributedcache">AddRedisNearCacheDistributedCache</a></li><li><a href="#addrednc-hybridcache">AddRedisNearCacheHybridCache</a></li><li><a href="#redisnearcachedistributedcache">RedisNearCacheDistributedCache</a></li></ul></li><li><a href="#reconnects-cluster">Reconnects and cluster</a></li><li><a href="#operations">Operations</a></li><li><a href="#limitations">Limitations</a></li><li><a href="#performance">Performance</a></li><li><a href="#samples">Samples</a></li><li><a href="#faq">FAQ</a></li></ul></div>
+<div class="nav-group"><ul><li><a href="#introduction">Introduction</a></li><li><a href="#quickstart">Quickstart</a></li><li><a href="#how-it-works">How it works</a></li><li><a href="#configuration">Configuration</a></li><li><a href="#api-reference">API reference</a><ul class="sub-nav"><li><a href="#getasync">GetAsync</a></li><li><a href="#setasync">SetAsync</a></li><li><a href="#removeasync">RemoveAsync</a></li><li><a href="#evictlocal">EvictLocal</a></li><li><a href="#trygetlocal">TryGetLocal</a></li><li><a href="#statistics">Statistics</a></li><li><a href="#ready">Ready</a></li><li><a href="#redisnearcachestatistics">RedisNearCacheStatistics</a></li><li><a href="#iredisnearcacheserializer">IRedisNearCacheSerializer</a></li><li><a href="#jsonredisnearcacheserializer">JsonRedisNearCacheSerializer</a></li><li><a href="#addrednc-configure">AddRedisNearCache(configure)</a></li><li><a href="#addrednc-connectionstring">AddRedisNearCache(connString)</a></li></ul></li><li><a href="#hybridcache">HybridCache</a><ul class="sub-nav"><li><a href="#addrednc-distributedcache">AddRedisNearCacheDistributedCache</a></li><li><a href="#addrednc-hybridcache">AddRedisNearCacheHybridCache</a></li><li><a href="#redisnearcachedistributedcache">RedisNearCacheDistributedCache</a></li></ul></li><li><a href="#reconnects-cluster">Reconnects and cluster</a></li><li><a href="#operations">Operations</a></li><li><a href="#limitations">Limitations</a></li><li><a href="#performance">Performance</a></li><li><a href="#testing">Testing</a></li><li><a href="#samples">Samples</a></li><li><a href="#faq">FAQ</a></li></ul></div>
 </nav>
 <div class="main">
 <section class="section" id="introduction">
@@ -710,6 +710,49 @@ dotnet run -c Release --project bench/RedisNearCache.Bench -- --load --chaos    
 <p>What the numbers say:</p><ul><li>With the same 20 clients, the near cache served 7.2x the reads while sending the server 3.2x fewer commands and 3x less network output. The server&#8217;s <code>GET</code> rate is the miss rate, 4% of reads.</li><li>Every foreign write reached, on average, 14 to 18 of the 20 instances as an invalidation (the 500 hot keys are tracked by almost everyone). 35k invalidations/s were absorbed with zero stale entries in the audit.</li><li>The chaos run killed both connections of 5 instances at T/2. Each raised <code>TrackingLost</code> for both connections, reconnected, and was re-armed (<code>InteractiveRestored</code> and <code>SubscriptionRestored</code>) within about 120 ms; the sampled hit ratio dipped by under a point and recovered in the next 5 s window.</li><li>Miss latency in the near-cache runs is worse than the baseline&#8217;s read latency (p99 12 ms vs 1.6 ms). That is a load-generator artefact: 160 readers spin at 1.4 M reads/s on a 14-core machine, so the continuation of a network read waits for a thread-pool slot. A service that does real work between reads would not see this. The hit path is unaffected (p50 0.8 &#181;s).</li><li>Race discards ran at about 1 per 10,000 reads. Each costs one extra round trip on the next read; none cost correctness.</li><li>Observed once in five near-cache runs and not reproduced: the server closed all 40 tracked sockets at once (<code>SocketClosed</code> on both connection types of every instance, no <code>CLIENT KILL</code> issued). Every instance raised <code>TrackingLost</code>, reconnected and re-armed, and the audit still found 0 stale entries.</li></ul>
 </div>
 <div class="rail"></div>
+</div>
+</section>
+<section class="section" id="testing">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Evidence</div>
+<h2>Testing <a class="anchor" href="#testing" aria-label="Link to this section">#</a></h2>
+<p class="lede">Coherence is the whole product, so most of the tests run against real Redis in Docker: standalone, a replica, a TLS server and a six-node cluster. The same script brings that stack up on your machine and in CI.</p>
+<h3>What runs</h3>
+<table>
+<thead><tr><th>Suite</th><th>Tests</th><th>What it proves</th></tr></thead>
+<tbody>
+<tr><td>Unit</td><td>30</td><td>No Redis. In-flight tracker interleavings, L1 limits and expiry, serializer pass-through, configuration cloning (RESP2, admin, 5 s topology check, caller&#8217;s options untouched), statistics, the <code>IDistributedCache</code> adapter&#8217;s expiry mapping against a fake.</td></tr>
+<tr><td>Core</td><td>14</td><td>Hit serves locally (asserted on the server&#8217;s <code>cmdstat_get</code>), external write evicts, multi-key invalidation, <code>FLUSHDB</code>, write-through, prefix opt-in, interactive and subscriber connection kills re-arm, per-node cluster invalidation, dispose, and two deterministic in-flight windows (flush and re-arm) using a test hook inside the flush handler.</td></tr>
+<tr><td>Chaos</td><td>13</td><td>Stress with foreign and own writers followed by a staleness audit, both connections killed repeatedly, cluster node restart, cluster <code>FLUSHALL</code>, <code>L1MaxAge</code> safety net, a hot-key invalidation storm, and concurrent same-key readers sharing one invalidation.</td></tr>
+<tr><td>Edge cases</td><td>21</td><td>Degraded mode and recovery driven by an ACL user that is denied <code>CLIENT TRACKING</code> and then granted it (Redis 7.0+), replica connection blips, master kill with a replica present, dispose during startup, cancelled own writes, missing keys, size and age limits, byte and custom serializers, remove and server-side expiry, registration idempotence, RESP3 forced to RESP2, concurrency, cluster full-kill recovery.</td></tr>
+<tr><td>Compat</td><td>29</td><td>Every mutation kind invalidates (<code>SET</code>, <code>DEL</code>, <code>EXPIRE</code>, <code>PEXPIRE</code>, <code>RENAME</code>, <code>COPY</code>, <code>MOVE</code>, <code>GETDEL</code>, <code>SET NX</code>, <code>MSET</code>, <code>APPEND</code>, <code>INCR</code>, <code>EVAL</code>, <code>FCALL</code>, <code>RESTORE</code>, same-value <code>SET</code>, <code>FLUSHALL</code>, <code>SWAPDB</code>), eviction under <code>maxmemory</code>, the database-number caveat, 1 MB values, 100,000 tracked keys, two providers in one process, coexistence with the app&#8217;s own pub/sub, cluster hash tags, HybridCache and <code>IDistributedCache</code> under invalidation.</td></tr>
+<tr><td>Resilience</td><td>10</td><td>Redis container restart, <code>CLIENT PAUSE</code> shorter and longer than the command timeout, TLS with the caller&#8217;s certificate callback carried onto the private connection, ACL user and wrong password, cluster failover with fail-back, reshard while reads run, subscriber killed ten times under load, a 65 s idle keep-alive, and a soak (30 s by default, manual in CI).</td></tr>
+<tr><td>HybridCache</td><td>6</td><td>Round trips, absolute expiry, external writes visible, two providers, per-call options not reviving HybridCache&#8217;s own local cache.</td></tr>
+</tbody>
+</table>
+<h3>Where it runs</h3>
+<p>CI runs the unit tests on .NET 8 and 10, then the 93 integration tests against Redis 7.4, and again against Redis 6.2, 7.0, 7.2, 8 and Valkey 8.1 in a matrix. Tests that need a feature a server lacks (subcommand-level ACL denial, <code>FCALL</code>) skip on that server and say so in the output. The soak test runs on manual dispatch.</p>
+<p>Two behaviours the compat tests established, both documented under Limitations: <code>SWAPDB</code> sends no invalidation, and the database number is not part of tracking. One defect they exposed was fixed: a promoted cluster master used to be armed about 60 s after a failover; the private multiplexer now checks topology every 5 s and the measured delay is 4 s.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">run locally</span><span class="cb-lang">bash</span></div><pre><code class="language-bash"># standalone + replica + TLS + 6-node cluster (needs Docker)
+./up.sh
+
+# unit tests, no Redis
+dotnet test tests/RedisNearCache.UnitTests
+
+# everything against the containers (about 4 minutes)
+dotnet test tests/RedisNearCache.Tests --filter "Category!=Soak"
+
+# one suite
+dotnet test tests/RedisNearCache.Tests --filter "FullyQualifiedName~Resilience"
+
+# the soak, 30 s by default
+RNC_SOAK_SECONDS=300 dotnet test tests/RedisNearCache.Tests --filter "Category=Soak"
+
+# the whole suite against another server
+RNC_REDIS_IMAGE=valkey/valkey:8.1 ./up.sh
+dotnet test tests/RedisNearCache.Tests --filter "Category!=Soak"</code></pre></div></div>
 </div>
 </section>
 <section class="section" id="samples">
