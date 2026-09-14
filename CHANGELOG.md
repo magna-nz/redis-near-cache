@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.1 (2026-09-14)
+
+No library changes: `RedisNearCache` and `RedisNearCache.HybridCache` are functionally identical to 0.5.0.
+
+- CI: packages are published only from a GitHub Release (a tag push no longer races it), and a release whose
+  tag disagrees with `<Version>` fails before publishing.
+- Tests: the Sentinel failover tests tolerate client-side thread-pool starvation during the failover
+  (StackExchange.Redis's Sentinel reconnect blocks pool threads) and re-issue a failover that Sentinel itself
+  aborts. The test assembly raises the minimum worker threads to 32; `RNC_TEST_MIN_WORKER_THREADS=0` keeps the
+  runtime default.
+
 ## 0.5.0 (2026-09-14)
 
 - Fix: a Sentinel master that is killed no longer keeps the cache in pass-through forever. An unreachable node
