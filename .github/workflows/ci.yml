@@ -92,13 +92,15 @@ jobs:
 
   publish:
     name: publish to NuGet
-    # A published GitHub Release (its tag is vX.Y.Z) or a pushed v* tag. Needs the repository secret
-    # NUGET_API_KEY (Settings > Secrets and variables > Actions).
+    # A published GitHub Release (its tag is vX.Y.Z) or a pushed v* tag. Uses nuget.org Trusted Publishing:
+    # the job's OIDC token is exchanged for a short-lived API key, so no long-lived secret is stored.
+    # The trust policy on nuget.org must name this repository and this workflow file (ci.yml).
     if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
     needs: [pack]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/setup-dotnet@v4
         with:
@@ -107,13 +109,15 @@ jobs:
         with:
           name: nupkg
           path: artifacts
+      - name: NuGet login (trusted publishing)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: magnanz
       - name: Push packages
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: |
-          test -n "$NUGET_API_KEY" || { echo "NUGET_API_KEY secret is not set (repo Settings > Secrets and variables > Actions)"; exit 1; }
           for pkg in artifacts/*.nupkg; do
-            dotnet nuget push "$pkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+            dotnet nuget push "$pkg" --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
           done
       - name: Attach packages to the GitHub release
         if: github.event_name == 'release'

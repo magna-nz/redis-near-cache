@@ -108,8 +108,8 @@ races, stress, chaos, degraded mode and recovery. CI runs both on every push and
 ## Releasing
 
 Publish a GitHub release whose tag is `vX.Y.Z` (or push that tag). CI runs the unit and integration tests,
-packs both packages at that version, pushes them to NuGet with the repository secret `NUGET_API_KEY`, and
-attaches the `.nupkg` files to the release.
+packs both packages at that version, pushes them to nuget.org through Trusted Publishing (the workflow's
+GitHub identity, no stored secret), and attaches the `.nupkg` files to the release.
 
 ## License
 
