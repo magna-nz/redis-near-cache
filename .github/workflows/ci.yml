@@ -3,8 +3,9 @@ name: ci
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
+  # Publishing a GitHub Release is the only way to ship. Its tag push deliberately does not trigger this
+  # workflow: both events used to run the full matrix and race to push the same packages.
   release:
     types: [published]
   workflow_dispatch:
@@ -133,10 +134,16 @@ jobs:
       - name: Resolve version
         id: version
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            echo "value=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          base=$(sed -n 's/.*<Version>\(.*\)<\/Version>.*/\1/p' Directory.Build.props)
+          if [[ "${GITHUB_EVENT_NAME}" == release ]]; then
+            tag="${GITHUB_REF#refs/tags/v}"
+            # A release whose tag disagrees with the committed version is a mistake (e.g. the bump never merged).
+            if [[ "$tag" != "$base" ]]; then
+              echo "::error::release tag v${tag} does not match <Version>${base}</Version> in Directory.Build.props at ${GITHUB_SHA}"
+              exit 1
+            fi
+            echo "value=${tag}" >> "$GITHUB_OUTPUT"
           else
-            base=$(sed -n 's/.*<Version>\(.*\)<\/Version>.*/\1/p' Directory.Build.props)
             echo "value=${base}-ci.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
           fi
       - name: Pack
@@ -151,10 +158,10 @@ jobs:
 
   publish:
     name: publish to NuGet
-    # A published GitHub Release (its tag is vX.Y.Z) or a pushed v* tag. Uses nuget.org Trusted Publishing:
-    # the job's OIDC token is exchanged for a short-lived API key, so no long-lived secret is stored.
-    # The trust policy on nuget.org must name this repository and this workflow file (ci.yml).
-    if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
+    # A published GitHub Release only (its tag is vX.Y.Z and must match <Version>; see pack). Uses nuget.org
+    # Trusted Publishing: the job's OIDC token is exchanged for a short-lived API key, so no long-lived secret
+    # is stored. The trust policy on nuget.org must name this repository and this workflow file (ci.yml).
+    if: github.event_name == 'release'
     needs: [pack]
     runs-on: ubuntu-latest
     permissions:
