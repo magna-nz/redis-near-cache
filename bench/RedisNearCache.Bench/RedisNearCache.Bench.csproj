@@ -5,6 +5,11 @@
     <RootNamespace>RedisNearCache.Bench</RootNamespace>
     <IsPackable>false</IsPackable>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!-- BDN1000: BenchmarkDotNet's build-time analyzer does not recognize `typeof(HitBenchmarks<>)` (the open
+         generic type definition, required by BenchmarkDotNet's own GenericBenchmarksBuilder; passing a closed
+         type throws at runtime, verified directly) as carrying [Benchmark] methods, and flags it as an error. A
+         false positive: the methods are there and the generic expansion runs correctly. -->
+    <NoWarn>$(NoWarn);BDN1000</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/RedisNearCache/RedisNearCache.csproj" />

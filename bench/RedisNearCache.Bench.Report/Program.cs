@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using RedisNearCache.Bench.Results;
 
 namespace RedisNearCache.Bench.Report;
@@ -150,8 +152,8 @@ internal static class Program
         {
             sb.AppendLine($"## Contender comparison — standalone, {label}");
             sb.AppendLine();
-            sb.AppendLine("| Contender | Write mode | Reads/s | Local hit % | Local read p50 / p99 (µs) | Remote read p50 / p99 (µs) | Server cmds/s | Stale reads (count, %) | Staleness age p50 / p99 / max (ms) | Stale local entries after quiescence |");
-            sb.AppendLine("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+            sb.AppendLine("| Contender | Write mode | Reads/s | Local hit % | Local read p50 / p99 (µs) | Remote read p50 / p99 (µs) | Server cmds/s | Source loads / read | Errors | Stale reads (count, %) | Staleness age p50 / p99 / max (ms) | Stale local entries after quiescence |");
+            sb.AppendLine("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
 
             foreach (var contender in ContenderOrder)
             {
@@ -182,8 +184,10 @@ internal static class Program
         var staleReads = $"{FormatCount(r.StaleReads)} ({FormatStalePercent(r.StaleReadFraction)})";
         var stalenessAge = r.StalenessAgeMillis is { } a ? $"{FormatMillis(a.P50)} / {FormatMillis(a.P99)} / {FormatMillis(a.Max)}" : "n/a";
         var staleEntries = r.StaleEntriesAfterQuiescence.HasValue ? FormatCount(r.StaleEntriesAfterQuiescence.Value) : "n/a";
+        var sourceLoadsPerRead = r.Reads > 0 ? FormatPercent((double)r.SourceLoads / r.Reads) : "n/a";
+        var errors = FormatCount(r.ReadErrors + r.WriteErrors);
 
-        return $"| {contender} | {mode} | {FormatRate(r.ReadsPerSecond)} | {localHit} | {localLatency} | {remoteLatency} | {FormatRate(r.ServerCommandsPerSecond)} | {staleReads} | {stalenessAge} | {staleEntries} |";
+        return $"| {contender} | {mode} | {FormatRate(r.ReadsPerSecond)} | {localHit} | {localLatency} | {remoteLatency} | {FormatRate(r.ServerCommandsPerSecond)} | {sourceLoadsPerRead} | {errors} | {staleReads} | {stalenessAge} | {staleEntries} |";
     }
 
     private static void WriteLatencySweepSection(StringBuilder sb, List<LoadResult> results)
@@ -330,11 +334,599 @@ internal static class Program
         sb.AppendLine();
     }
 
-    // Micro-benchmark sections (BenchmarkDotNet, Sailfish) are added here. A later agent wires these up to
-    // read `bdn/<latency>/` and `sailfish/<latency>/` subfolders under resultsDir; this stub renders nothing.
+    // --- micro-benchmark sections (BenchmarkDotNet, Sailfish) --------------------------------------------------
+    //
+    // BenchmarkDotNet: reads <resultsDir>/bdn/<label>/results/{HitBenchmarks,MissBenchmarks}-report-full.json
+    // (JsonExporter.Full; schema verified directly against a real run: Benchmarks[].Method/Parameters/
+    // Statistics.{Mean,Median,ConfidenceInterval.Margin}/Memory.BytesAllocatedPerOperation, all in nanoseconds).
+    //
+    // Sailfish: reads every <resultsDir>/sailfish/<label>/PerformanceResults_*.csv (Median/Mean/RawExecutionResults
+    // in milliseconds; p95/p99 are not columns Sailfish emits for [SailfishMethod] results, so they are computed
+    // here from RawExecutionResults) and every TestSession_*_Results_*.csv's "# Method Comparisons" section
+    // (Method1/Method2/Ratio/CI95_Lower/CI95_Upper/q_value; Method1 is the Plain baseline because each Hit/Miss x
+    // payload class has exactly one baseline test case -- see HitComparisonString's remarks). Both file sets are
+    // globbed because a run makes two separate SailfishRunner.Run calls (hit classes, miss classes) into the same
+    // --output directory, each producing its own timestamped files.
+
+    private static readonly string[] MicroPathOrder = { "Hit", "Miss" };
+    private static readonly string[] MicroPayloadOrder = { "String", "Json" };
+
+    private sealed record BdnRow(string Path, string Contender, string Payload, double MeanNs, double ErrorNs, double MedianNs, long AllocatedBytes);
+
+    private sealed record SailfishPerfRow(string Path, string Contender, string Payload, double MedianMs, double MeanMs, double P95Ms, double P99Ms);
+
+    private sealed record SailfishComparisonRow(string Path, string Contender, string Payload, double Ratio, double CiLower, double CiUpper, double QValue);
+
     private static void WriteMicroBenchmarkSections(StringBuilder sb, string resultsDir)
     {
+        var bdnRoot = Path.Combine(resultsDir, "bdn");
+        var sailfishRoot = Path.Combine(resultsDir, "sailfish");
+
+        var labels = OrderLatencyLabels(
+            SubdirectoryNames(bdnRoot).Concat(SubdirectoryNames(sailfishRoot)).Distinct(StringComparer.Ordinal));
+
+        if (labels.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var label in labels)
+        {
+            var bdnRows = LoadBdnRows(Path.Combine(bdnRoot, label));
+            var sailfishPerf = LoadSailfishPerfRows(Path.Combine(sailfishRoot, label));
+            var sailfishComparisons = LoadSailfishComparisonRows(Path.Combine(sailfishRoot, label));
+
+            WriteBdnMicroSection(sb, label, bdnRows);
+            WriteSailfishMicroSection(sb, label, sailfishPerf, sailfishComparisons);
+            WriteCrossCheckSection(sb, label, bdnRows, sailfishPerf);
+        }
     }
+
+    private static IEnumerable<string> SubdirectoryNames(string root) =>
+        Directory.Exists(root)
+            ? Directory.EnumerateDirectories(root).Select(d => Path.GetFileName(d.TrimEnd('/', '\\'))).Where(n => n is { Length: > 0 })!
+            : Enumerable.Empty<string>();
+
+    // --- BenchmarkDotNet parsing ---------------------------------------------------------------------------------
+
+    private sealed class BdnReportFile
+    {
+        public List<BdnBenchmark>? Benchmarks { get; set; }
+    }
+
+    private sealed class BdnBenchmark
+    {
+        public string? Type { get; set; }
+        public string? Method { get; set; }
+        public BdnStatistics? Statistics { get; set; }
+        public BdnMemory? Memory { get; set; }
+    }
+
+    private sealed class BdnStatistics
+    {
+        public double Mean { get; set; }
+        public double Median { get; set; }
+        public BdnConfidenceInterval? ConfidenceInterval { get; set; }
+    }
+
+    private sealed class BdnConfidenceInterval
+    {
+        // A pathologically small sample count (BenchmarkDotNet's own edge case, not expected in real jobs) can
+        // serialize this as an empty string instead of a number; tolerate it rather than failing the whole file.
+        [JsonConverter(typeof(LenientDoubleConverter))]
+        public double Margin { get; set; }
+    }
+
+    /// <summary>Reads a JSON number normally; a non-numeric string (BenchmarkDotNet emits <c>""</c> for an
+    /// undefined statistic from a too-small sample) becomes 0 instead of failing deserialization of the whole file.</summary>
+    private sealed class LenientDoubleConverter : JsonConverter<double>
+    {
+        public override double Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+            reader.TokenType == JsonTokenType.Number && reader.TryGetDouble(out var value) ? value : 0;
+
+        public override void Write(Utf8JsonWriter writer, double value, JsonSerializerOptions options) => writer.WriteNumberValue(value);
+    }
+
+    private sealed class BdnMemory
+    {
+        public long BytesAllocatedPerOperation { get; set; }
+    }
+
+    // AllowNamedFloatingPointLiterals: a job with very few iterations can produce a NaN/Infinity confidence
+    // interval margin, which BenchmarkDotNet's own JsonExporter still writes out (verified against a real run).
+    private static readonly JsonSerializerOptions BdnJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        NumberHandling = JsonNumberHandling.AllowNamedFloatingPointLiterals,
+    };
+
+    private static List<BdnRow> LoadBdnRows(string labelDir)
+    {
+        var rows = new List<BdnRow>();
+        if (!Directory.Exists(labelDir))
+        {
+            return rows;
+        }
+
+        var resultsDir = Path.Combine(labelDir, "results");
+        if (!Directory.Exists(resultsDir))
+        {
+            return rows;
+        }
+
+        // HitBenchmarks<T>/MissBenchmarks<T> are generic over the payload ([GenericTypeArguments], not [Params]),
+        // so BenchmarkDotNet names the exported file after the closed type, e.g.
+        // "RedisNearCache.Bench.Micro.HitBenchmarks_String_-report-full.json" (verified against a real run) -- one
+        // file per payload closure that ran (both under a full run; only String under --quick). Glob rather than a
+        // fixed name for this reason.
+        foreach (var (globPattern, path) in new[] { ("*HitBenchmarks*-report-full.json", "Hit"), ("*MissBenchmarks*-report-full.json", "Miss") })
+        {
+            foreach (var file in Directory.EnumerateFiles(resultsDir, globPattern))
+            {
+                BdnReportFile? report;
+                try
+                {
+                    report = JsonSerializer.Deserialize<BdnReportFile>(File.ReadAllText(file), BdnJsonOptions);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"warning: failed to parse {file}: {ex.Message}, skipping");
+                    continue;
+                }
+
+                if (report?.Benchmarks is null)
+                {
+                    continue;
+                }
+
+                foreach (var b in report.Benchmarks)
+                {
+                    if (b.Method is null || b.Statistics is null || b.Memory is null)
+                    {
+                        continue;
+                    }
+
+                    var payload = ParseBdnPayload(b.Type);
+                    if (payload is null)
+                    {
+                        continue;
+                    }
+
+                    rows.Add(new BdnRow(path, b.Method, payload, b.Statistics.Mean, b.Statistics.ConfidenceInterval?.Margin ?? 0,
+                        b.Statistics.Median, b.Memory.BytesAllocatedPerOperation));
+                }
+            }
+        }
+
+        return rows;
+    }
+
+    /// <summary>
+    /// The payload comes from the closed generic type argument in the <c>Type</c> field, e.g.
+    /// <c>"HitBenchmarks&lt;String&gt;"</c> or <c>"HitBenchmarks&lt;SampleRecord&gt;"</c> (verified against a real
+    /// run) -- not from <c>Parameters</c> (empty; these classes use <c>[GenericTypeArguments]</c>, not <c>[Params]</c>).
+    /// <c>SampleRecord</c> is the JSON payload's CLR type name; mapped to the "Json" label used everywhere else in
+    /// this report.
+    /// </summary>
+    private static string? ParseBdnPayload(string? type)
+    {
+        if (string.IsNullOrEmpty(type))
+        {
+            return null;
+        }
+
+        var lt = type.IndexOf('<');
+        var gt = type.LastIndexOf('>');
+        if (lt < 0 || gt < 0 || gt <= lt)
+        {
+            return null;
+        }
+
+        var arg = type[(lt + 1)..gt];
+        return arg switch
+        {
+            "String" => "String",
+            "SampleRecord" => "Json",
+            _ => arg,
+        };
+    }
+
+    private static void WriteBdnMicroSection(StringBuilder sb, string label, List<BdnRow> rows)
+    {
+        sb.AppendLine($"## Per-call cost — BenchmarkDotNet, {label}");
+        sb.AppendLine();
+
+        if (rows.Count == 0)
+        {
+            sb.AppendLine("_No BenchmarkDotNet results found._");
+            sb.AppendLine();
+            return;
+        }
+
+        foreach (var path in MicroPathOrder)
+        {
+            var pathRows = rows.Where(r => r.Path == path).ToList();
+            sb.AppendLine(path == "Hit" ? "**Hit path**" : "**Miss path**");
+            sb.AppendLine();
+            if (pathRows.Count == 0)
+            {
+                sb.AppendLine("_No results._");
+                sb.AppendLine();
+                continue;
+            }
+
+            sb.AppendLine("| Contender | Payload | Mean | Error | Ratio vs Plain | Allocated |");
+            sb.AppendLine("|---|---|---:|---:|---:|---:|");
+
+            foreach (var payload in MicroPayloadOrder)
+            {
+                var group = pathRows.Where(r => r.Payload == payload).ToList();
+                if (group.Count == 0)
+                {
+                    continue;
+                }
+
+                var baseline = group.FirstOrDefault(r => string.Equals(r.Contender, "Plain", StringComparison.OrdinalIgnoreCase));
+                foreach (var contender in ContenderOrder)
+                {
+                    var r = group.FirstOrDefault(x => string.Equals(x.Contender, contender, StringComparison.OrdinalIgnoreCase));
+                    if (r is null)
+                    {
+                        continue;
+                    }
+
+                    var ratio = baseline is not null && baseline.MeanNs > 0 ? (r.MeanNs / baseline.MeanNs).ToString("N3", CultureInfo.InvariantCulture) : "n/a";
+                    sb.AppendLine($"| {r.Contender} | {r.Payload} | {FormatNanosAsMicros(r.MeanNs)} | {FormatNanosAsMicros(r.ErrorNs)} | {ratio} | {FormatBytes(r.AllocatedBytes)} |");
+                }
+            }
+
+            sb.AppendLine();
+        }
+    }
+
+    // --- Sailfish parsing ------------------------------------------------------------------------------------------
+
+    private static readonly Regex SailfishDisplayNamePattern = new(@"^(?<class>\w+)\.(?<method>\w+)\(\)$", RegexOptions.Compiled);
+
+    private static (string Path, string Payload)? ClassNameToPathPayload(string className) => className switch
+    {
+        "HitComparisonString" => ("Hit", "String"),
+        "HitComparisonJson" => ("Hit", "Json"),
+        "MissComparisonString" => ("Miss", "String"),
+        "MissComparisonJson" => ("Miss", "Json"),
+        _ => null,
+    };
+
+    private static List<SailfishPerfRow> LoadSailfishPerfRows(string labelDir)
+    {
+        var rows = new List<SailfishPerfRow>();
+        if (!Directory.Exists(labelDir))
+        {
+            return rows;
+        }
+
+        foreach (var file in Directory.EnumerateFiles(labelDir, "PerformanceResults_*.csv"))
+        {
+            List<string> lines;
+            try
+            {
+                lines = File.ReadAllLines(file).ToList();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"warning: failed to read {file}: {ex.Message}, skipping");
+                continue;
+            }
+
+            if (lines.Count < 2)
+            {
+                continue;
+            }
+
+            var header = SplitCsvLine(lines[0]);
+            int Col(string name) => header.IndexOf(name);
+            var displayNameCol = Col("DisplayName");
+            var medianCol = Col("Median");
+            var meanCol = Col("Mean");
+            var rawCol = Col("RawExecutionResults");
+            if (displayNameCol < 0 || medianCol < 0 || meanCol < 0 || rawCol < 0)
+            {
+                continue;
+            }
+
+            foreach (var line in lines.Skip(1))
+            {
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+
+                var fields = SplitCsvLine(line);
+                if (fields.Count <= Math.Max(rawCol, Math.Max(medianCol, Math.Max(meanCol, displayNameCol))))
+                {
+                    continue;
+                }
+
+                var match = SailfishDisplayNamePattern.Match(fields[displayNameCol]);
+                if (!match.Success)
+                {
+                    continue;
+                }
+
+                var mapped = ClassNameToPathPayload(match.Groups["class"].Value);
+                if (mapped is null)
+                {
+                    continue;
+                }
+
+                if (!double.TryParse(fields[medianCol], NumberStyles.Float, CultureInfo.InvariantCulture, out var median) ||
+                    !double.TryParse(fields[meanCol], NumberStyles.Float, CultureInfo.InvariantCulture, out var mean))
+                {
+                    continue;
+                }
+
+                var raw = fields[rawCol]
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(s => double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : (double?)null)
+                    .Where(v => v.HasValue)
+                    .Select(v => v!.Value)
+                    .OrderBy(v => v)
+                    .ToArray();
+
+                var p95 = PercentileOfSorted(raw, 0.95);
+                var p99 = PercentileOfSorted(raw, 0.99);
+
+                rows.Add(new SailfishPerfRow(mapped.Value.Path, match.Groups["method"].Value, mapped.Value.Payload, median, mean, p95, p99));
+            }
+        }
+
+        return rows;
+    }
+
+    private static List<SailfishComparisonRow> LoadSailfishComparisonRows(string labelDir)
+    {
+        var rows = new List<SailfishComparisonRow>();
+        if (!Directory.Exists(labelDir))
+        {
+            return rows;
+        }
+
+        foreach (var file in Directory.EnumerateFiles(labelDir, "TestSession_*_Results_*.csv"))
+        {
+            string[] lines;
+            try
+            {
+                lines = File.ReadAllLines(file);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"warning: failed to read {file}: {ex.Message}, skipping");
+                continue;
+            }
+
+            var headerIndex = Array.IndexOf(lines, "# Method Comparisons");
+            if (headerIndex < 0 || headerIndex + 1 >= lines.Length)
+            {
+                continue;
+            }
+
+            var header = SplitCsvLine(lines[headerIndex + 1]);
+            int Col(string name) => header.IndexOf(name);
+            var groupCol = Col("ComparisonGroup");
+            var method1Col = Col("Method1");
+            var method2Col = Col("Method2");
+            var ratioCol = Col("Ratio");
+            var ciLowerCol = Col("CI95_Lower");
+            var ciUpperCol = Col("CI95_Upper");
+            var qCol = Col("q_value");
+            if (groupCol < 0 || method1Col < 0 || method2Col < 0 || ratioCol < 0 || qCol < 0)
+            {
+                continue;
+            }
+
+            for (var i = headerIndex + 2; i < lines.Length; i++)
+            {
+                if (lines[i].Length == 0 || lines[i].StartsWith('#'))
+                {
+                    break;
+                }
+
+                var fields = SplitCsvLine(lines[i]);
+                if (fields.Count <= qCol)
+                {
+                    continue;
+                }
+
+                // Method1 is the Plain baseline (see class-remarks on why there is exactly one baseline test case
+                // per class); a comparison row for a non-baseline pair would mean the N x N fallback triggered, and
+                // is skipped rather than misreported as "vs Plain".
+                if (!string.Equals(fields[method1Col], "Plain", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var mapped = ClassNameToPathPayload(fields[groupCol]);
+                if (mapped is null)
+                {
+                    continue;
+                }
+
+                if (!double.TryParse(fields[ratioCol], NumberStyles.Float, CultureInfo.InvariantCulture, out var ratio) ||
+                    !double.TryParse(fields[qCol], NumberStyles.Float, CultureInfo.InvariantCulture, out var q))
+                {
+                    continue;
+                }
+
+                double.TryParse(ciLowerCol >= 0 && fields.Count > ciLowerCol ? fields[ciLowerCol] : "", NumberStyles.Float, CultureInfo.InvariantCulture, out var ciLower);
+                double.TryParse(ciUpperCol >= 0 && fields.Count > ciUpperCol ? fields[ciUpperCol] : "", NumberStyles.Float, CultureInfo.InvariantCulture, out var ciUpper);
+
+                rows.Add(new SailfishComparisonRow(mapped.Value.Path, fields[method2Col], mapped.Value.Payload, ratio, ciLower, ciUpper, q));
+            }
+        }
+
+        return rows;
+    }
+
+    /// <summary>Splits one CSV line, honouring double-quoted fields that may contain commas (Sailfish's own CSV
+    /// writer quotes <c>RawExecutionResults</c> this way).</summary>
+    private static List<string> SplitCsvLine(string line)
+    {
+        var fields = new List<string>();
+        var current = new StringBuilder();
+        var inQuotes = false;
+        for (var i = 0; i < line.Length; i++)
+        {
+            var c = line[i];
+            if (inQuotes)
+            {
+                if (c == '"')
+                {
+                    if (i + 1 < line.Length && line[i + 1] == '"') { current.Append('"'); i++; }
+                    else inQuotes = false;
+                }
+                else current.Append(c);
+            }
+            else if (c == '"')
+            {
+                inQuotes = true;
+            }
+            else if (c == ',')
+            {
+                fields.Add(current.ToString());
+                current.Clear();
+            }
+            else
+            {
+                current.Append(c);
+            }
+        }
+
+        fields.Add(current.ToString());
+        return fields;
+    }
+
+    /// <summary>Nearest-rank percentile of an ascending-sorted array. Sailfish does not compute p95/p99 for
+    /// <c>[SailfishMethod]</c> results (only <c>Mean</c>/<c>Median</c>/confidence intervals); this derives them from
+    /// the raw per-sample data it does expose (<c>RawExecutionResults</c>).</summary>
+    private static double PercentileOfSorted(double[] sorted, double p)
+    {
+        if (sorted.Length == 0)
+        {
+            return 0;
+        }
+
+        var rank = (int)Math.Ceiling(p * sorted.Length) - 1;
+        return sorted[Math.Clamp(rank, 0, sorted.Length - 1)];
+    }
+
+    private static void WriteSailfishMicroSection(StringBuilder sb, string label, List<SailfishPerfRow> perf, List<SailfishComparisonRow> comparisons)
+    {
+        sb.AppendLine($"## Per-call latency — Sailfish, {label}");
+        sb.AppendLine();
+        sb.AppendLine("_p95/p99 are derived here from Sailfish's raw per-sample data (RawExecutionResults); Sailfish itself does not compute percentiles for `[SailfishMethod]` results, only mean/median/confidence intervals._");
+        sb.AppendLine();
+
+        if (perf.Count == 0)
+        {
+            sb.AppendLine("_No Sailfish results found._");
+            sb.AppendLine();
+            return;
+        }
+
+        foreach (var path in MicroPathOrder)
+        {
+            var pathPerf = perf.Where(r => r.Path == path).ToList();
+            sb.AppendLine(path == "Hit" ? "**Hit path**" : "**Miss path**");
+            sb.AppendLine();
+            if (pathPerf.Count == 0)
+            {
+                sb.AppendLine("_No results._");
+                sb.AppendLine();
+                continue;
+            }
+
+            sb.AppendLine("| Contender | Payload | Median | Mean | p95 | p99 | Ratio vs Plain [95% CI] | q-value |");
+            sb.AppendLine("|---|---|---:|---:|---:|---:|---:|---:|");
+
+            foreach (var payload in MicroPayloadOrder)
+            {
+                foreach (var contender in ContenderOrder)
+                {
+                    var r = pathPerf.FirstOrDefault(x => x.Payload == payload && string.Equals(x.Contender, contender, StringComparison.OrdinalIgnoreCase));
+                    if (r is null)
+                    {
+                        continue;
+                    }
+
+                    var cmp = comparisons.FirstOrDefault(x => x.Path == path && x.Payload == payload && string.Equals(x.Contender, contender, StringComparison.OrdinalIgnoreCase));
+                    var ratio = string.Equals(contender, "Plain", StringComparison.OrdinalIgnoreCase)
+                        ? "1.000 (baseline)"
+                        : cmp is not null
+                            ? $"{cmp.Ratio.ToString("N3", CultureInfo.InvariantCulture)} [{cmp.CiLower.ToString("N3", CultureInfo.InvariantCulture)}, {cmp.CiUpper.ToString("N3", CultureInfo.InvariantCulture)}]"
+                            : "n/a";
+                    var qValue = string.Equals(contender, "Plain", StringComparison.OrdinalIgnoreCase) ? "n/a" : cmp is not null ? FormatQValue(cmp.QValue) : "n/a";
+
+                    sb.AppendLine($"| {r.Contender} | {r.Payload} | {FormatMillisAsMicros(r.MedianMs)} | {FormatMillisAsMicros(r.MeanMs)} | {FormatMillisAsMicros(r.P95Ms)} | {FormatMillisAsMicros(r.P99Ms)} | {ratio} | {qValue} |");
+                }
+            }
+
+            sb.AppendLine();
+        }
+    }
+
+    private static void WriteCrossCheckSection(StringBuilder sb, string label, List<BdnRow> bdnRows, List<SailfishPerfRow> sailfishRows)
+    {
+        sb.AppendLine($"## Cross-check: BenchmarkDotNet vs Sailfish — {label}");
+        sb.AppendLine();
+
+        if (bdnRows.Count == 0 || sailfishRows.Count == 0)
+        {
+            sb.AppendLine("_Need both a BenchmarkDotNet and a Sailfish run for this latency point; at least one is missing._");
+            sb.AppendLine();
+            return;
+        }
+
+        sb.AppendLine("| Path | Contender | Payload | BDN median | Sailfish median | Difference |");
+        sb.AppendLine("|---|---|---|---:|---:|---:|");
+
+        foreach (var path in MicroPathOrder)
+        {
+            foreach (var payload in MicroPayloadOrder)
+            {
+                foreach (var contender in ContenderOrder)
+                {
+                    var b = bdnRows.FirstOrDefault(x => x.Path == path && x.Payload == payload && string.Equals(x.Contender, contender, StringComparison.OrdinalIgnoreCase));
+                    var s = sailfishRows.FirstOrDefault(x => x.Path == path && x.Payload == payload && string.Equals(x.Contender, contender, StringComparison.OrdinalIgnoreCase));
+                    if (b is null || s is null)
+                    {
+                        continue;
+                    }
+
+                    var bdnMedianUs = b.MedianNs / 1000.0;
+                    var sailfishMedianUs = s.MedianMs * 1000.0;
+                    var diffPct = bdnMedianUs == 0 ? 0 : (sailfishMedianUs - bdnMedianUs) / bdnMedianUs * 100.0;
+
+                    sb.AppendLine($"| {path} | {contender} | {payload} | {FormatMicrosValue(bdnMedianUs)} | {FormatMicrosValue(sailfishMedianUs)} | {diffPct.ToString("N1", CultureInfo.InvariantCulture)} % |");
+                }
+            }
+        }
+
+        sb.AppendLine();
+    }
+
+    private static string FormatNanosAsMicros(double nanos) => FormatMicrosValue(nanos / 1000.0);
+
+    private static string FormatMillisAsMicros(double millis) => FormatMicrosValue(millis * 1000.0);
+
+    private static string FormatMicrosValue(double micros) => $"{FormatMicros(micros)} µs";
+
+    private static string FormatBytes(long bytes) => bytes >= 1024
+        ? (bytes / 1024.0).ToString("N2", CultureInfo.InvariantCulture) + " KB"
+        : bytes.ToString("N0", CultureInfo.InvariantCulture) + " B";
+
+    private static string FormatQValue(double q) => q < 0.001
+        ? q.ToString("E1", CultureInfo.InvariantCulture)
+        : q.ToString("N3", CultureInfo.InvariantCulture);
 
     // --- helpers -------------------------------------------------------------------------------------------
 

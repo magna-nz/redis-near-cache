@@ -120,6 +120,7 @@ preflight() {
   fi
   x "$DOTNET" build -c Release -nologo bench/RedisNearCache.Bench
   x "$DOTNET" build -c Release -nologo bench/RedisNearCache.Bench.Report
+  x "$DOTNET" build -c Release -nologo bench/RedisNearCache.Bench.Sailfish
 }
 
 write_environment() {
@@ -278,15 +279,15 @@ run_sailfish() {
     local log="$OUT/logs/sailfish-$label.log"
     if [ "$DRY_RUN" = 1 ]; then
       printf '+'
-      printf ' %q' "$DOTNET" run -c Release --no-build --project bench/RedisNearCache.Bench -- \
-        --sailfish --endpoint localhost:6420 --latency-label "$label" --output "$OUT/sailfish/$label" ${quick_flag[@]+"${quick_flag[@]}"}
+      printf ' %q' "$DOTNET" run -c Release --no-build --project bench/RedisNearCache.Bench.Sailfish -- \
+        --endpoint localhost:6420 --latency-label "$label" --output "$OUT/sailfish/$label" ${quick_flag[@]+"${quick_flag[@]}"}
       printf '\n'
       echo "  (stdout+stderr tee'd to $log)"
       continue
     fi
     mkdir -p "$OUT/sailfish/$label" "$(dirname "$log")"
-    if ! "$DOTNET" run -c Release --no-build --project bench/RedisNearCache.Bench -- \
-      --sailfish --endpoint localhost:6420 --latency-label "$label" --output "$OUT/sailfish/$label" ${quick_flag[@]+"${quick_flag[@]}"} \
+    if ! "$DOTNET" run -c Release --no-build --project bench/RedisNearCache.Bench.Sailfish -- \
+      --endpoint localhost:6420 --latency-label "$label" --output "$OUT/sailfish/$label" ${quick_flag[@]+"${quick_flag[@]}"} \
       2>&1 | tee "$log"; then
       echo "FAILED: sailfish $label" | tee -a "$FAILURES" >&2
     fi

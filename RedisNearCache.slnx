@@ -2,6 +2,7 @@
   <Folder Name="/bench/">
     <Project Path="bench/RedisNearCache.Bench/RedisNearCache.Bench.csproj" />
     <Project Path="bench/RedisNearCache.Bench.Report/RedisNearCache.Bench.Report.csproj" />
+    <Project Path="bench/RedisNearCache.Bench.Sailfish/RedisNearCache.Bench.Sailfish.csproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/MinimalApi/MinimalApi.csproj" />
