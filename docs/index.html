@@ -392,10 +392,13 @@ services.AddRedisNearCache(options =&gt;
 <h2>API reference <a class="anchor" href="#api-reference" aria-label="Link to this section">#</a></h2>
 <p class="lede">Every public member of RedisNearCache, one entry at a time.</p>
 
+</div>
+<div class="rail"></div>
+</div>
 <div class="member" id="getasync">
 <div class="row">
 <div class="prose">
-<h3>GetAsync&amp;lt;T&amp;gt;<span class="pill">method</span> <a class="anchor" href="#getasync" aria-label="Link to this member">#</a></h3>
+<h3>GetAsync&lt;T&gt;<span class="pill">method</span> <a class="anchor" href="#getasync" aria-label="Link to this member">#</a></h3>
 <div class="sig-inline">ValueTask&lt;T?&gt; GetAsync&lt;T&gt;(string key, CancellationToken cancellationToken = default)</div>
 <p>Gets the value stored at <code>key</code>, serving from L1 when present and tracked. On a miss, reads the key over RedisNearCache&#8217;s tracked interactive connection, which arms server-side tracking for it, stores it in L1 if the key matches <code>KeyPrefixes</code>, and returns it.</p>
 <div class="returns"><strong>Returns</strong> the deserialized value, or <code>default</code> when the key does not exist in Redis.</div>
@@ -408,7 +411,7 @@ services.AddRedisNearCache(options =&gt;
 <div class="member" id="setasync">
 <div class="row">
 <div class="prose">
-<h3>SetAsync&amp;lt;T&amp;gt;<span class="pill">method</span> <a class="anchor" href="#setasync" aria-label="Link to this member">#</a></h3>
+<h3>SetAsync&lt;T&gt;<span class="pill">method</span> <a class="anchor" href="#setasync" aria-label="Link to this member">#</a></h3>
 <div class="sig-inline">ValueTask SetAsync&lt;T&gt;(string key, T value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)</div>
 <p>Writes <code>value</code> to Redis through RedisNearCache&#8217;s own connection (armed with <code>NOLOOP</code> so the write does not invalidate itself) and evicts any L1 copy. The next <code>GetAsync&lt;T&gt;</code> re-reads and re-tracks the key. <code>SetAsync</code> does not populate L1 itself; write-through population of L1 is out of scope for v1.</p>
 
@@ -447,7 +450,7 @@ services.AddRedisNearCache(options =&gt;
 <div class="member" id="trygetlocal">
 <div class="row">
 <div class="prose">
-<h3>TryGetLocal&amp;lt;T&amp;gt;<span class="pill">method</span> <a class="anchor" href="#trygetlocal" aria-label="Link to this member">#</a></h3>
+<h3>TryGetLocal&lt;T&gt;<span class="pill">method</span> <a class="anchor" href="#trygetlocal" aria-label="Link to this member">#</a></h3>
 <div class="sig-inline">bool TryGetLocal&lt;T&gt;(string key, out T? value)</div>
 <p>Returns <code>true</code> and the L1 value when the key is currently cached locally. Never touches Redis, so this never blocks and never counts as a hit or miss against Redis traffic.</p>
 <div class="returns"><strong>Returns</strong> <code>true</code> if the key is cached in L1 right now.</div>
@@ -541,9 +544,6 @@ public JsonRedisNearCacheSerializer(JsonSerializerOptions options);</code></pre>
     Action&lt;RedisNearCacheOptions&gt;? configure = null);</code></pre></div></div>
 </div>
 </div>
-</div>
-<div class="rail"></div>
-</div>
 </section>
 <section class="section" id="hybridcache">
 <div class="row">
@@ -565,6 +565,9 @@ services.AddRedisNearCacheHybridCache();</code></pre></div></div>
 <div class="row">
 <div class="prose">
 <p>This registers <code>RedisNearCacheDistributedCache</code> as both <code>IDistributedCache</code> and <code>IBufferDistributedCache</code>, backed by the <code>IRedisNearCache</code> that <code>AddRedisNearCache</code> already registered, and then calls <code>AddHybridCache</code> so that <code>Microsoft.Extensions.Caching.Hybrid.HybridCache</code> uses RedisNearCache as its distributed tier. Use <code>AddRedisNearCacheDistributedCache()</code> alone if you only want the <code>IDistributedCache</code>/<code>IBufferDistributedCache</code> adapters (for session state, output caching, etc.) without <code>HybridCache</code>.</p>
+</div>
+<div class="rail"></div>
+</div>
 <div class="member" id="addrednc-distributedcache">
 <div class="row">
 <div class="prose">
@@ -604,9 +607,6 @@ services.AddRedisNearCacheHybridCache();</code></pre></div></div>
 // 3. SlidingExpiration, treated as an absolute expiry
 // null (never expires) if none of the three is set</code></pre></div></div>
 </div>
-</div>
-</div>
-<div class="rail"></div>
 </div>
 </section>
 <section class="section" id="reconnects-cluster">
@@ -817,6 +817,9 @@ info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
 <h2>FAQ <a class="anchor" href="#faq" aria-label="Link to this section">#</a></h2>
 
 
+</div>
+<div class="rail"></div>
+</div>
 <div class="member" id="faq-1"><div class="row"><div class="prose"><h3>Do my writers need to change? <a class="anchor" href="#faq-1" aria-label="Link to this question">#</a></h3><p>No. Any client, in any language, doing a plain <code>SET</code>, <code>DEL</code>, <code>MSET</code>, or a <code>redis-cli</code> command by hand causes Redis itself to push an invalidation to every connection tracking that key. RedisNearCache does not require writers to publish anything or use the same library.</p></div><div class="rail"></div></div></div>
 <div class="member" id="faq-2"><div class="row"><div class="prose"><h3>Can I use my existing IConnectionMultiplexer? <a class="anchor" href="#faq-2" aria-label="Link to this question">#</a></h3><p>Your existing multiplexer is never touched, reconfigured, or depended on. RedisNearCache opens its own private multiplexer (cloned connection settings, forced to RESP2 with admin mode). Your own connection can stay on whatever protocol and configuration it already uses.</p></div><div class="rail"></div></div></div>
 <div class="member" id="faq-3"><div class="row"><div class="prose"><h3>Why does RedisNearCache need its own connection instead of using mine? <a class="anchor" href="#faq-3" aria-label="Link to this question">#</a></h3><p>Two reasons: <code>CLIENT TRACKING</code> and <code>CLIENT LIST</code> require <code>AllowAdmin=true</code>, which most applications do not (and should not) set on their main connection; and every read issued on a tracked connection is tracked by Redis, whether or not it is something you actually want cached. Giving RedisNearCache its own connection means only cache reads are tracked, and your main connection&#8217;s admin surface is untouched.</p></div><div class="rail"></div></div></div>
@@ -830,9 +833,6 @@ info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
 <div class="member" id="faq-11"><div class="row"><div class="prose"><h3>What happens to a key's TTL? <a class="anchor" href="#faq-11" aria-label="Link to this question">#</a></h3><p>RedisNearCache does not track expiry deadlines itself. When Redis&#8217;s own active expiry cycle actually removes an expired key, that is a normal deletion from Redis&#8217;s point of view and it is invalidated like any other write. Because active expiry can lag the TTL deadline, there can be a small window where L1 still holds a value whose TTL has technically passed. <code>L1MaxAge</code> (default 5 minutes) is the safety net for this and for any other missed invalidation.</p></div><div class="rail"></div></div></div>
 <div class="member" id="faq-12"><div class="row"><div class="prose"><h3>Can I invalidate a key without touching Redis? <a class="anchor" href="#faq-12" aria-label="Link to this question">#</a></h3><p>Yes, <code>EvictLocal(key)</code> removes only the local L1 copy without going to Redis. This is separate from <code>RemoveAsync</code>, which deletes the key in Redis too.</p></div><div class="rail"></div></div></div>
 <div class="member" id="faq-13"><div class="row"><div class="prose"><h3>Does SetAsync populate L1 immediately? <a class="anchor" href="#faq-13" aria-label="Link to this question">#</a></h3><p>No. <code>SetAsync</code> writes to Redis and evicts any existing L1 copy of the key; the next <code>GetAsync&lt;T&gt;</code> re-reads it from Redis and re-tracks it. Write-through population of L1 is explicitly out of scope for v1.</p></div><div class="rail"></div></div></div>
-</div>
-<div class="rail"></div>
-</div>
 </section>
 <footer class="site-foot">
 <p>RedisNearCache is MIT licensed. Source, issues, and the full README live at
