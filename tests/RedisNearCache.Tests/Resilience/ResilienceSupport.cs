@@ -52,6 +52,10 @@ internal static class ResilienceSupport
         return (p.ExitCode, stdout.Trim(), stderr.Trim());
     }
 
+    /// <summary><see cref="Docker"/> without holding a thread-pool thread while docker runs (see <see cref="DockerProcess"/>).</summary>
+    public static Task<(int ExitCode, string StdOut, string StdErr)> DockerAsync(params string[] args) =>
+        DockerProcess.RunAsync(args);
+
     /// <summary>Stops and starts a container in place. Blocks until docker reports the restart done.</summary>
     public static void RestartContainer(string container)
     {

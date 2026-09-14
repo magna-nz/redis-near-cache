@@ -36,6 +36,18 @@ internal static class RedisCli
         return output.Trim();
     }
 
+    /// <summary><see cref="Run"/> without holding a thread-pool thread while docker runs (see <see cref="DockerProcess"/>).</summary>
+    public static async Task<string> RunAsync(string container, params string[] args)
+    {
+        var r = await DockerProcess.RunAsync(["exec", container, "redis-cli", .. args]);
+        if (r.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"redis-cli {string.Join(' ', args)} in {container} exited {r.ExitCode}: {r.StdErr}");
+        }
+        return r.StdOut;
+    }
+
     /// <summary>Runs redis-cli against the single-node standalone container.</summary>
     public static string Standalone(params string[] args) => Run(StandaloneContainer, args);
 

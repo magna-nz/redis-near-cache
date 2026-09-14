@@ -57,6 +57,10 @@ internal static class DockerExec
         p.WaitForExit();
         return (p.ExitCode, stdout.Trim(), stderr.Trim());
     }
+
+    /// <summary><see cref="Run"/> without holding a thread-pool thread while docker runs (see <see cref="DockerProcess"/>).</summary>
+    public static Task<(int ExitCode, string StdOut, string StdErr)> RunAsync(string container, params string[] args) =>
+        DockerProcess.RunAsync(["exec", container, .. args]);
 }
 
 internal static class ChaosSupport
