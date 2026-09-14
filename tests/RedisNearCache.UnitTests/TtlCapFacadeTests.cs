@@ -5,6 +5,8 @@ using StackExchange.Redis;
 using Xunit;
 using Facade = RedisNearCache.Caching.RedisNearCache;
 
+#pragma warning disable CS0618 // the simple exception constructors are the clearest way to fake a server reply here
+
 namespace RedisNearCache.UnitTests;
 
 /// <summary>

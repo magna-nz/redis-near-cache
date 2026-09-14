@@ -35,7 +35,7 @@ public class HybridCachePerCallOptionsTests : IClassFixture<HybridCacheFixture>
             {
                 var current = await _fx.HybridCache.GetOrCreateAsync<string>(key, _ => ValueTask.FromResult("factory-should-not-run"), perCall);
                 return current == "v2";
-            }, TimeSpan.FromSeconds(3));
+            }, TimeSpan.FromSeconds(10)); // the regression this guards was 30 s of stale reads; a cold CI runner can take more than 3 s here
 
             Assert.True(sawV2, "HybridCache kept serving the old value from its own local cache despite the tracked invalidation");
         }

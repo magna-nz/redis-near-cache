@@ -24,7 +24,7 @@ public class OptOutModeArmingTests
             var info = await server.ExecuteAsync("CLIENT", "TRACKINGINFO");
             var fields = info.ToDictionary();
 
-            var flags = ((string[])fields["flags"]).Select(f => f.ToLowerInvariant()).ToArray();
+            var flags = ((string[])fields["flags"]!).Select(f => f.ToLowerInvariant()).ToArray();
             Assert.Contains("on", flags);
             Assert.Contains("optout", flags);
             Assert.Contains("noloop", flags);
