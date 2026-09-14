@@ -19,6 +19,10 @@ keep a local copy of what you read: a hit is served from memory, and a write fro
 few milliseconds later. It runs on StackExchange.Redis 3.x over its own connection, so nothing about your
 existing setup changes.
 
+StackExchange.Redis has never exposed this. The [request from 2020](https://github.com/StackExchange/StackExchange.Redis/issues/1461)
+is still open, the 3.x rewrite shipped without it, and Redis lists client-side caching support for its
+Python, Java, Node and Go clients only. RedisNearCache fills that gap without forking the library.
+
 <div align="center">
   <img src="docs/architecture-diagram.svg" alt="Your code reads through RedisNearCache; misses go over a tracked private connection; Redis pushes invalidations to a private subscriber connection which evicts the local copy" width="820" />
   <br />
