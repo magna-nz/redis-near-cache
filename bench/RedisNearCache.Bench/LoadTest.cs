@@ -143,65 +143,84 @@ internal static class LoadTest
     }
 
     /// <summary>
-    /// Per key, the last <see cref="Window"/> acknowledged versions with the <see cref="Stopwatch"/> timestamp at which the
-    /// writer saw the acknowledgement. Each array is immutable and replaced whole (copy-on-write), so readers read it
-    /// lock-free. Arrays are in ascending version order and, because a key has exactly one writer that never has two
-    /// writes to it in flight, ascending acknowledgement order too.
+    /// Per key, the <see cref="Stopwatch"/> timestamp at which the writer saw each version acknowledged, indexed by version
+    /// (0 = not acknowledged: not yet written, or the write threw). Versions per key are consecutive and a key has exactly
+    /// one writer that never has two writes to it in flight, so acknowledgement times ascend with versions. Every version
+    /// is kept for the whole run: a local tier can serve a value dozens of versions old (a hot key sees several writes a
+    /// second against a TTL of seconds), so a bounded window would truncate staleness ages.
+    /// <para>
+    /// The owning writer is the only thread that writes a key's array. It stores into the array readers already see, and
+    /// when the array is full it copies into a larger one, stores there, and only then publishes the new reference. A
+    /// reader holding the old reference misses the newest acknowledgements, which can only undercount.
+    /// </para>
     /// </summary>
     private sealed class VersionRegistry
     {
-        public const int Window = 16;
-        private readonly Entry[][] _perKey;
-
-        public readonly record struct Entry(long Version, long AckTimestamp);
+        private readonly long[][] _acksPerKey;
+        private readonly long[] _latestAcked;
 
         public VersionRegistry(int keys, long seedTimestamp)
         {
-            var seed = new[] { new Entry(0, seedTimestamp) };
-            _perKey = new Entry[keys][];
-            for (var i = 0; i < keys; i++) _perKey[i] = seed;
+            _acksPerKey = new long[keys][];
+            _latestAcked = new long[keys];
+            for (var i = 0; i < keys; i++)
+            {
+                _acksPerKey[i] = new long[64];
+                _acksPerKey[i][0] = seedTimestamp;
+            }
         }
 
-        public Entry[] Read(int keyIndex) => Volatile.Read(ref _perKey[keyIndex]);
+        /// <summary>
+        /// The highest acknowledged version, then the ack array. Read in that order: the writer publishes the array before
+        /// the version, so the array read second always covers index <c>latest</c>.
+        /// </summary>
+        public (long Latest, long[] Acks) Read(int keyIndex)
+        {
+            var latest = Volatile.Read(ref _latestAcked[keyIndex]);
+            return (latest, Volatile.Read(ref _acksPerKey[keyIndex]));
+        }
 
+        /// <summary>Called only by the key's single writer.</summary>
         public void Record(int keyIndex, long version, long ackTimestamp)
         {
-            while (true)
+            var acks = _acksPerKey[keyIndex];
+            if (version < acks.Length)
             {
-                var current = Volatile.Read(ref _perKey[keyIndex]);
-                var keep = Math.Min(current.Length, Window - 1);
-                var next = new Entry[keep + 1];
-                Array.Copy(current, current.Length - keep, next, 0, keep);
-                next[keep] = new Entry(version, ackTimestamp);
-                if (ReferenceEquals(Interlocked.CompareExchange(ref _perKey[keyIndex], next, current), current)) return;
+                acks[version] = ackTimestamp;
             }
+            else
+            {
+                var grown = new long[Math.Max(acks.Length * 2, version + 1)];
+                Array.Copy(acks, grown, acks.Length);
+                grown[version] = ackTimestamp;
+                Volatile.Write(ref _acksPerKey[keyIndex], grown);
+            }
+            Volatile.Write(ref _latestAcked[keyIndex], version);
         }
 
         /// <summary>
         /// A read that started at <paramref name="readStart"/> and returned <paramref name="returned"/> is stale iff a newer
         /// version was acknowledged before the read started. On true, <paramref name="ackTimestamp"/> is the acknowledgement
-        /// time of the smallest newer version. Acks ascend with versions, so if the smallest newer version was acknowledged
-        /// at or after <paramref name="readStart"/>, no newer version qualifies (the read raced the write: not stale).
+        /// time of the smallest acknowledged newer version (normally returned + 1; a higher one only when the writes in
+        /// between threw). Acks ascend with versions, so if that version was acknowledged at or after
+        /// <paramref name="readStart"/>, no newer version qualifies (the read raced the write: not stale).
         /// <para>
-        /// If the smallest newer version (returned + 1; versions per key are consecutive) has already fallen out of the
-        /// window, the oldest windowed version is used instead. Its ack is later than the true one, so the age is a lower
-        /// bound, and a read whose true first newer version was acked before the read but whose oldest windowed version
-        /// was acked after it is not counted. Both need 16 writes to one key during a single read.
-        /// </para>
-        /// <para>
-        /// The writer takes the ack timestamp before publishing the entry, and the reader looks the registry up only after
-        /// its read completed. A writer descheduled between the two can make a stale read go uncounted, never the
-        /// reverse: the probe can undercount by that window but cannot report a fresh read as stale.
+        /// The writer takes the ack timestamp after its write's continuation runs (never earlier than the real
+        /// acknowledgement), and the reader looks the registry up only after its read completed. Both delays can make a
+        /// stale read go uncounted, never the reverse: the probe can undercount but cannot report a fresh read as stale.
         /// </para>
         /// </summary>
-        public static bool IsStale(Entry[] window, long returned, long readStart, out long ackTimestamp)
+        public static bool IsStale((long Latest, long[] Acks) registry, long returned, long readStart, out long ackTimestamp)
         {
-            foreach (var e in window)
+            var (latest, acks) = registry;
+            // Usual case, a fresh read: nothing newer has been acknowledged. Bounded by latest, so it's O(1) then.
+            for (var v = returned + 1; v <= latest && v < acks.Length; v++)
             {
-                if (e.Version <= returned) continue;
-                if (e.AckTimestamp < readStart)
+                var ack = acks[v];
+                if (ack == 0) continue; // not acknowledged (yet, or ever)
+                if (ack < readStart)
                 {
-                    ackTimestamp = e.AckTimestamp;
+                    ackTimestamp = ack;
                     return true;
                 }
                 break;
