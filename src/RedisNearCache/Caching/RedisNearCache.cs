@@ -25,6 +25,26 @@ internal sealed class RedisNearCache : IRedisNearCache
     private readonly System.Collections.Concurrent.ConcurrentDictionary<EndPoint, bool> _lostEndpoints = new();
     private int _disposed;
 
+    /// <summary>
+    /// Completed while the cache is coherent; replaced by a fresh, pending source whenever coherence is lost.
+    /// <see cref="WaitForCoherenceAsync"/> re-checks <see cref="IsCoherent"/> after every completion, so a source
+    /// that completes and is immediately superseded never lets a waiter through wrongly.
+    /// </summary>
+    private TaskCompletionSource _coherence = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object _coherenceLock = new();
+
+    /// <summary>
+    /// Set once the server has rejected PTTL outright (an ACL without it, a proxy): the TTL cap cannot be honoured, so
+    /// misses fall back to a plain GET and are cached for L1MaxAge, as with RespectServerTtl off. Logged once.
+    /// </summary>
+    private int _ttlCapUnavailable;
+
+    /// <summary>
+    /// Set once the server has rejected CLIENT CACHING inside a transaction (EXECABORT): untracked reads are not
+    /// possible there, so keys outside KeyPrefixes are read with a plain, tracked GET, as before 0.5.2. Logged once.
+    /// </summary>
+    private int _untrackedReadsUnavailable;
+
     public RedisNearCacheStatistics Statistics { get; } = new();
 
     public Task Ready { get; }
@@ -94,21 +114,25 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     private void OnArmed(TrackingArmedEvent e)
     {
-        if (e.Reason != ArmReason.Initial)
-        {
-            FlushLocal();
-            Statistics.Rearm();
-        }
+        // Initial: nothing was cached yet. Promoted: the node was armed while it was still a replica, so every read
+        // routed to it since is tracked and no re-arm is needed; L1 is still flushed once, because entries read from
+        // the demoted master before the failover are protected only by that node's tracking table from here on.
+        if (e.Reason != ArmReason.Initial) FlushLocal();
+        if (e.Reason is not (ArmReason.Initial or ArmReason.Promoted)) Statistics.Rearm();
         // Re-enable caching only AFTER the flush, so no concurrent read can hit an entry the flush discards.
         _lostEndpoints.TryRemove(e.EndPoint, out _);
         // An arm succeeded, so startup (or its recovery) is settled and the cache is no longer degraded.
         Volatile.Write(ref _startupSettled, 1);
         _degraded = false;
+        SignalCoherence();
     }
 
     private void OnTrackingLost(EndPoint endPoint)
     {
         // Nothing can be trusted while tracking is down on any endpoint: stop populating L1 first, then flush.
+        // The coherence source is reset BEFORE the loss is visible, so a waiter can never observe "not coherent"
+        // against a still-completed source and spin.
+        ResetCoherence();
         _lostEndpoints[endPoint] = true;
         FlushLocal();
     }
@@ -121,10 +145,53 @@ internal sealed class RedisNearCache : IRedisNearCache
         // never be re-armed, so it must not keep us in pass-through. Flush first, re-enable after, as in OnArmed.
         FlushLocal();
         _lostEndpoints.TryRemove(endPoint, out _);
+        SignalCoherence();
     }
 
     /// <summary>L1 may only be read or populated while tracking is believed to be armed everywhere.</summary>
     private bool CachingEnabled => !_degraded && _lostEndpoints.IsEmpty;
+
+    /// <inheritdoc />
+    public bool IsCoherent => Volatile.Read(ref _startupSettled) == 1 && CachingEnabled && Volatile.Read(ref _disposed) == 0;
+
+    /// <inheritdoc />
+    public async Task WaitForCoherenceAsync(CancellationToken cancellationToken = default)
+    {
+        while (true)
+        {
+            ThrowIfDisposed();
+            if (IsCoherent) return;
+            TaskCompletionSource pending;
+            lock (_coherenceLock) pending = _coherence;
+            if (pending.Task.IsCompleted)
+            {
+                // Coherence was lost after the source completed and before the losing path replaced it; give that
+                // path a chance to run rather than spinning on a completed task.
+                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Yield();
+                continue;
+            }
+            await pending.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Lets waiters through if the cache is coherent now. Called after every event that can restore coherence.</summary>
+    private void SignalCoherence()
+    {
+        lock (_coherenceLock)
+        {
+            if (IsCoherent) _coherence.TrySetResult();
+        }
+    }
+
+    /// <summary>Makes the next wait pend again. Called before every event that takes coherence away.</summary>
+    private void ResetCoherence()
+    {
+        lock (_coherenceLock)
+        {
+            if (_coherence.Task.IsCompleted) _coherence = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+    }
 
     private void ThrowIfDisposed()
     {
@@ -177,6 +244,7 @@ internal sealed class RedisNearCache : IRedisNearCache
             // faulted forever, but the cache does not.
             if (Interlocked.Exchange(ref _startupSettled, 1) == 0 && !Ready.IsCompletedSuccessfully)
             {
+                ResetCoherence();
                 _degraded = true;
             }
         }
@@ -188,11 +256,68 @@ internal sealed class RedisNearCache : IRedisNearCache
         }
 
         Statistics.Miss();
+        var cacheable = MatchesPrefixes(key);
         long token = _inflight.Begin(key);
         try
         {
             var db = _connection.Multiplexer.GetDatabase();
-            RedisValue value = await db.StringGetAsync(key).WaitAsync(cancellationToken).ConfigureAwait(false);
+            RedisValue value;
+            long? ttlMilliseconds = null;
+            var ttlUnknown = false; // PTTL failed: the value is good but must not be stored without its cap
+            if (!cacheable && CachingEnabled && Volatile.Read(ref _untrackedReadsUnavailable) == 0)
+            {
+                // Outside KeyPrefixes: nothing will be stored, so do not let the server track the key either.
+                // The connection is armed in OPTOUT mode, and CLIENT CACHING NO applies to the next command on the
+                // same connection. A MULTI/EXEC is the only way StackExchange.Redis writes two commands adjacently
+                // on a multiplexed connection; the pair is atomic on the server, so no other read slips between.
+                value = await ReadUntrackedAsync(db, key, cancellationToken).ConfigureAwait(false);
+            }
+            else if (cacheable && CachingEnabled && _options.RespectServerTtl && Volatile.Read(ref _ttlCapUnavailable) == 0)
+            {
+                // GET and PTTL pipelined back to back: one round trip. A write landing between them pushes an
+                // invalidation for the key, which the in-flight tracker turns into a discard below, so a value from
+                // before the write is never stored with a TTL from after it.
+                var getTask = db.StringGetAsync(key);
+                var ttlTask = db.ExecuteAsync("PTTL", (RedisKey)key);
+                try
+                {
+                    value = await getTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch
+                {
+                    Observe(getTask);
+                    Observe(ttlTask);
+                    throw;
+                }
+
+                try
+                {
+                    ttlMilliseconds = (long)await ttlTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    Observe(ttlTask);
+                    throw;
+                }
+                catch (RedisServerException ex)
+                {
+                    // The server refuses PTTL on this connection: no cap will ever be available. Say so once and stop
+                    // asking; from now on misses are plain GETs cached for L1MaxAge, as with RespectServerTtl off.
+                    if (Interlocked.Exchange(ref _ttlCapUnavailable, 1) == 0)
+                        _logger.LogWarning(ex, "RedisNearCache: the server rejected PTTL, so RespectServerTtl cannot be honoured; L1 entries are capped by L1MaxAge only from now on");
+                    ttlUnknown = true;
+                }
+                catch (Exception ex)
+                {
+                    // The value is good; only the cap is unknown (a timeout, a dropped connection). Serve it, store nothing.
+                    _logger.LogDebug(ex, "RedisNearCache could not read PTTL for {Key}; the value is served but not cached", key);
+                    ttlUnknown = true;
+                }
+            }
+            else
+            {
+                value = await db.StringGetAsync(key).WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
 
             var afterRead = _options.TestHooks.AfterRedisReadBeforeStore;
             if (afterRead is not null)
@@ -206,15 +331,26 @@ internal sealed class RedisNearCache : IRedisNearCache
                 return default;
             }
 
-            if (CachingEnabled && MatchesPrefixes(key))
+            // A read that started in pass-through has no TTL to cap by; if caching came back meanwhile, leave the entry
+            // to the next read rather than store it for the full L1MaxAge against the option.
+            if (CachingEnabled && cacheable && !ttlUnknown && (ttlMilliseconds is not null || !_options.RespectServerTtl || Volatile.Read(ref _ttlCapUnavailable) == 1))
             {
-                if (_inflight.WasInvalidated(key, token))
+                // PTTL: -1 no expiry, -2 the key vanished between GET and PTTL (expired or deleted; the server has
+                // pushed, or is about to push, an invalidation for it), otherwise the remaining milliseconds.
+                TimeSpan? cap = ttlMilliseconds switch
+                {
+                    null or -1 => null,
+                    < 0 => TimeSpan.Zero,
+                    long ms => TimeSpan.FromMilliseconds(ms),
+                };
+
+                if (cap == TimeSpan.Zero || _inflight.WasInvalidated(key, token))
                 {
                     Statistics.RaceDiscard();
                 }
                 else
                 {
-                    _l1.Set(key, bytes);
+                    _l1.Set(key, bytes, cap);
                     // Re-check after the store: an invalidation that landed between the check above and the
                     // Set would have found nothing to remove, so remove it ourselves.
                     if (_inflight.WasInvalidated(key, token))
@@ -231,6 +367,63 @@ internal sealed class RedisNearCache : IRedisNearCache
         {
             _inflight.End(key, token);
         }
+    }
+
+    /// <summary>
+    /// <c>MULTI</c> / <c>CLIENT CACHING NO</c> / <c>GET</c> / <c>EXEC</c>. If the node is not in OPTOUT mode (tracking
+    /// is off there while it is being re-armed) the CACHING command fails inside EXEC and the GET still answers; the
+    /// key is then tracked as before, which is harmless. If the server refuses to even queue CLIENT CACHING (an ACL
+    /// without it, a proxy) EXEC is aborted; that is reported once and every later read outside KeyPrefixes is a
+    /// plain, tracked GET. A transaction that did not run at all also falls back to a plain GET.
+    /// </summary>
+    private async Task<RedisValue> ReadUntrackedAsync(IDatabase db, string key, CancellationToken cancellationToken)
+    {
+        var transaction = db.CreateTransaction();
+        var caching = transaction.ExecuteAsync("CLIENT", "CACHING", "NO");
+        var get = transaction.StringGetAsync(key);
+        var exec = transaction.ExecuteAsync();
+        bool executed;
+        try
+        {
+            executed = await exec.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RedisServerException ex)
+        {
+            Observe(caching);
+            Observe(get);
+            if (Interlocked.Exchange(ref _untrackedReadsUnavailable, 1) == 0)
+                _logger.LogWarning(ex, "RedisNearCache: the server rejected CLIENT CACHING NO inside a transaction, so keys outside KeyPrefixes will be read with a plain GET and tracked from now on");
+            return await db.StringGetAsync(key).WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            Observe(exec);
+            Observe(caching);
+            Observe(get);
+            throw;
+        }
+
+        Observe(caching);
+        if (!executed)
+        {
+            Observe(get);
+            _logger.LogDebug("RedisNearCache untracked read of {Key} did not execute as a transaction; reading it tracked instead", key);
+            return await db.StringGetAsync(key).WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        return await get.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Marks a task's eventual failure as observed so an abandoned pipelined command never surfaces as an unobserved exception.</summary>
+    private static void Observe(Task task)
+    {
+        if (task.IsCompleted)
+        {
+            _ = task.Exception;
+            return;
+        }
+
+        _ = task.ContinueWith(static t => _ = t.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
     public async ValueTask SetAsync<T>(string key, T value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)
@@ -277,6 +470,8 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     public void EvictLocal(string key) => _l1.Remove(key);
 
+    public void EvictAllLocal() => FlushLocal();
+
     public bool TryGetLocal<T>(string key, out T? value)
     {
         if (CachingEnabled && Volatile.Read(ref _disposed) == 0 && _l1.TryGet(key, out var bytes))
@@ -308,5 +503,7 @@ internal sealed class RedisNearCache : IRedisNearCache
         await _listener.DisposeAsync().ConfigureAwait(false);
         _l1.Dispose();
         await _connection.DisposeAsync().ConfigureAwait(false);
+        // Waiters can never be satisfied now; wake them so they observe the disposal.
+        lock (_coherenceLock) _coherence.TrySetResult();
     }
 }

@@ -27,7 +27,10 @@ public class DistributedCacheAdapterTests
 
         public ValueTask<bool> RemoveAsync(string key, CancellationToken ct = default) => new(Store.Remove(key));
         public void EvictLocal(string key) { }
+        public void EvictAllLocal() { }
         public bool TryGetLocal<T>(string key, out T? value) { value = default; return false; }
+        public bool IsCoherent => true;
+        public Task WaitForCoherenceAsync(CancellationToken ct = default) => Task.CompletedTask;
         public ValueTask DisposeAsync() => default;
     }
 

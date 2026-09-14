@@ -3,13 +3,11 @@ using Xunit;
 namespace RedisNearCache.Tests.EdgeCases;
 
 /// <summary>
-/// <see cref="RedisNearCacheOptions.KeyPrefixes"/> only decides what gets stored in L1
-/// (RedisNearCache.MatchesPrefixes); it has no effect on what the Redis server tracks, because every key read
-/// through the private connection is tracked regardless of prefix (design: "only keys read through
-/// RedisNearCache are tracked, because only its connection is tracked; prefix opt-in further limits what is
-/// stored in L1"). So a key outside every configured prefix is never cached, but the server still remembers
-/// that this connection read it and still pushes an invalidation for it when someone writes it - the listener
-/// must shrug that off (nothing to remove from L1) rather than treat it as unexpected.
+/// <see cref="RedisNearCacheOptions.KeyPrefixes"/> decides both what gets stored in L1 and what the server tracks:
+/// the connection is armed in OPTOUT mode and a read of a key outside every prefix is sent with
+/// <c>CLIENT CACHING NO</c> (inside a MULTI/EXEC so the two are adjacent on the wire), so the server never
+/// remembers it and a later write to it pushes nothing. A key inside a prefix is tracked and invalidated as
+/// before. (Before 0.5.2 every key read through the connection was tracked whatever its prefix.)
 /// </summary>
 public class KeyPrefixInvalidationTests
 {
@@ -27,8 +25,7 @@ public class KeyPrefixInvalidationTests
             Assert.Equal("v1", await cache.GetAsync<string>(cachedKey));
             Assert.True(cache.TryGetLocal<string>(cachedKey, out _), "a:-prefixed key must be cached.");
 
-            // Read once so the server starts tracking it on our connection, even though it will never be
-            // stored in L1 (outside every configured prefix).
+            // Read once. Outside every configured prefix, so it is neither stored in L1 nor tracked by the server.
             await cache.SetAsync(uncachedKey, "v1");
             Assert.Equal("v1", await cache.GetAsync<string>(uncachedKey));
             Assert.False(cache.TryGetLocal<string>(uncachedKey, out _), "b:-prefixed key must never be cached.");
@@ -40,16 +37,51 @@ public class KeyPrefixInvalidationTests
             var invalidationsBefore = cache.Statistics.Invalidations;
             RedisCli.Standalone("SET", uncachedKey, "v2");
             var sawInvalidation = await Poll.UntilAsync(
-                () => cache.Statistics.Invalidations > invalidationsBefore, TimeSpan.FromSeconds(5));
-            Assert.True(sawInvalidation,
-                "a write to the uncached prefix should still produce an invalidation message for the server-tracked key.");
-            Assert.False(cache.TryGetLocal<string>(uncachedKey, out _), "still never cached after its own invalidation.");
+                () => cache.Statistics.Invalidations > invalidationsBefore, TimeSpan.FromSeconds(1));
+            Assert.False(sawInvalidation,
+                "a write to a key outside KeyPrefixes produced an invalidation: the read was tracked although it was sent with CLIENT CACHING NO.");
+            Assert.False(cache.TryGetLocal<string>(uncachedKey, out _), "still never cached.");
             Assert.Equal("v2", await cache.GetAsync<string>(uncachedKey));
         }
         finally
         {
             await handle.DisposeAsync();
             RedisCli.Standalone("DEL", cachedKey, uncachedKey);
+        }
+    }
+
+    /// <summary>
+    /// The server tracks one-shot per key and does not know what L1 holds, so an invalidation for a key that is no
+    /// longer in L1 (evicted locally, aged out, dropped by the size limit) is routine. It must be counted and shrugged
+    /// off, never treated as unexpected, and the next read must see the new value.
+    /// </summary>
+    [Fact]
+    public async Task InvalidationForAKeyNotInL1IsHarmless()
+    {
+        var handle = await EdgeCaseSupport.BuildAsync(StandaloneCacheFixture.ConnectionString);
+        var key = TestHelpers.Key("evicted-then-written");
+        try
+        {
+            var cache = handle.Cache;
+            await cache.SetAsync(key, "v1");
+            Assert.True(await TestHelpers.ReadUntilCachedAsync(cache, key, "v1"), "the key was not cached.");
+
+            // Gone from L1, still tracked on the server.
+            cache.EvictLocal(key);
+            Assert.False(cache.TryGetLocal<string>(key, out _));
+
+            var invalidationsBefore = cache.Statistics.Invalidations;
+            RedisCli.Standalone("SET", key, "v2");
+            Assert.True(await Poll.UntilAsync(() => cache.Statistics.Invalidations > invalidationsBefore, TimeSpan.FromSeconds(5)),
+                "the server did not push an invalidation for a tracked key that L1 no longer holds.");
+            Assert.False(cache.TryGetLocal<string>(key, out _));
+            Assert.Equal("v2", await cache.GetAsync<string>(key));
+            Assert.True(cache.TryGetLocal<string>(key, out _), "the key was not cached again after the invalidation.");
+        }
+        finally
+        {
+            await handle.DisposeAsync();
+            RedisCli.Standalone("DEL", key);
         }
     }
 }

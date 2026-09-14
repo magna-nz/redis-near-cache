@@ -378,7 +378,7 @@ flowchart LR
       <tr><td>Use your existing multiplexer</td><td>Every <code>CLIENT TRACKING</code> and <code>CLIENT LIST</code> call needs <code>allowAdmin</code>, and every read on it would be tracked, cache or not.</td></tr>
       <tr><td>RESP3 push messages (the 3.x default)</td><td>StackExchange.Redis collapses to one connection and drops the <code>invalidate</code> pushes. Server says tracking is on; zero messages arrive.</td></tr>
       <tr><td>Lua to bypass admin mode</td><td><code>CLIENT TRACKING</code> is flagged <code>noscript</code>.</td></tr>
-      <tr><td><code>OPTIN</code> / <code>CLIENT CACHING YES</code></td><td>Must be adjacent on the wire to the next command; impossible on a multiplexed connection. Selection lives in the package instead.</td></tr>
+      <tr><td><code>OPTIN</code> / <code>CLIENT CACHING YES</code></td><td>Would need to decide, before every read, whether to track it - before the library knows whether the key is cacheable. Ruled out in favour of <code>OPTOUT</code>: the connection is armed <code>OPTOUT</code>, and a read outside <code>KeyPrefixes</code> is preceded by <code>CLIENT CACHING NO</code> inside a <code>MULTI</code>/<code>EXEC</code>, which keeps the two commands adjacent on the wire even on a multiplexed connection.</td></tr>
       <tr><td>Raw-socket sidecar per node</td><td>Works, kept as fallback. It re-implements TLS, auth, topology and reconnects that the library already provides.</td></tr>
       <tr><td>Garnet</td><td>Does not implement <code>CLIENT TRACKING</code>. Redis 6+ and Valkey do.</td></tr>
     </tbody>

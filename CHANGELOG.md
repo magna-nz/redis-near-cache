@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.5.2 (2026-09-14)
+
+- Feature: `RespectServerTtl` option (default `true`). On every miss, `PTTL` is pipelined with the `GET` (one
+  extra command, no extra round trip) and the L1 entry's expiration is capped at whichever is shorter, that or
+  `L1MaxAge`. Redis's active-expiry cycle only pushes an invalidation once it actually deletes an expired key,
+  which on a large keyspace can lag the TTL deadline by minutes; with this on, a value is never served locally
+  after its TTL has elapsed. A key found already gone between the `GET` and the `PTTL` is returned but not
+  cached, and counts as a `RaceDiscard`.
+- Feature: reads of keys outside `KeyPrefixes` (once `KeyPrefixes` is non-empty) are now sent as `CLIENT CACHING
+  NO` immediately followed by `GET`, inside a `MULTI`/`EXEC` so the two stay adjacent on the wire, so the server
+  no longer tracks them either. The private connection is armed `OPTOUT` instead of plain `ON`.
+- Fix: every connected replica is now pre-armed with `CLIENT TRACKING ON ... OPTOUT NOLOOP` ahead of any
+  failover. A replica is never read from, so pre-arming costs nothing; from the moment it is promoted, reads
+  routed to it are already tracked, closing the window (previously up to 5 s, until the next topology check)
+  during which a freshly promoted master served untracked reads. A promotion found already pre-armed is
+  reported as `ArmReason.Promoted`: no re-arm and no pass-through gap, one L1 flush for the entries read from the
+  demoted master. A pre-armed replica whose connection fails, or whose replication link goes down, is re-armed
+  by a later reconcile sweep once it is a connected replica again.
+- Feature: `IRedisNearCache.IsCoherent` and `WaitForCoherenceAsync(CancellationToken)` expose directly whether
+  every master is armed and L1 is being read and populated, instead of inferring pass-through from statistics.
+  Breaking for code that implements `IRedisNearCache` itself (test doubles, decorators): these two and
+  `EvictAllLocal()` are new abstract members.
+- Feature: `IRedisNearCache.EvictAllLocal()` drops every L1 entry through the same flush path as a whole-cache
+  invalidation, for operations Redis does not push an invalidation for, such as `SWAPDB`.
+- Fix: arming now wraps a `RedisServerException` from `CLIENT TRACKING ON REDIRECT` with a message naming Redis
+  Enterprise-based services and ElastiCache Serverless, instead of surfacing the bare server error.
+- Docs: corrected the OPTIN/OPTOUT limitation (OPTOUT plus `CLIENT CACHING NO` inside a `MULTI`/`EXEC` works
+  fine on a multiplexed connection; only OPTIN would need to decide before the read), the managed-services
+  limitation (ElastiCache Serverless and every Redis Enterprise-based tier of Azure Managed Redis, Redis Cloud
+  and Redis Software cannot run RedisNearCache at all, per each service's own documentation), and the
+  cluster-failover limitation (replica pre-arming, not just the 5 s topology check, is what closes the
+  staleness window).
+- Tests: new integration tests for the TTL cap, opt-out untracked reads and replica pre-arm across a cluster
+  failover, plus unit tests for the pre-arm bookkeeping.
+
+## 0.5.1 (2026-09-14)
+
+No library changes: `RedisNearCache` and `RedisNearCache.HybridCache` are functionally identical to 0.5.0.
+
+- CI: packages are published only from a GitHub Release (a tag push no longer races it), and a release whose
+  tag disagrees with `<Version>` fails before publishing.
+- Tests: the Sentinel failover tests tolerate client-side thread-pool starvation during the failover
+  (StackExchange.Redis's Sentinel reconnect blocks pool threads) and re-issue a failover that Sentinel itself
+  aborts. The test assembly raises the minimum worker threads to 32; `RNC_TEST_MIN_WORKER_THREADS=0` keeps the
+  runtime default.
+
 ## 0.5.0 (2026-09-14)
 
 - Fix: a Sentinel master that is killed no longer keeps the cache in pass-through forever. An unreachable node

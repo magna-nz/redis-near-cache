@@ -43,7 +43,9 @@ dotnet add package RedisNearCache
 ```
 
 Add `RedisNearCache.HybridCache` as well if you want it behind `HybridCache` or `IDistributedCache`.
-Needs Redis 6 or newer, or Valkey. Garnet does not implement `CLIENT TRACKING`.
+Needs Redis 6 or newer, or Valkey. Garnet does not implement `CLIENT TRACKING`, and neither Redis
+Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis Software) nor ElastiCache Serverless are
+supported.
 
 ## Use
 

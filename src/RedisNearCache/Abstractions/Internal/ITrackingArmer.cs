@@ -17,6 +17,12 @@ internal enum ArmReason
     TopologyChanged,
     /// <summary>A background retry succeeded on an endpoint whose earlier arm had failed; L1 is flushed.</summary>
     Recovered,
+    /// <summary>
+    /// A replica that was pre-armed while it was a replica is now a master. Its tracking has been on since before any
+    /// read could reach it, so no re-arm (and no pass-through gap) is needed; L1 is still flushed once, for the
+    /// entries that were read from the demoted master.
+    /// </summary>
+    Promoted,
 }
 
 /// <summary>Raised after CLIENT TRACKING ON REDIRECT succeeded on one endpoint.</summary>
@@ -47,8 +53,14 @@ internal interface ITrackingArmer : IAsyncDisposable
     /// <summary>Raised when an endpoint is no longer a master of this deployment; consumers forget it entirely.</summary>
     event Action<EndPoint>? EndpointRemoved;
 
-    /// <summary>Current redirect client id per endpoint, for diagnostics and tests.</summary>
+    /// <summary>Current redirect client id per armed master endpoint, for diagnostics and tests.</summary>
     IReadOnlyDictionary<EndPoint, long> RedirectTargets { get; }
+
+    /// <summary>
+    /// Redirect client id per pre-armed replica. A replica is armed ahead of time so that a failover that promotes
+    /// it needs no re-arm and no flush; the entry is dropped when a connection to it fails.
+    /// </summary>
+    IReadOnlyDictionary<EndPoint, long> ReplicaRedirectTargets { get; }
 
     /// <summary>Re-arms one endpoint now.</summary>
     Task RearmAsync(EndPoint endPoint, ArmReason reason, CancellationToken cancellationToken);

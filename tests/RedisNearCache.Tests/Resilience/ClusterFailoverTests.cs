@@ -10,10 +10,11 @@ namespace RedisNearCache.Tests.Resilience;
 /// <summary>
 /// A coordinated cluster failover: the replica of 7100 is promoted and 7100 becomes its replica. Unlike a node
 /// restart, nothing crashes and no connection necessarily breaks - the slots simply belong to a different node
-/// from one moment to the next. That is the dangerous shape for this library, because tracking is per node:
-/// the promoted replica has never had <c>CLIENT TRACKING ON REDIRECT</c> issued on it, so until the armer
-/// notices the new master, every write to those slots produces no invalidation at all and L1 keeps serving the
-/// pre-failover values. The old master must also stop being treated as armed, since it is a replica now.
+/// from one moment to the next. That is the dangerous shape for this library, because tracking is per node.
+/// Since 0.5.2 the armer pre-arms replicas, so the promoted node already tracks every read routed to it
+/// (<see cref="ClusterFailoverPreArmTests"/> covers that window); this test checks the bookkeeping that follows:
+/// the promoted node ends up in <c>RedirectTargets</c>, the old master stops being treated as armed since it is a
+/// replica now, and every node still delivers invalidations afterwards.
 /// </summary>
 /// <remarks>
 /// Commands used (inside the <c>redis-near-cache-cluster</c> container):

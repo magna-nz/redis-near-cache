@@ -46,6 +46,28 @@ internal sealed class FakeServer
     public long SubscriberId { get; }
     public IServer Proxy { get; }
 
+    /// <summary>
+    /// The first element of the <c>ROLE</c> reply. Null (the default) derives it from <see cref="IsReplica"/> at the
+    /// time <c>ROLE</c> is answered, so flipping the role flag is reflected without also updating this property;
+    /// set explicitly to make the fake disagree with <see cref="IsReplica"/> (e.g. a replica whose ROLE still says
+    /// "master" because the promotion raced the pre-arm's ROLE call).
+    /// </summary>
+    public string? RoleAnswer { get; set; }
+
+    /// <summary>
+    /// Answers for successive <c>ROLE</c> calls, consumed in order; once empty, <see cref="RoleAnswer"/> applies.
+    /// Lets a test make the pre-arm's first ROLE say "slave" and its second (the one issued right after
+    /// CLIENT TRACKING ON) say "master", i.e. a promotion that raced the arm.
+    /// </summary>
+    public Queue<string> RoleAnswers { get; } = new();
+
+    /// <summary>The link-state element of a replica's <c>ROLE</c> reply ("connected" unless a test says otherwise).</summary>
+    public string LinkState { get; set; } = "connected";
+
+    /// <summary>How many <c>ROLE</c> calls this server has answered.</summary>
+    public int RoleCalls => Volatile.Read(ref _roleCalls);
+    private int _roleCalls;
+
     private object? Handle(MethodInfo method, object?[] args)
     {
         switch (method.Name)
@@ -69,6 +91,29 @@ internal sealed class FakeServer
                         RedisResult.Create((RedisValue)"flags"), RedisResult.Create([RedisResult.Create((RedisValue)"on")]),
                         RedisResult.Create((RedisValue)"redirect"), RedisResult.Create((RedisValue)SubscriberId),
                     ]));
+                }
+                // The armer calls server.ExecuteAsync("ROLE") with no extra arguments, so the command name lands in
+                // args[0] and commandArgs (args[1]) is an empty object[]; a command with a sub-command (e.g. CLIENT
+                // TRACKINGINFO above) puts it in commandArgs[0] instead, so both spots are checked.
+                if (Equals(args[0], "ROLE") || (commandArgs.Length > 0 && Equals(commandArgs[0], "ROLE")))
+                {
+                    Interlocked.Increment(ref _roleCalls);
+                    string role;
+                    lock (RoleAnswers) role = RoleAnswers.Count > 0 ? RoleAnswers.Dequeue() : RoleAnswer ?? (IsReplica ? "slave" : "master");
+                    // A real ROLE reply on a replica is [role, master-host, master-port, link-state, offset], and
+                    // TrackingArmer's pre-arm check requires link-state "connected" (TrackingArmer.IsReplicaRole,
+                    // requireConnected: true) before it will touch the node at all. A master's ROLE reply has a
+                    // different shape, but nothing reads past the first element for that case.
+                    RedisResult[] items = string.Equals(role, "slave", StringComparison.Ordinal)
+                        ? [
+                            RedisResult.Create((RedisValue)role),
+                            RedisResult.Create((RedisValue)"127.0.0.1"),
+                            RedisResult.Create((RedisValue)0L),
+                            RedisResult.Create((RedisValue)LinkState),
+                            RedisResult.Create((RedisValue)0L),
+                          ]
+                        : [RedisResult.Create((RedisValue)role)];
+                    return Task.FromResult(RedisResult.Create(items));
                 }
                 return Task.FromResult(RedisResult.Create((RedisValue)"OK"));
             default:
@@ -146,11 +191,31 @@ internal sealed class FakeMultiplexer
         }
     }
 
-    private object? HandleDatabase(MethodInfo method, object?[] args) => method.Name switch
+    /// <summary>Remaining TTL the fake reports for every key: -1 (no expiry) unless a test sets it.</summary>
+    public long StoredTtlMilliseconds { get; set; } = -1;
+
+    /// <summary>When set, every PTTL faults with this exception (a server that rejects the command, or a timeout).</summary>
+    public Exception? PttlFailure { get; set; }
+
+    /// <summary>How many PTTL commands the fake has answered (or faulted).</summary>
+    public int PttlCalls => Volatile.Read(ref _pttlCalls);
+    private int _pttlCalls;
+
+    private object? HandleDatabase(MethodInfo method, object?[] args)
     {
-        "StringGetAsync" when args.Length > 0 && args[0] is RedisKey => Task.FromResult(StoredValue),
-        _ => throw new NotSupportedException($"IDatabase.{method.Name} is not modelled by the fake"),
-    };
+        switch (method.Name)
+        {
+            case "StringGetAsync" when args.Length > 0 && args[0] is RedisKey:
+                return Task.FromResult(StoredValue);
+            case "ExecuteAsync" when args.Length == 2 && Equals(args[0], "PTTL"):
+                Interlocked.Increment(ref _pttlCalls);
+                return PttlFailure is { } failure
+                    ? Task.FromException<RedisResult>(failure)
+                    : Task.FromResult(RedisResult.Create((RedisValue)StoredTtlMilliseconds));
+            default:
+                throw new NotSupportedException($"IDatabase.{method.Name} is not modelled by the fake");
+        }
+    }
 }
 
 /// <summary>A listener that never delivers anything; these tests are about the armer's lifecycle events.</summary>

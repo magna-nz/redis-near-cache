@@ -1,0 +1,258 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using RedisNearCache.Internal;
+using RedisNearCache.Tracking;
+using StackExchange.Redis;
+using Xunit;
+using Facade = RedisNearCache.Caching.RedisNearCache;
+
+namespace RedisNearCache.UnitTests;
+
+/// <summary>
+/// The real <see cref="TrackingArmer"/> and facade wired to a fake multiplexer, exercising replica pre-arm: a
+/// replica gets <c>CLIENT TRACKING ON REDIRECT</c> before it is ever promoted, so a promotion needs neither a
+/// re-arm nor an L1 flush. Mirrors the rig pattern in <see cref="EndpointLossOrderingTests"/> but drives the
+/// reconcile loop by hand (<see cref="Timeout.InfiniteTimeSpan"/>), since these tests assert on the one-shot
+/// pre-arm sweep that <see cref="TrackingArmer.StartAsync"/> queues after <c>Ready</c>.
+/// </summary>
+public class ReplicaPreArmTests
+{
+    private const string Key = "k";
+    private const int MasterPort = 7000;
+    private const int ReplicaPort = 7001;
+
+    private sealed class Rig : IAsyncDisposable
+    {
+        public required FakeMultiplexer Mux { get; init; }
+        public required TrackingArmer Armer { get; init; }
+        public required Facade Cache { get; init; }
+        public required FakeServer Master { get; init; }
+        public required FakeServer Replica { get; init; }
+        public required ConcurrentQueue<string> Events { get; init; }
+
+        public static async Task<Rig> StartAsync(Action<FakeServer, FakeServer>? configure = null)
+        {
+            var mux = new FakeMultiplexer("rnc-unit");
+            var master = mux.Add(MasterPort, isReplica: false);
+            var replica = mux.Add(ReplicaPort, isReplica: true);
+            configure?.Invoke(master, replica);
+
+            var connection = FakeRedis.Connection(mux);
+            var armer = new TrackingArmer(connection, NullLogger<TrackingArmer>.Instance, Timeout.InfiniteTimeSpan);
+            // Subscribe before the facade is built: its constructor starts the initial arm, and against the fake
+            // (every reply completes synchronously) the Initial event is raised before the constructor returns.
+            var events = new ConcurrentQueue<string>();
+            armer.TrackingLost += ep => events.Enqueue($"lost {ep}");
+            armer.EndpointRemoved += ep => events.Enqueue($"removed {ep}");
+            armer.Armed += e => events.Enqueue($"armed {e.EndPoint} {e.Reason}");
+            var rig = new Rig
+            {
+                Mux = mux,
+                Armer = armer,
+                Master = master,
+                Replica = replica,
+                Events = events,
+                Cache = new Facade(connection, armer, new SilentListener(), Options.Create(new RedisNearCacheOptions()), NullLogger<Facade>.Instance),
+            };
+            await rig.Cache.Ready;
+            return rig;
+        }
+
+        public bool Cached => Cache.TryGetLocal<string>(Key, out _);
+
+        /// <summary>Reads the key through the cache and reports whether the read populated L1.</summary>
+        public async Task<bool> ReadCachesAsync()
+        {
+            Cache.EvictLocal(Key);
+            Assert.Equal("v1", await Cache.GetAsync<string>(Key));
+            return Cached;
+        }
+
+        public string Describe() => string.Join(" | ", Events);
+
+        public ValueTask DisposeAsync() => Cache.DisposeAsync();
+    }
+
+    private static Task<bool> UntilAsync(Func<bool> condition, int timeoutMs = 3000) =>
+        UntilAsync(() => Task.FromResult(condition()), timeoutMs);
+
+    private static async Task<bool> UntilAsync(Func<Task<bool>> condition, int timeoutMs = 3000)
+    {
+        var clock = Stopwatch.StartNew();
+        while (clock.ElapsedMilliseconds < timeoutMs)
+        {
+            if (await condition()) return true;
+            await Task.Delay(10);
+        }
+        return await condition();
+    }
+
+    [Fact]
+    public async Task ReplicaIsPreArmedAfterStart()
+    {
+        await using var rig = await Rig.StartAsync();
+
+        Assert.True(
+            await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000),
+            "the replica was never pre-armed: " + rig.Describe());
+        Assert.Equal(1000L + ReplicaPort, rig.Armer.ReplicaRedirectTargets[rig.Replica.EndPoint]);
+
+        Assert.Single(rig.Armer.RedirectTargets);
+        Assert.True(rig.Armer.RedirectTargets.ContainsKey(rig.Master.EndPoint));
+
+        var armedEvents = rig.Events.Where(e => e.StartsWith("armed ", StringComparison.Ordinal)).ToArray();
+        Assert.Equal(new[] { $"armed {rig.Master.EndPoint} {ArmReason.Initial}" }, armedEvents);
+    }
+
+    [Fact]
+    public async Task PromotionOfAPreArmedReplicaRaisesPromotedWithoutARearm()
+    {
+        await using var rig = await Rig.StartAsync();
+        Assert.True(
+            await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000),
+            "precondition: the replica was never pre-armed: " + rig.Describe());
+
+        Assert.True(await rig.ReadCachesAsync(), "precondition: the key is cached before promotion");
+
+        var flushesBefore = rig.Cache.Statistics.Flushes;
+
+        rig.Master.IsReplica = true;
+        rig.Replica.IsReplica = false;
+        rig.Mux.RaiseConfigurationChanged(rig.Replica);
+
+        // Reconcile runs synchronously off the raised event, so the outcome is checked immediately.
+        Assert.Contains($"armed {rig.Replica.EndPoint} {ArmReason.Promoted}", rig.Events);
+        Assert.Contains($"removed {rig.Master.EndPoint}", rig.Events);
+        Assert.Equal(flushesBefore + 2, rig.Cache.Statistics.Flushes); // the promotion's flush and the old master's removal
+        Assert.Equal(0, rig.Cache.Statistics.Rearms);
+        Assert.Single(rig.Armer.RedirectTargets);
+        Assert.True(rig.Armer.RedirectTargets.ContainsKey(rig.Replica.EndPoint));
+        // The promoted node left the replica set; the demoted old master may already have been pre-armed in its place.
+        Assert.False(rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), "the promoted node is still listed as a pre-armed replica.");
+
+        Assert.True(await rig.ReadCachesAsync(), "caching did not resume after promotion: " + rig.Describe());
+    }
+
+    [Fact]
+    public async Task ReplicaWhoseConnectionFailedIsNotTrustedAndIsReArmedWithAFlushOnPromotion()
+    {
+        await using var rig = await Rig.StartAsync();
+        Assert.True(
+            await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000),
+            "precondition: the replica was never pre-armed: " + rig.Describe());
+
+        var flushesBeforeFailure = rig.Cache.Statistics.Flushes;
+        rig.Mux.RaiseConnectionFailed(rig.Replica, ConnectionType.Interactive);
+
+        // A pre-armed replica is not a tracked master, so losing its connection is not a lifecycle event: no
+        // flush, no TrackingLost. Only the (no longer trustworthy) pre-arm entry is dropped.
+        Assert.False(rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint));
+        Assert.Equal(flushesBeforeFailure, rig.Cache.Statistics.Flushes);
+        Assert.DoesNotContain(rig.Events, e => e.StartsWith("lost ", StringComparison.Ordinal));
+
+        rig.Master.IsReplica = true;
+        rig.Replica.IsReplica = false;
+        rig.Mux.RaiseConfigurationChanged(rig.Replica);
+
+        Assert.True(
+            await UntilAsync(() => rig.Events.Contains($"armed {rig.Replica.EndPoint} {ArmReason.TopologyChanged}"), 3000),
+            "the replica was never re-armed after losing its pre-arm: " + rig.Describe());
+        Assert.DoesNotContain(rig.Events, e => e.StartsWith($"armed {rig.Replica.EndPoint} {ArmReason.Promoted}", StringComparison.Ordinal));
+        Assert.True(
+            rig.Cache.Statistics.Flushes >= flushesBeforeFailure + 2,
+            "expected at least the old master's removal and the topology-changed re-arm to each flush: " + rig.Describe());
+    }
+
+    /// <summary>
+    /// The pre-arm issues CLIENT TRACKING ON and then ROLE on the same connection; if that second ROLE says master the
+    /// promotion may have preceded the ON, so the node must be left to the ordinary arm-and-flush path. The first ROLE
+    /// (the "is it a connected replica" gate) says slave here, so the arm proceeds up to the second gate.
+    /// </summary>
+    [Fact]
+    public async Task ReplicaPromotedBetweenTrackingOnAndRoleIsNotRecordedAsPreArmed()
+    {
+        await using var rig = await Rig.StartAsync((_, replica) =>
+        {
+            replica.RoleAnswers.Enqueue("slave");   // first ROLE: connected replica, proceed
+            replica.RoleAnswers.Enqueue("master");  // second ROLE, after CLIENT TRACKING ON: promoted meanwhile
+        });
+
+        Assert.True(await UntilAsync(() => rig.Replica.RoleCalls >= 2, 3000), "the pre-arm never reached its second ROLE check.");
+        // The sweep records the pre-arm right after the second ROLE; give it a moment to finish, then it must not be there.
+        await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.Count > 0, 300);
+        Assert.Empty(rig.Armer.ReplicaRedirectTargets);
+        Assert.DoesNotContain(rig.Events, e => e.StartsWith($"armed {rig.Replica.EndPoint}", StringComparison.Ordinal));
+
+        // A later sweep, with the node a replica again, pre-arms it.
+        rig.Mux.RaiseConfigurationChanged(rig.Replica);
+        Assert.True(await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000),
+            "the replica was not pre-armed by the next sweep: " + rig.Describe());
+    }
+
+    /// <summary>
+    /// The per-sweep link check must not mistake a promotion for a broken replication link: between the failover and the
+    /// multiplexer's next topology check the node's ROLE says master while the multiplexer still flags it a replica.
+    /// Disarming it there would throw away exactly the pre-arm the promotion path needs.
+    /// </summary>
+    [Fact]
+    public async Task SweepLeavesAPreArmedNodeAloneWhenRoleSaysMasterBeforeTheMultiplexerNotices()
+    {
+        await using var rig = await Rig.StartAsync();
+        Assert.True(
+            await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000),
+            "the replica was never pre-armed: " + rig.Describe());
+        var preArmId = rig.Armer.ReplicaRedirectTargets[rig.Replica.EndPoint];
+
+        // Promoted on the server, not yet in the multiplexer's view: a sweep runs and re-checks the node.
+        rig.Replica.RoleAnswer = "master";
+        var roleCalls = rig.Replica.RoleCalls;
+        rig.Mux.RaiseConfigurationChanged(rig.Replica);
+        Assert.True(await UntilAsync(() => rig.Replica.RoleCalls > roleCalls, 3000), "the sweep never re-checked the pre-armed node.");
+        await UntilAsync(() => !rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 300);
+        Assert.True(rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint),
+            "the sweep disarmed a node whose ROLE says master; that is a promotion, not a broken link: " + rig.Describe());
+
+        // Now the multiplexer notices: the pre-arm is what makes this a Promoted arm with no flush.
+        var flushesBefore = rig.Cache.Statistics.Flushes;
+        rig.Replica.IsReplica = false;
+        rig.Master.IsReplica = true;
+        rig.Mux.RaiseConfigurationChanged(rig.Replica);
+        Assert.Contains($"armed {rig.Replica.EndPoint} {ArmReason.Promoted}", rig.Events);
+        Assert.Equal(preArmId, rig.Armer.RedirectTargets[rig.Replica.EndPoint]);
+        Assert.Equal(0, rig.Cache.Statistics.Rearms);
+        Assert.Equal(flushesBefore + 2, rig.Cache.Statistics.Flushes); // the promotion's flush and the old master's removal
+    }
+
+    /// <summary>A pre-armed replica whose replication link is down is disarmed by the sweep (a full resync would flush L1 for nothing).</summary>
+    [Fact]
+    public async Task SweepDisarmsAPreArmedReplicaWhoseLinkIsDown()
+    {
+        await using var rig = await Rig.StartAsync();
+        Assert.True(
+            await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000),
+            "the replica was never pre-armed: " + rig.Describe());
+
+        rig.Replica.LinkState = "sync";
+        rig.Mux.RaiseConfigurationChanged(rig.Replica);
+        Assert.True(await UntilAsync(() => !rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000),
+            "the sweep kept a pre-armed replica whose link is down: " + rig.Describe());
+        Assert.Equal(0, rig.Cache.Statistics.Flushes);
+
+        rig.Replica.LinkState = "connected";
+        rig.Mux.RaiseConfigurationChanged(rig.Replica);
+        Assert.True(await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000),
+            "the replica was not re-armed once its link came back: " + rig.Describe());
+    }
+
+    [Fact]
+    public async Task ReplicaThatIsNotAConnectedReplicaOnRoleIsNotTouched()
+    {
+        await using var rig = await Rig.StartAsync((_, replica) => replica.RoleAnswer = "master");
+
+        Assert.True(await UntilAsync(() => rig.Replica.RoleCalls >= 1, 3000), "the pre-arm sweep never asked the replica for its ROLE.");
+        await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.Count > 0, 300);
+        Assert.Empty(rig.Armer.ReplicaRedirectTargets);
+    }
+}
