@@ -53,32 +53,33 @@ latency distributions. None of this runs in CI; everything here runs locally wit
 <!-- HEADLINE -->
 | | Plain StackExchange.Redis | `IMemoryCache` + 10 s TTL | `HybridCache` + Redis L2 | FusionCache + backplane | **RedisNearCache** |
 |---|---:|---:|---:|---:|---:|
-| Reads/s | 164,527 | 14.43 M | 25.60 M | 6.59 M | 1.35 M |
-| Server commands/s | 166,527 | 22,420 | 45,409 | 37,663 | 104,596 |
-| Reads served stale | 0 | 83.1 % | 84.8 % | 85.0 % | 0.07 % |
-| Stalest read | – | 10.0 s | 10.0 s | 10.0 s | 76 ms |
-| Stale local entries after writes stop | – | 822 | 67 | 9,625 | 0 |
-| Reads served stale, writes through the library's API | 0 | 83.2 % | 83.0 % | 2.4 % | 0.13 % |
+| Reads/s | 164,427 | 14.51 M | 25.99 M | 6.42 M | 2.20 M |
+| Server commands/s | 166,427 | 22,322 | 45,448 | 37,315 | 110,426 |
+| Reads served stale | 0 | 83.1 % | 84.8 % | 85.0 % | 0.33 % |
+| Stalest read | – | 10.0 s | 10.0 s | 10.0 s | 105 ms |
+| Stale local entries after writes stop | – | 792 | 605 | 16,701 | 0 |
+| Reads served stale, writes through the library's API | 0 | 82.8 % | 83.2 % | 2.3 % | 0.41 % |
 <!-- /HEADLINE -->
 
 What that says:
 
 - **Only RedisNearCache stays fresh when someone else writes.** The TTL caches (hand-rolled `IMemoryCache`,
   `HybridCache`, FusionCache) served 83–85 % of reads stale, up to the full 10 s TTL, and still held stale entries
-  (67 to 9,625 across 20 instances) after writes stopped. FusionCache's backplane only carries writes made through FusionCache. RedisNearCache
-  served 0.07 % of reads stale, the stalest 76 ms old, and held 0 stale entries after writes stopped.
+  (605 to 16,701 across 20 instances) after writes stopped. FusionCache's backplane only carries writes made through FusionCache. RedisNearCache
+  served 0.33 % of reads stale, the stalest 105 ms old, and held 0 stale entries after writes stopped.
 - **It costs server traffic that a TTL cache doesn't spend.** Every write invalidates the key on every instance that
   tracks it (19 instances per write here), and each of those re-reads it on the next access (`GET` plus a pipelined
-  `PTTL`). That is 104,596 commands/s against 22,420 for `IMemoryCache` with a 10 s TTL. The rate follows writes, not
-  reads: at 0 ms it is 37 % fewer commands than plain StackExchange.Redis while serving 8.2x the reads, but at 2 ms
-  injected latency, where plain StackExchange.Redis readers slow to 64,853 commands/s, RedisNearCache sends 98,145
-  (51 % more) while serving 13x the reads.
+  `PTTL`). That is 110,426 commands/s against 22,322 for `IMemoryCache` with a 10 s TTL. The rate follows writes, not
+  reads: at 0 ms it is 34 % fewer commands than plain StackExchange.Redis while serving 13x the reads, but at 2 ms
+  injected latency, where plain StackExchange.Redis readers slow to 64,568 commands/s, RedisNearCache sends 98,813
+  (53 % more) while serving 14x the reads.
 - **In-process TTL caches read faster.** `IMemoryCache` and `HybridCache` hand back a stored object reference (about
-  40–50 ns per hit); RedisNearCache decodes the value from its stored bytes and takes a lock-protected coherence check
-  on every hit (223 ns for a 1 KB string, see [Findings](#findings)). Under 160 spinning readers that shows up as
-  1.35 M reads/s against 6.6 M (FusionCache) to 25.6 M (`HybridCache`).
+  40–50 ns per hit); RedisNearCache decodes the value from its stored bytes on every hit (169 ns for a 1 KB string,
+  see [Findings](#findings)). Under 160 spinning readers that shows up as 2.20 M reads/s against 6.4 M (FusionCache)
+  to 26.0 M (`HybridCache`).
 - **A miss costs about what a plain `GET` costs.** RedisNearCache's cold read (a `GET` with a pipelined `PTTL`) had a
-  median 0.95–1.17x a plain StackExchange.Redis `GET` across payloads and latencies (Sailfish, 1,000 samples each);
+  ratio of 0.93–1.02x a plain StackExchange.Redis `GET` at 0.5 and 2 ms injected latency (Sailfish, 1,000 samples each;
+  0.71–1.34x at 0 ms, where both it and the plain `GET` had heavy tails);
   `HybridCache` and FusionCache cold reads cost about 2x and 3x a `GET` once there is any latency, because they also
   write their Redis L2.
 
@@ -257,21 +258,31 @@ setting.
 
 Things the comparison surfaced that are worth knowing beyond the tables:
 
-- **RedisNearCache's hit path takes a lock on every read.** `CachingEnabled` evaluates
+- **RedisNearCache's hit path took a lock on every read, until this run.** `CachingEnabled` evaluated
   `ConcurrentDictionary.IsEmpty` on each L1 hit, and on an empty dictionary (the normal state) that acquires all of its
-  locks. A throwaway prototype replacing it with a lock-free counter took the 4 × 2-reader load test from 2.6 M to
-  7.3 M reads/s (local hit p50 2.3 µs → 0.3 µs). Everything in these tables was measured before any such fix.
+  locks. It now compares a volatile counter to zero (see CHANGELOG). Against the previous full run of this matrix, the
+  20-instance load test at 0 ms went from 1.35 M to 2.20 M reads/s (local hit 96.2 % → 97.5 %) and the BenchmarkDotNet
+  hit from 223 ns to 169 ns; the 4 × 2-reader load test on `localhost:6379` went from 2.43 M to 7.29 M reads/s (local
+  hit p50 2.3 µs → 0.3 µs, p99 3.9 µs → 1.9 µs).
+- **Stale reads rose when the lock went, under 160 spinning readers.** At 0 ms, RedisNearCache's stale-read rate went
+  from 0.07 % to 0.33 % (writes through its API: 0.13 % → 0.41 %), staleness p50 from 0.3 ms to 5.9 ms and the stalest
+  read from 76 ms to 105 ms. Stale local entries after quiescence stayed at 0 everywhere. The likely cause is CPU, not
+  coherence: readers that used to park on the lock now keep all 14 cores busy, so the invalidation handler waits
+  longer to run, and more reads land in the gap between a write's acknowledgement and that handler. Consistent with
+  that, the 4 × 2-reader run, which leaves cores free, saw its stale-read rate fall (0.023 % → 0.014 %). Not proven
+  beyond that comparison.
 - **Stale reads are not zero for RedisNearCache, by design.** Redis acknowledges the writer and pushes the invalidation
   to the other connections at the same moment; a read on another instance between the acknowledgement and that
   instance handling the push is served the old value. Every stale read observed was of that kind: the invalidation for
   the newer version had not been handled when the read started. The in-flight guard (a read whose key is invalidated
   while its reply is in flight never populates L1) held throughout: 0 stale entries in every audit, including chaos.
-- **FusionCache with writes through its API** served 2.2–2.8 % of reads stale, p99 age 95–218 ms, with a rare maximum
-  of 5.2–9.9 s (the duration is 10 s), i.e. an occasional instance keeping an old value after the backplane message.
-- **The chaos run** (both connections of 5 of 20 instances killed at T/2) raised 39 read errors from the killed
-  connections, 44 flushes and 17 re-arms, and the audit still found 0 stale entries.
-- **`NearCacheHybridCache` with writes through HybridCache** showed a similar rare long tail at 2 ms latency (p99 4.5 s,
-  max 9.7 s over 1,703 stale reads). The suspected cause is HybridCache's background write-back of a value computed
+- **FusionCache with writes through its API** served 2.3–2.8 % of reads stale, p99 age 140–240 ms, with a rare maximum
+  of up to 9.3 s (the duration is 10 s), i.e. an occasional instance keeping an old value after the backplane message.
+- **The chaos run** (both connections of 5 of 20 instances killed at T/2) raised 37 read errors from the killed
+  connections, 42 flushes and 16 re-arms, and the audit still found 0 stale entries.
+- **`NearCacheHybridCache` with writes through HybridCache** showed a similar rare long tail, at 0.5 ms latency in this run
+  (p99 3.9 s, max 9.5 s over 4,256 stale reads; the previous run showed it at 2 ms instead, where this one had p99
+  2.6 ms). The suspected cause is HybridCache's background write-back of a value computed
   before a newer `SetAsync` landing after it; not confirmed, and it contradicts the adapter's documentation, so it is
   being investigated separately.
 - **Allocations on a hit:** RedisNearCache keeps values as bytes and decodes on every hit (2.08 KB for a 1 KB string,
@@ -284,8 +295,8 @@ Things the comparison surfaced that are worth knowing beyond the tables:
 ### Run environment
 
 ```
-date: 2026-09-14T23:05:54Z
-git rev-parse HEAD: 0251007cb049324d80af6253b11d8927af1e2eb5
+date: 2026-09-15T01:35:46Z
+git rev-parse HEAD: d67ea9d1485fb8d6f1cc52bf7cbde6cbb97a178d
 uname -a: Darwin Daniels-MacBook-Pro.local 25.6.0 Darwin Kernel Version 25.6.0: Fri Jul 31 19:17:26 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T6041 arm64
 CPU: Apple M4 Pro
 docker info CPUs: 14
@@ -297,7 +308,6 @@ dotnet --info (head):
  Workload version:  10.0.400-manifests.330ea142
  MSBuild version:   18.9.6+14fbf8d52
 images: redis:7.4 (default bench server), valkey/valkey:8.1 (valkey topology sweep)
-BenchmarkDotNet suites re-run after two harness fixes (runner overload, miss key pool size), 2026-09-15, bench code otherwise unchanged.
 ```
 
 Profile (from results):
@@ -319,97 +329,97 @@ Profile (from results):
 
 | Contender | Write mode | Reads/s | Local hit % | Local read p50 / p99 (µs) | Remote read p50 / p99 (µs) | Server cmds/s | Source loads / read | Errors | Stale reads (count, %) | Staleness age p50 / p99 / max (ms) | Stale local entries after quiescence |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Plain | Foreign | 164,527 | n/a | n/a | 922 / 2,114 | 166,527 | 100.00 % | 0 | 0 (0.00 %) | n/a | n/a |
-| Plain | Api | 165,281 | n/a | n/a | 922 / 2,114 | 167,281 | 100.00 % | 0 | 0 (0.00 %) | n/a | n/a |
-| MemoryCacheTtl | Foreign | 14,433,455 | 99.86 % | 0.12 / 5.5 | 1,121 / 9,134 | 22,420 | 0.14 % | 0 | 360,402,914 (83.11 %) | 5,191.5 / 9,789.4 / 10,000.3 | 822 |
-| MemoryCacheTtl | Api | 14,322,608 | 99.86 % | 0.12 / 5.5 | 1,177 / 7,515 | 22,600 | 0.14 % | 0 | 358,527,927 (83.18 %) | 5,191.5 / 9,789.4 / 10,000.5 | 1,549 |
-| HybridCache | Foreign | 25,597,268 | 99.92 % | 0.12 / 3.9 | 1,236 / 9,591 | 45,409 | 0.00 % | 0 | 652,132,028 (84.82 %) | 5,723.6 / 9,789.4 / 9,997.5 | 67 |
-| HybridCache | Api | 24,610,078 | 99.90 % | 0.12 / 0.71 | 1,298 / 13,496 | 56,729 | 0.01 % | 0 | 614,044,977 (83.02 %) | 5,451.1 / 9,789.4 / 9,996.1 | 17,881 |
-| FusionCache | Foreign | 6,587,211 | 99.69 % | 0.34 / 5.0 | 1,431 / 32,479 | 37,663 | 0.02 % | 0 | 168,458,887 (85.00 %) | 6,625.8 / 9,789.4 / 9,999.0 | 9,625 |
-| FusionCache | Api | 1,570,624 | 98.76 % | 0.38 / 3.4 | 2,330 / 58,328 | 66,391 | 0.06 % | 0 | 1,123,547 (2.38 %) | 9.6 / 217.8 / 9,914.5 | 1 |
-| NearCacheHybridCache | Foreign | 527,667 | n/a | n/a | 63 / 4,844 | 45,970 | 0.21 % | 0 | 13,221,024 (83.40 %) | 5,451.1 / 9,789.4 / 9,994.3 | n/a |
-| NearCacheHybridCache | Api | 352,616 | n/a | n/a | 35 / 5,086 | 107,201 | 0.26 % | 0 | 5,087 (0.05 %) | 0.3 / 45.7 / 180.6 | n/a |
-| NearCache | Foreign | 1,348,724 | 96.20 % | 0.71 / 30 | 1,739 / 14,171 | 104,596 | 3.80 % | 0 | 30,089 (0.07 %) | 0.3 / 39.5 / 75.9 | 0 |
-| NearCache | Api | 1,353,987 | 96.22 % | 0.74 / 25 | 1,826 / 14,171 | 104,365 | 3.78 % | 0 | 52,313 (0.13 %) | 0.3 / 9.1 / 50.6 | 0 |
+| Plain | Foreign | 164,427 | n/a | n/a | 922 / 2,114 | 166,427 | 100.00 % | 0 | 0 (0.00 %) | n/a | n/a |
+| Plain | Api | 166,290 | n/a | n/a | 922 / 2,114 | 168,291 | 100.00 % | 0 | 0 (0.00 %) | n/a | n/a |
+| MemoryCacheTtl | Foreign | 14,505,927 | 99.86 % | 0.12 / 5.5 | 1,177 / 7,891 | 22,322 | 0.14 % | 0 | 362,157,983 (83.09 %) | 4,944.3 / 9,789.4 / 10,000.0 | 792 |
+| MemoryCacheTtl | Api | 13,501,567 | 99.85 % | 0.12 / 5.8 | 1,121 / 9,134 | 22,679 | 0.15 % | 0 | 337,315,985 (82.84 %) | 5,451.1 / 9,789.4 / 10,001.1 | 2,089 |
+| HybridCache | Foreign | 25,987,205 | 99.92 % | 0.12 / 3.7 | 1,298 / 10,071 | 45,448 | 0.00 % | 0 | 663,067,550 (84.83 %) | 5,723.6 / 9,789.4 / 9,996.1 | 605 |
+| HybridCache | Api | 24,635,238 | 99.90 % | 0.12 / 0.71 | 1,298 / 14,171 | 56,988 | 0.01 % | 0 | 615,483,366 (83.21 %) | 5,451.1 / 9,789.4 / 9,995.1 | 18,162 |
+| FusionCache | Foreign | 6,416,919 | 99.69 % | 0.34 / 4.7 | 1,502 / 37,599 | 37,315 | 0.02 % | 0 | 163,922,142 (85.01 %) | 6,625.8 / 9,789.4 / 9,999.5 | 16,701 |
+| FusionCache | Api | 1,496,726 | 98.79 % | 0.38 / 3.7 | 2,447 / 74,443 | 63,904 | 0.07 % | 0 | 1,047,070 (2.32 %) | 8.7 / 140.4 / 4,346.3 | 0 |
+| NearCacheHybridCache | Foreign | 555,156 | n/a | n/a | 63 / 4,614 | 45,996 | 0.19 % | 0 | 13,901,422 (83.37 %) | 5,451.1 / 9,789.4 / 9,996.4 | n/a |
+| NearCacheHybridCache | Api | 372,638 | n/a | n/a | 30 / 5,086 | 108,415 | 0.25 % | 0 | 5,600 (0.05 %) | 0.3 / 217.8 / 393.7 | n/a |
+| NearCache | Foreign | 2,198,037 | 97.53 % | 0.41 / 2.0 | 2,219 / 9,591 | 110,426 | 2.47 % | 0 | 216,543 (0.33 %) | 5.9 / 86.2 / 104.7 | 0 |
+| NearCache | Api | 2,022,827 | 97.38 % | 0.46 / 2.1 | 2,219 / 10,574 | 108,160 | 2.62 % | 0 | 250,378 (0.41 %) | 2.3 / 67.5 / 112.1 | 0 |
 
 ### Contender comparison — standalone, 0.5ms
 
 | Contender | Write mode | Reads/s | Local hit % | Local read p50 / p99 (µs) | Remote read p50 / p99 (µs) | Server cmds/s | Source loads / read | Errors | Stale reads (count, %) | Staleness age p50 / p99 / max (ms) | Stale local entries after quiescence |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Plain | Foreign | 124,343 | n/a | n/a | 1,236 / 2,330 | 126,344 | 100.00 % | 0 | 0 (0.00 %) | n/a | n/a |
-| Plain | Api | 124,550 | n/a | n/a | 1,236 / 2,330 | 126,550 | 100.00 % | 0 | 0 (0.00 %) | n/a | n/a |
-| MemoryCacheTtl | Foreign | 15,868,961 | 99.87 % | 0.12 / 5.5 | 1,502 / 9,134 | 22,556 | 0.13 % | 0 | 397,172,553 (83.19 %) | 5,451.1 / 9,789.4 / 10,000.6 | 9,510 |
-| MemoryCacheTtl | Api | 15,984,631 | 99.87 % | 0.12 / 5.5 | 1,502 / 9,134 | 22,421 | 0.13 % | 0 | 400,209,012 (83.30 %) | 5,451.1 / 9,789.4 / 10,000.2 | 9,283 |
-| HybridCache | Foreign | 24,961,847 | 99.92 % | 0.12 / 3.5 | 1,577 / 9,591 | 46,137 | 0.00 % | 0 | 640,174,764 (84.91 %) | 5,723.6 / 9,789.4 / 9,996.6 | 4,318 |
-| HybridCache | Api | 23,432,031 | 99.89 % | 0.12 / 3.9 | 1,577 / 12,853 | 57,018 | 0.01 % | 0 | 585,318,086 (83.02 %) | 5,451.1 / 9,789.4 / 9,994.6 | 18,653 |
-| FusionCache | Foreign | 6,258,546 | 99.68 % | 0.34 / 5.8 | 1,739 / 30,933 | 38,387 | 0.02 % | 0 | 160,122,613 (85.05 %) | 6,625.8 / 9,789.4 / 9,993.2 | 3,205 |
-| FusionCache | Api | 1,419,819 | 98.58 % | 0.41 / 3.4 | 2,697 / 55,551 | 68,984 | 0.07 % | 0 | 944,788 (2.21 %) | 7.2 / 127.3 / 8,634.2 | 0 |
-| NearCacheHybridCache | Foreign | 525,493 | n/a | n/a | 60 / 4,844 | 45,935 | 0.21 % | 0 | 13,172,393 (83.43 %) | 5,451.1 / 9,789.4 / 9,993.6 | n/a |
-| NearCacheHybridCache | Api | 322,090 | n/a | n/a | 37 / 5,086 | 106,093 | 0.28 % | 0 | 3,861 (0.04 %) | 0.2 / 228.7 / 453.4 | n/a |
-| NearCache | Foreign | 1,311,492 | 96.07 % | 0.74 / 29 | 2,219 / 10,071 | 105,008 | 3.93 % | 0 | 34,151 (0.09 %) | 0.3 / 35.8 / 58.7 | 0 |
-| NearCache | Api | 1,283,808 | 96.01 % | 0.74 / 27 | 2,219 / 10,574 | 104,355 | 3.99 % | 0 | 52,509 (0.14 %) | 0.3 / 5.3 / 62.1 | 0 |
+| Plain | Foreign | 124,616 | n/a | n/a | 1,236 / 2,330 | 126,617 | 100.00 % | 0 | 0 (0.00 %) | n/a | n/a |
+| Plain | Api | 125,961 | n/a | n/a | 1,236 / 2,330 | 127,961 | 100.00 % | 0 | 0 (0.00 %) | n/a | n/a |
+| MemoryCacheTtl | Foreign | 12,966,273 | 99.84 % | 0.12 / 5.8 | 1,502 / 7,891 | 22,585 | 0.16 % | 0 | 322,820,953 (82.82 %) | 5,191.5 / 9,789.4 / 10,000.3 | 9,035 |
+| MemoryCacheTtl | Api | 12,816,770 | 99.84 % | 0.12 / 5.8 | 1,431 / 9,591 | 22,437 | 0.16 % | 0 | 319,731,388 (83.05 %) | 5,191.5 / 9,789.4 / 10,000.5 | 9,218 |
+| HybridCache | Foreign | 20,296,958 | 99.90 % | 0.12 / 5.2 | 1,502 / 9,591 | 45,321 | 0.01 % | 0 | 517,371,055 (84.85 %) | 5,723.6 / 9,789.4 / 9,999.5 | 65 |
+| HybridCache | Api | 23,279,172 | 99.89 % | 0.12 / 2.9 | 1,656 / 12,853 | 57,052 | 0.01 % | 0 | 580,747,622 (83.05 %) | 5,451.1 / 9,789.4 / 9,993.2 | 17,574 |
+| FusionCache | Foreign | 5,954,832 | 99.66 % | 0.34 / 5.2 | 1,917 / 35,808 | 38,483 | 0.02 % | 0 | 152,003,697 (84.92 %) | 6,957.1 / 9,789.4 / 9,997.3 | 10,743 |
+| FusionCache | Api | 1,482,154 | 98.64 % | 0.41 / 4.1 | 2,697 / 52,905 | 68,357 | 0.07 % | 0 | 1,039,397 (2.33 %) | 8.3 / 154.8 / 9,275.9 | 0 |
+| NearCacheHybridCache | Foreign | 523,903 | n/a | n/a | 63 / 4,844 | 45,936 | 0.21 % | 0 | 13,134,842 (83.46 %) | 5,451.1 / 9,789.4 / 9,994.0 | n/a |
+| NearCacheHybridCache | Api | 347,477 | n/a | n/a | 27 / 4,844 | 107,138 | 0.26 % | 0 | 4,256 (0.04 %) | 0.2 / 3,874.0 / 9,489.1 | n/a |
+| NearCache | Foreign | 2,051,488 | 97.38 % | 0.46 / 2.1 | 2,330 / 7,515 | 109,657 | 2.62 % | 0 | 101,272 (0.16 %) | 0.7 / 50.4 / 82.4 | 0 |
+| NearCache | Api | 2,014,309 | 97.34 % | 0.41 / 2.1 | 2,219 / 8,285 | 109,049 | 2.66 % | 0 | 180,385 (0.30 %) | 1.4 / 61.2 / 97.1 | 0 |
 
 ### Contender comparison — standalone, 2ms
 
 | Contender | Write mode | Reads/s | Local hit % | Local read p50 / p99 (µs) | Remote read p50 / p99 (µs) | Server cmds/s | Source loads / read | Errors | Stale reads (count, %) | Staleness age p50 / p99 / max (ms) | Stale local entries after quiescence |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Plain | Foreign | 62,852 | n/a | n/a | 2,447 / 3,443 | 64,853 | 100.00 % | 0 | 0 (0.00 %) | n/a | n/a |
-| Plain | Api | 63,007 | n/a | n/a | 2,447 / 3,279 | 65,008 | 100.00 % | 0 | 0 (0.00 %) | n/a | n/a |
-| MemoryCacheTtl | Foreign | 12,726,584 | 99.84 % | 0.12 / 5.5 | 2,697 / 9,591 | 22,615 | 0.16 % | 0 | 320,424,505 (83.37 %) | 6,009.8 / 9,789.4 / 10,000.1 | 24,904 |
-| MemoryCacheTtl | Api | 14,600,079 | 99.86 % | 0.12 / 5.2 | 2,697 / 10,574 | 22,632 | 0.14 % | 0 | 366,084,740 (83.44 %) | 6,009.8 / 9,789.4 / 10,000.1 | 25,680 |
-| HybridCache | Foreign | 19,533,349 | 99.90 % | 0.12 / 3.7 | 2,697 / 10,071 | 45,446 | 0.01 % | 0 | 501,124,019 (85.25 %) | 6,625.8 / 9,789.4 / 9,998.7 | 537 |
-| HybridCache | Api | 19,158,871 | 99.87 % | 0.12 / 0.67 | 2,697 / 13,496 | 56,031 | 0.01 % | 0 | 478,777,332 (83.14 %) | 6,310.3 / 9,789.4 / 9,991.4 | 16,461 |
-| FusionCache | Foreign | 4,475,469 | 99.55 % | 0.34 / 5.0 | 3,123 / 45,702 | 39,009 | 0.03 % | 0 | 114,667,594 (85.17 %) | 7,670.2 / 9,789.4 / 9,995.0 | 18,405 |
-| FusionCache | Api | 1,183,664 | 98.45 % | 0.41 / 4.7 | 3,796 / 64,307 | 62,862 | 0.08 % | 0 | 1,005,936 (2.82 %) | 9.1 / 95.0 / 5,212.4 | 0 |
-| NearCacheHybridCache | Foreign | 444,614 | n/a | n/a | 52 / 5,608 | 45,701 | 0.25 % | 0 | 11,167,403 (83.55 %) | 5,723.6 / 9,789.4 / 9,995.8 | n/a |
-| NearCacheHybridCache | Api | 167,088 | n/a | n/a | 33 / 6,183 | 91,782 | 0.53 % | 0 | 1,703 (0.03 %) | 0.1 / 4,484.6 / 9,715.0 | n/a |
-| NearCache | Foreign | 830,694 | 94.21 % | 0.71 / 13 | 2,974 / 5,888 | 98,145 | 5.79 % | 0 | 13,245 (0.05 %) | 0.1 / 2.2 / 60.5 | 0 |
-| NearCache | Api | 806,339 | 94.06 % | 0.74 / 12 | 2,974 / 5,888 | 97,842 | 5.94 % | 0 | 15,019 (0.06 %) | 0.1 / 2.4 / 35.0 | 0 |
+| Plain | Foreign | 62,567 | n/a | n/a | 2,569 / 3,279 | 64,568 | 100.00 % | 0 | 0 (0.00 %) | n/a | n/a |
+| Plain | Api | 62,537 | n/a | n/a | 2,569 / 3,443 | 64,538 | 100.00 % | 0 | 0 (0.00 %) | n/a | n/a |
+| MemoryCacheTtl | Foreign | 14,073,907 | 99.85 % | 0.12 / 5.2 | 2,697 / 9,134 | 22,736 | 0.15 % | 0 | 354,166,141 (83.34 %) | 5,723.6 / 9,789.4 / 10,011.3 | 24,399 |
+| MemoryCacheTtl | Api | 12,746,970 | 99.84 % | 0.12 / 5.5 | 2,697 / 9,591 | 22,807 | 0.16 % | 0 | 321,227,002 (83.24 %) | 6,009.8 / 9,789.4 / 10,004.7 | 25,966 |
+| HybridCache | Foreign | 19,559,160 | 99.90 % | 0.12 / 3.9 | 2,697 / 10,071 | 45,284 | 0.01 % | 0 | 500,427,927 (85.15 %) | 6,625.8 / 9,789.4 / 9,995.6 | 124 |
+| HybridCache | Api | 19,264,634 | 99.87 % | 0.12 / 0.67 | 2,832 / 14,171 | 56,106 | 0.01 % | 0 | 481,646,095 (83.18 %) | 6,310.3 / 9,789.4 / 9,988.9 | 16,144 |
+| FusionCache | Foreign | 4,219,258 | 99.52 % | 0.34 / 5.5 | 2,974 / 52,905 | 37,785 | 0.03 % | 0 | 108,169,681 (85.29 %) | 7,670.2 / 9,789.4 / 10,003.3 | 27,190 |
+| FusionCache | Api | 1,239,406 | 98.48 % | 0.41 / 5.0 | 3,796 / 55,551 | 64,150 | 0.08 % | 0 | 1,042,010 (2.79 %) | 8.3 / 240.1 / 637.6 | 1 |
+| NearCacheHybridCache | Foreign | 476,399 | n/a | n/a | 49 / 5,341 | 45,819 | 0.23 % | 0 | 11,982,072 (83.70 %) | 5,723.6 / 9,789.4 / 9,995.0 | n/a |
+| NearCacheHybridCache | Api | 169,113 | n/a | n/a | 32 / 6,183 | 92,445 | 0.53 % | 0 | 1,524 (0.03 %) | 0.1 / 2.6 / 14.3 | n/a |
+| NearCache | Foreign | 879,939 | 94.50 % | 0.46 / 2.0 | 2,974 / 5,608 | 98,813 | 5.50 % | 0 | 15,406 (0.06 %) | 0.1 / 7.2 / 69.1 | 0 |
+| NearCache | Api | 927,073 | 94.75 % | 0.46 / 2.0 | 2,974 / 5,608 | 99,348 | 5.25 % | 0 | 19,006 (0.07 %) | 0.1 / 2.3 / 30.0 | 0 |
 
 ### Latency sweep
 
 | Contender | 0ms Reads/s | 0ms Server cmds/s | 0.5ms Reads/s | 0.5ms Server cmds/s | 2ms Reads/s | 2ms Server cmds/s |
 |---|---:|---:|---:|---:|---:|---:|
-| Plain | 164,527 | 166,527 | 124,343 | 126,344 | 62,852 | 64,853 |
-| MemoryCacheTtl | 14,433,455 | 22,420 | 15,868,961 | 22,556 | 12,726,584 | 22,615 |
-| HybridCache | 25,597,268 | 45,409 | 24,961,847 | 46,137 | 19,533,349 | 45,446 |
-| FusionCache | 6,587,211 | 37,663 | 6,258,546 | 38,387 | 4,475,469 | 39,009 |
-| NearCacheHybridCache | 527,667 | 45,970 | 525,493 | 45,935 | 444,614 | 45,701 |
-| NearCache | 1,348,724 | 104,596 | 1,311,492 | 105,008 | 830,694 | 98,145 |
+| Plain | 164,427 | 166,427 | 124,616 | 126,617 | 62,567 | 64,568 |
+| MemoryCacheTtl | 14,505,927 | 22,322 | 12,966,273 | 22,585 | 14,073,907 | 22,736 |
+| HybridCache | 25,987,205 | 45,448 | 20,296,958 | 45,321 | 19,559,160 | 45,284 |
+| FusionCache | 6,416,919 | 37,315 | 5,954,832 | 38,483 | 4,219,258 | 37,785 |
+| NearCacheHybridCache | 555,156 | 45,996 | 523,903 | 45,936 | 476,399 | 45,819 |
+| NearCache | 2,198,037 | 110,426 | 2,051,488 | 109,657 | 879,939 | 98,813 |
 
 ### Topologies
 
 | Topology | Server version | Contender | Write mode | Reads/s | Local hit % | Stale reads | Stale entries |
 |---|---|---|---|---:|---:|---:|---:|
-| cluster | redis 7.4.11 | Plain | Foreign | 116,995 | n/a | 0 | n/a |
-| cluster | redis 7.4.11 | NearCache | Foreign | 1,235,793 | 95.82 % | 37,293 | 0 |
-| tls | redis 7.4.11 | Plain | Foreign | 44,767 | n/a | 0 | n/a |
-| tls | redis 7.4.11 | NearCache | Foreign | 964,426 | 95.16 % | 28,429 | 0 |
-| valkey | valkey 8.1.10 | Plain | Foreign | 172,639 | n/a | 0 | n/a |
-| valkey | valkey 8.1.10 | NearCache | Foreign | 1,449,964 | 96.43 % | 37,115 | 0 |
+| cluster | redis 7.4.11 | Plain | Foreign | 116,968 | n/a | 0 | n/a |
+| cluster | redis 7.4.11 | NearCache | Foreign | 1,735,041 | 96.92 % | 74,757 | 0 |
+| tls | redis 7.4.11 | Plain | Foreign | 40,406 | n/a | 0 | n/a |
+| tls | redis 7.4.11 | NearCache | Foreign | 1,314,845 | 96.36 % | 56,776 | 0 |
+| valkey | valkey 8.1.10 | Plain | Foreign | 172,215 | n/a | 0 | n/a |
+| valkey | valkey 8.1.10 | NearCache | Foreign | 2,117,385 | 97.47 % | 280,100 | 0 |
 
 ### Chaos
 
 | Contender | Write mode | Topology | Latency | Invalidations | Race discards | Flushes | Re-arms | Tracking keys | Stale entries after quiescence |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|
-| NearCache | Foreign | standalone | 0ms | 1,132,766 | 4,515 | 44 | 17 | 9,991 | 0 |
+| NearCache | Foreign | standalone | 0ms | 1,132,566 | 3,330 | 42 | 16 | 9,994 | 0 |
 
 ### RedisNearCache internals
 
 | Contender | Write mode | Latency | Invalidations | Invalidations/write | Race discards | Flushes | Re-arms | Tracking keys | Server used mem before | Server used mem after |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| NearCacheHybridCache | Foreign | 0ms | 578,077 | 9.62 | 276 | 0 | 0 | 249 | 10.7 MB | 9.9 MB |
-| NearCacheHybridCache | Foreign | 0.5ms | 578,046 | 9.62 | 268 | 0 | 0 | 223 | 10.7 MB | 9.9 MB |
-| NearCacheHybridCache | Foreign | 2ms | 569,987 | 9.48 | 362 | 0 | 0 | 509 | 10.6 MB | 10.3 MB |
-| NearCacheHybridCache | Api | 0ms | 1,391,415 | 23.15 | 1,605 | 0 | 0 | 6,306 | 10.7 MB | 18.5 MB |
-| NearCacheHybridCache | Api | 0.5ms | 1,369,330 | 22.79 | 1,475 | 0 | 0 | 6,524 | 10.6 MB | 18.9 MB |
-| NearCacheHybridCache | Api | 2ms | 1,149,669 | 19.14 | 998 | 0 | 0 | 8,910 | 10.6 MB | 21.1 MB |
-| NearCache | Foreign | 0ms | 1,145,412 | 19.06 | 4,377 | 0 | 0 | 9,987 | 10.0 MB | 17.6 MB |
-| NearCache | Foreign | 0.5ms | 1,142,571 | 19.02 | 3,679 | 0 | 0 | 9,994 | 10.0 MB | 17.6 MB |
-| NearCache | Foreign | 2ms | 1,094,315 | 18.20 | 1,992 | 0 | 0 | 9,984 | 9.9 MB | 17.6 MB |
-| NearCache | Api | 0ms | 1,141,133 | 19.00 | 4,438 | 0 | 0 | 9,987 | 9.9 MB | 17.5 MB |
-| NearCache | Api | 0.5ms | 1,140,155 | 18.95 | 3,899 | 0 | 0 | 9,981 | 9.9 MB | 17.6 MB |
-| NearCache | Api | 2ms | 1,092,366 | 18.18 | 2,024 | 0 | 0 | 9,985 | 9.8 MB | 17.5 MB |
+| NearCacheHybridCache | Foreign | 0ms | 578,825 | 9.63 | 273 | 0 | 0 | 185 | 10.7 MB | 9.9 MB |
+| NearCacheHybridCache | Foreign | 0.5ms | 577,223 | 9.61 | 291 | 0 | 0 | 273 | 10.7 MB | 10.0 MB |
+| NearCacheHybridCache | Foreign | 2ms | 571,445 | 9.51 | 318 | 0 | 0 | 454 | 10.6 MB | 10.3 MB |
+| NearCacheHybridCache | Api | 0ms | 1,405,036 | 23.38 | 1,389 | 0 | 0 | 6,389 | 10.7 MB | 18.7 MB |
+| NearCacheHybridCache | Api | 0.5ms | 1,388,833 | 23.12 | 1,300 | 0 | 0 | 6,456 | 10.6 MB | 18.7 MB |
+| NearCacheHybridCache | Api | 2ms | 1,155,479 | 19.23 | 1,103 | 0 | 0 | 9,030 | 10.6 MB | 21.3 MB |
+| NearCache | Foreign | 0ms | 1,155,965 | 19.23 | 3,531 | 0 | 0 | 9,974 | 9.9 MB | 17.6 MB |
+| NearCache | Foreign | 0.5ms | 1,149,603 | 19.13 | 2,951 | 0 | 0 | 9,985 | 10.0 MB | 17.7 MB |
+| NearCache | Foreign | 2ms | 1,094,383 | 18.21 | 1,878 | 0 | 0 | 9,971 | 9.9 MB | 17.6 MB |
+| NearCache | Api | 0ms | 1,149,201 | 19.12 | 3,130 | 0 | 0 | 9,972 | 9.9 MB | 17.5 MB |
+| NearCache | Api | 0.5ms | 1,149,247 | 19.10 | 3,122 | 0 | 0 | 9,988 | 9.9 MB | 17.6 MB |
+| NearCache | Api | 2ms | 1,097,133 | 18.26 | 2,069 | 0 | 0 | 9,939 | 9.8 MB | 17.4 MB |
 
 ### Per-call cost — BenchmarkDotNet, 0ms
 
@@ -417,35 +427,35 @@ Profile (from results):
 
 | Contender | Payload | Mean | Error | Ratio vs Plain | Allocated |
 |---|---|---:|---:|---:|---:|
-| Plain | String | 135 µs | 1.0 µs | 1.000 | 3.47 KB |
-| MemoryCacheTtl | String | 41.3 ns | 0.1 ns | 0.000307 | 56 B |
-| HybridCache | String | 50.1 ns | 0.1 ns | 0.000372 | 56 B |
-| FusionCache | String | 141.1 ns | 0.3 ns | 0.00105 | 240 B |
-| NearCacheHybridCache | String | 573.1 ns | 1.1 ns | 0.00425 | 3.55 KB |
-| NearCache | String | 222.5 ns | 0.8 ns | 0.00165 | 2.08 KB |
-| Plain | Json | 134 µs | 1.3 µs | 1.000 | 936 B |
-| MemoryCacheTtl | Json | 41.3 ns | 0.1 ns | 0.000308 | 56 B |
-| HybridCache | Json | 508.6 ns | 0.9 ns | 0.0038 | 408 B |
-| FusionCache | Json | 142.7 ns | 0.3 ns | 0.00107 | 240 B |
-| NearCacheHybridCache | Json | 820.1 ns | 4.3 ns | 0.00612 | 1.00 KB |
-| NearCache | Json | 386.8 ns | 0.7 ns | 0.00289 | 408 B |
+| Plain | String | 134 µs | 658.2 ns | 1.000 | 3.47 KB |
+| MemoryCacheTtl | String | 41.7 ns | 0.1 ns | 0.000312 | 56 B |
+| HybridCache | String | 50.4 ns | 0.1 ns | 0.000377 | 56 B |
+| FusionCache | String | 140.7 ns | 0.3 ns | 0.00105 | 240 B |
+| NearCacheHybridCache | String | 514.1 ns | 0.7 ns | 0.00385 | 3.55 KB |
+| NearCache | String | 169.1 ns | 0.5 ns | 0.00127 | 2.08 KB |
+| Plain | Json | 135 µs | 686.6 ns | 1.000 | 936 B |
+| MemoryCacheTtl | Json | 41.5 ns | 0.1 ns | 0.000308 | 56 B |
+| HybridCache | Json | 506.9 ns | 0.6 ns | 0.00376 | 408 B |
+| FusionCache | Json | 143.7 ns | 0.9 ns | 0.00107 | 240 B |
+| NearCacheHybridCache | Json | 781.0 ns | 3.2 ns | 0.0058 | 1.00 KB |
+| NearCache | Json | 345.4 ns | 0.6 ns | 0.00256 | 408 B |
 
 **Miss path**
 
 | Contender | Payload | Mean | Error | Ratio vs Plain | Allocated |
 |---|---|---:|---:|---:|---:|
-| Plain | String | 151 µs | 22 µs | 1.000 | 3.41 KB |
-| MemoryCacheTtl | String | 139 µs | 6.2 µs | 0.924 | 3.56 KB |
-| HybridCache | String | 292 µs | 3.5 µs | 1.934 | 6.49 KB |
-| FusionCache | String | 451 µs | 19 µs | 2.990 | 12.66 KB |
-| NearCacheHybridCache | String | 295 µs | 9.0 µs | 1.952 | 7.27 KB |
-| NearCache | String | 143 µs | 5.5 µs | 0.949 | 4.20 KB |
-| Plain | Json | 145 µs | 7.7 µs | 1.000 | 880 B |
-| MemoryCacheTtl | Json | 139 µs | 2.7 µs | 0.956 | 1.01 KB |
-| HybridCache | Json | 298 µs | 5.5 µs | 2.058 | 4.87 KB |
-| FusionCache | Json | 446 µs | 7.9 µs | 3.081 | 9.23 KB |
-| NearCacheHybridCache | Json | 298 µs | 12 µs | 2.058 | 4.33 KB |
-| NearCache | Json | 142 µs | 5.4 µs | 0.980 | 1.65 KB |
+| Plain | String | 150 µs | 19 µs | 1.000 | 3.41 KB |
+| MemoryCacheTtl | String | 153 µs | 21 µs | 1.019 | 3.56 KB |
+| HybridCache | String | 298 µs | 26 µs | 1.991 | 6.49 KB |
+| FusionCache | String | 440 µs | 4.5 µs | 2.939 | 12.66 KB |
+| NearCacheHybridCache | String | 293 µs | 7.8 µs | 1.955 | 7.27 KB |
+| NearCache | String | 144 µs | 3.2 µs | 0.959 | 4.20 KB |
+| Plain | Json | 145 µs | 4.1 µs | 1.000 | 880 B |
+| MemoryCacheTtl | Json | 147 µs | 18 µs | 1.010 | 1.01 KB |
+| HybridCache | Json | 298 µs | 5.7 µs | 2.052 | 4.86 KB |
+| FusionCache | Json | 444 µs | 13 µs | 3.055 | 9.23 KB |
+| NearCacheHybridCache | Json | 306 µs | 22 µs | 2.108 | 4.33 KB |
+| NearCache | Json | 145 µs | 5.0 µs | 0.994 | 1.65 KB |
 
 ### Per-call latency — Sailfish, 0ms
 
@@ -455,64 +465,64 @@ _p95/p99 are derived here from Sailfish's raw per-sample data (RawExecutionResul
 
 | Contender | Payload | Median | Mean | p95 | p99 | Ratio vs Plain [95% CI] | q-value |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Plain | String | 233 µs | 235 µs | 333 µs | 450 µs | 1.000 (baseline) | n/a |
-| MemoryCacheTtl | String | 540.0 ns | 559.4 ns | 915.0 ns | 1.5 µs | 0.002 [0.002, 0.002] | 1.0E-300 |
-| HybridCache | String | 664.0 ns | 666.3 ns | 1.3 µs | 3.0 µs | 0.003 [0.003, 0.003] | 1.0E-300 |
-| FusionCache | String | 1.6 µs | 1.7 µs | 2.9 µs | 5.5 µs | 0.007 [0.007, 0.007] | 1.0E-300 |
-| NearCacheHybridCache | String | 3.3 µs | 3.4 µs | 6.6 µs | 14 µs | 0.014 [0.014, 0.015] | 1.0E-300 |
-| NearCache | String | 1.5 µs | 1.5 µs | 2.5 µs | 3.7 µs | 0.007 [0.006, 0.007] | 1.0E-300 |
-| Plain | Json | 239 µs | 260 µs | 510 µs | 670 µs | 1.000 (baseline) | n/a |
-| MemoryCacheTtl | Json | 581.0 ns | 599.2 ns | 915.0 ns | 1.5 µs | 0.002 [0.002, 0.002] | 1.0E-300 |
-| HybridCache | Json | 3.1 µs | 3.1 µs | 5.0 µs | 7.3 µs | 0.012 [0.012, 0.012] | 1.0E-300 |
-| FusionCache | Json | 1.6 µs | 1.5 µs | 3.1 µs | 6.3 µs | 0.006 [0.006, 0.006] | 1.0E-300 |
-| NearCacheHybridCache | Json | 4.7 µs | 4.7 µs | 7.9 µs | 13 µs | 0.018 [0.018, 0.018] | 1.0E-300 |
-| NearCache | Json | 2.5 µs | 2.7 µs | 4.7 µs | 8.3 µs | 0.011 [0.01, 0.011] | 1.0E-300 |
+| Plain | String | 226 µs | 227 µs | 319 µs | 432 µs | 1.000 (baseline) | n/a |
+| MemoryCacheTtl | String | 706.0 ns | 707.5 ns | 956.0 ns | 1.4 µs | 0.003 [0.003, 0.003] | 1.0E-300 |
+| HybridCache | String | 873.0 ns | 865.2 ns | 1.4 µs | 2.3 µs | 0.004 [0.004, 0.004] | 1.0E-300 |
+| FusionCache | String | 1.7 µs | 1.8 µs | 3.0 µs | 4.5 µs | 0.008 [0.008, 0.008] | 1.0E-300 |
+| NearCacheHybridCache | String | 3.8 µs | 3.7 µs | 5.6 µs | 10 µs | 0.017 [0.016, 0.017] | 1.0E-300 |
+| NearCache | String | 1.1 µs | 1.1 µs | 1.8 µs | 3.5 µs | 0.005 [0.005, 0.005] | 1.0E-300 |
+| Plain | Json | 248 µs | 256 µs | 484 µs | 564 µs | 1.000 (baseline) | n/a |
+| MemoryCacheTtl | Json | 623.0 ns | 607.7 ns | 915.0 ns | 1.4 µs | 0.002 [0.002, 0.002] | 1.0E-300 |
+| HybridCache | Json | 3.0 µs | 3.0 µs | 4.2 µs | 6.4 µs | 0.012 [0.012, 0.012] | 1.0E-300 |
+| FusionCache | Json | 1.5 µs | 1.5 µs | 2.4 µs | 5.0 µs | 0.006 [0.006, 0.006] | 1.0E-300 |
+| NearCacheHybridCache | Json | 5.0 µs | 5.0 µs | 8.0 µs | 14 µs | 0.02 [0.019, 0.02] | 1.0E-300 |
+| NearCache | Json | 1.2 µs | 1.2 µs | 1.7 µs | 3.2 µs | 0.005 [0.005, 0.005] | 1.0E-300 |
 
 **Miss path**
 
 | Contender | Payload | Median | Mean | p95 | p99 | Ratio vs Plain [95% CI] | q-value |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Plain | String | 408 µs | 435 µs | 830 µs | 1,247 µs | 1.000 (baseline) | n/a |
-| MemoryCacheTtl | String | 288 µs | 373 µs | 722 µs | 824 µs | 0.857 [0.825, 0.890] | 1.0E-300 |
-| HybridCache | String | 451 µs | 465 µs | 806 µs | 1,919 µs | 1.069 [1.041, 1.097] | 1.0E-300 |
-| FusionCache | String | 671 µs | 672 µs | 841 µs | 1,005 µs | 1.544 [1.507, 1.582] | 1.0E-300 |
-| NearCacheHybridCache | String | 500 µs | 530 µs | 896 µs | 2,156 µs | 1.217 [1.185, 1.251] | 1.0E-300 |
-| NearCache | String | 401 µs | 414 µs | 720 µs | 1,019 µs | 0.951 [0.921, 0.982] | 0.093 |
-| Plain | Json | 227 µs | 228 µs | 331 µs | 495 µs | 1.000 (baseline) | n/a |
-| MemoryCacheTtl | Json | 232 µs | 251 µs | 494 µs | 629 µs | 1.101 [1.088, 1.115] | 1.0E-300 |
-| HybridCache | Json | 442 µs | 445 µs | 657 µs | 876 µs | 1.951 [1.941, 1.960] | 1.0E-300 |
-| FusionCache | Json | 674 µs | 675 µs | 914 µs | 1,383 µs | 2.957 [2.943, 2.971] | 1.0E-300 |
-| NearCacheHybridCache | Json | 438 µs | 438 µs | 588 µs | 676 µs | 1.918 [1.907, 1.930] | 1.0E-300 |
-| NearCache | Json | 234 µs | 241 µs | 439 µs | 526 µs | 1.058 [1.051, 1.065] | 1.0E-300 |
+| Plain | String | 242 µs | 344 µs | 710 µs | 999 µs | 1.000 (baseline) | n/a |
+| MemoryCacheTtl | String | 280 µs | 342 µs | 600 µs | 730 µs | 0.993 [0.956, 1.031] | 2.3E-004 |
+| HybridCache | String | 444 µs | 452 µs | 737 µs | 1,007 µs | 1.312 [1.273, 1.352] | 1.0E-300 |
+| FusionCache | String | 666 µs | 668 µs | 858 µs | 1,108 µs | 1.940 [1.883, 1.999] | 1.0E-300 |
+| NearCacheHybridCache | String | 505 µs | 514 µs | 748 µs | 1,027 µs | 1.492 [1.446, 1.539] | 1.0E-300 |
+| NearCache | String | 234 µs | 245 µs | 507 µs | 670 µs | 0.712 [0.690, 0.735] | 1.0E-300 |
+| Plain | Json | 228 µs | 240 µs | 515 µs | 754 µs | 1.000 (baseline) | n/a |
+| MemoryCacheTtl | Json | 226 µs | 229 µs | 311 µs | 442 µs | 0.953 [0.945, 0.962] | 1.1E-008 |
+| HybridCache | Json | 439 µs | 442 µs | 582 µs | 682 µs | 1.842 [1.826, 1.859] | 1.0E-300 |
+| FusionCache | Json | 669 µs | 676 µs | 965 µs | 1,274 µs | 2.818 [2.791, 2.845] | 1.0E-300 |
+| NearCacheHybridCache | Json | 447 µs | 442 µs | 555 µs | 709 µs | 1.844 [1.826, 1.862] | 1.0E-300 |
+| NearCache | Json | 239 µs | 321 µs | 641 µs | 752 µs | 1.339 [1.300, 1.379] | 1.0E-300 |
 
 ### Cross-check: BenchmarkDotNet vs Sailfish — 0ms
 
 | Path | Contender | Payload | BDN median | Sailfish median | Difference |
 |---|---|---|---:|---:|---:|
-| Hit | Plain | String | 135 µs | 233 µs | 73.2 % |
-| Hit | MemoryCacheTtl | String | 41.3 ns | 540.0 ns | 1,206.2 % |
-| Hit | HybridCache | String | 50.1 ns | 664.0 ns | 1,224.1 % |
-| Hit | FusionCache | String | 141.2 ns | 1.6 µs | 1,049.4 % |
-| Hit | NearCacheHybridCache | String | 573.0 ns | 3.3 µs | 481.3 % |
-| Hit | NearCache | String | 222.7 ns | 1.5 µs | 591.0 % |
-| Hit | Plain | Json | 134 µs | 239 µs | 77.8 % |
-| Hit | MemoryCacheTtl | Json | 41.3 ns | 581.0 ns | 1,306.4 % |
-| Hit | HybridCache | Json | 508.5 ns | 3.1 µs | 514.1 % |
-| Hit | FusionCache | Json | 142.7 ns | 1.6 µs | 1,007.9 % |
-| Hit | NearCacheHybridCache | Json | 819.0 ns | 4.7 µs | 474.6 % |
-| Hit | NearCache | Json | 386.8 ns | 2.5 µs | 556.7 % |
-| Miss | Plain | String | 148 µs | 408 µs | 176.2 % |
-| Miss | MemoryCacheTtl | String | 139 µs | 288 µs | 107.8 % |
-| Miss | HybridCache | String | 292 µs | 451 µs | 54.7 % |
-| Miss | FusionCache | String | 449 µs | 671 µs | 49.7 % |
-| Miss | NearCacheHybridCache | String | 294 µs | 500 µs | 69.7 % |
-| Miss | NearCache | String | 142 µs | 401 µs | 182.0 % |
-| Miss | Plain | Json | 143 µs | 227 µs | 58.6 % |
-| Miss | MemoryCacheTtl | Json | 139 µs | 232 µs | 67.2 % |
-| Miss | HybridCache | Json | 299 µs | 442 µs | 47.9 % |
-| Miss | FusionCache | Json | 445 µs | 674 µs | 51.5 % |
-| Miss | NearCacheHybridCache | Json | 299 µs | 438 µs | 46.4 % |
-| Miss | NearCache | Json | 143 µs | 234 µs | 64.1 % |
+| Hit | Plain | String | 134 µs | 226 µs | 69.4 % |
+| Hit | MemoryCacheTtl | String | 41.7 ns | 706.0 ns | 1,592.7 % |
+| Hit | HybridCache | String | 50.4 ns | 873.0 ns | 1,633.7 % |
+| Hit | FusionCache | String | 140.8 ns | 1.7 µs | 1,111.9 % |
+| Hit | NearCacheHybridCache | String | 514.4 ns | 3.8 µs | 636.8 % |
+| Hit | NearCache | String | 169.2 ns | 1.1 µs | 563.7 % |
+| Hit | Plain | Json | 135 µs | 248 µs | 83.7 % |
+| Hit | MemoryCacheTtl | Json | 41.5 ns | 623.0 ns | 1,400.8 % |
+| Hit | HybridCache | Json | 506.8 ns | 3.0 µs | 499.7 % |
+| Hit | FusionCache | Json | 144.0 ns | 1.5 µs | 969.7 % |
+| Hit | NearCacheHybridCache | Json | 779.5 ns | 5.0 µs | 541.1 % |
+| Hit | NearCache | Json | 345.2 ns | 1.2 µs | 237.4 % |
+| Miss | Plain | String | 145 µs | 242 µs | 67.3 % |
+| Miss | MemoryCacheTtl | String | 144 µs | 280 µs | 95.3 % |
+| Miss | HybridCache | String | 292 µs | 444 µs | 52.4 % |
+| Miss | FusionCache | String | 442 µs | 666 µs | 50.9 % |
+| Miss | NearCacheHybridCache | String | 293 µs | 505 µs | 72.5 % |
+| Miss | NearCache | String | 144 µs | 234 µs | 63.1 % |
+| Miss | Plain | Json | 146 µs | 228 µs | 56.1 % |
+| Miss | MemoryCacheTtl | Json | 143 µs | 226 µs | 58.3 % |
+| Miss | HybridCache | Json | 299 µs | 439 µs | 47.1 % |
+| Miss | FusionCache | Json | 444 µs | 669 µs | 50.7 % |
+| Miss | NearCacheHybridCache | Json | 301 µs | 447 µs | 48.6 % |
+| Miss | NearCache | Json | 145 µs | 239 µs | 65.2 % |
 
 ### Per-call cost — BenchmarkDotNet, 0.5ms
 
@@ -520,35 +530,35 @@ _p95/p99 are derived here from Sailfish's raw per-sample data (RawExecutionResul
 
 | Contender | Payload | Mean | Error | Ratio vs Plain | Allocated |
 |---|---|---:|---:|---:|---:|
-| Plain | String | 1,049 µs | 36 µs | 1.000 | 3.47 KB |
-| MemoryCacheTtl | String | 41.3 ns | 0.1 ns | 3.93E-05 | 56 B |
-| HybridCache | String | 50.7 ns | 0.2 ns | 4.84E-05 | 56 B |
-| FusionCache | String | 140.0 ns | 0.3 ns | 0.000133 | 240 B |
-| NearCacheHybridCache | String | 576.2 ns | 1.3 ns | 0.000549 | 3.55 KB |
-| NearCache | String | 219.2 ns | 0.9 ns | 0.000209 | 2.08 KB |
-| Plain | Json | 1,047 µs | 28 µs | 1.000 | 937 B |
-| MemoryCacheTtl | Json | 40.8 ns | 0.1 ns | 3.9E-05 | 56 B |
-| HybridCache | Json | 510.9 ns | 0.6 ns | 0.000488 | 408 B |
-| FusionCache | Json | 140.3 ns | 0.3 ns | 0.000134 | 240 B |
-| NearCacheHybridCache | Json | 811.1 ns | 1.3 ns | 0.000775 | 1.00 KB |
-| NearCache | Json | 385.1 ns | 0.4 ns | 0.000368 | 408 B |
+| Plain | String | 1,187 µs | 28 µs | 1.000 | 3.47 KB |
+| MemoryCacheTtl | String | 42.1 ns | 0.1 ns | 3.55E-05 | 56 B |
+| HybridCache | String | 51.9 ns | 0.1 ns | 4.37E-05 | 56 B |
+| FusionCache | String | 142.3 ns | 0.2 ns | 0.00012 | 240 B |
+| NearCacheHybridCache | String | 535.6 ns | 1.1 ns | 0.000451 | 3.55 KB |
+| NearCache | String | 175.4 ns | 0.4 ns | 0.000148 | 2.08 KB |
+| Plain | Json | 1,201 µs | 19 µs | 1.000 | 937 B |
+| MemoryCacheTtl | Json | 41.3 ns | 0.1 ns | 3.44E-05 | 56 B |
+| HybridCache | Json | 522.1 ns | 0.5 ns | 0.000435 | 408 B |
+| FusionCache | Json | 143.2 ns | 0.3 ns | 0.000119 | 240 B |
+| NearCacheHybridCache | Json | 775.4 ns | 0.6 ns | 0.000646 | 1.00 KB |
+| NearCache | Json | 342.8 ns | 0.5 ns | 0.000285 | 408 B |
 
 **Miss path**
 
 | Contender | Payload | Mean | Error | Ratio vs Plain | Allocated |
 |---|---|---:|---:|---:|---:|
-| Plain | String | 1,081 µs | 93 µs | 1.000 | 3.41 KB |
-| MemoryCacheTtl | String | 1,110 µs | 154 µs | 1.027 | 3.56 KB |
-| HybridCache | String | 2,147 µs | 230 µs | 1.986 | 6.40 KB |
-| FusionCache | String | 3,163 µs | 138 µs | 2.926 | 12.62 KB |
-| NearCacheHybridCache | String | 2,074 µs | 69 µs | 1.919 | 7.17 KB |
-| NearCache | String | 1,123 µs | 145 µs | 1.039 | 4.20 KB |
-| Plain | Json | 1,071 µs | 96 µs | 1.000 | 880 B |
-| MemoryCacheTtl | Json | 1,123 µs | 104 µs | 1.049 | 1.01 KB |
-| HybridCache | Json | 2,113 µs | 92 µs | 1.973 | 4.88 KB |
-| FusionCache | Json | 3,228 µs | 276 µs | 3.014 | 9.23 KB |
-| NearCacheHybridCache | Json | 2,176 µs | 146 µs | 2.032 | 4.34 KB |
-| NearCache | Json | 1,061 µs | 120 µs | 0.990 | 1.65 KB |
+| Plain | String | 1,133 µs | 42 µs | 1.000 | 3.41 KB |
+| MemoryCacheTtl | String | 1,093 µs | 77 µs | 0.965 | 3.56 KB |
+| HybridCache | String | 2,295 µs | 118 µs | 2.026 | 6.36 KB |
+| FusionCache | String | 3,337 µs | 157 µs | 2.946 | 12.62 KB |
+| NearCacheHybridCache | String | 2,297 µs | 183 µs | 2.028 | 7.18 KB |
+| NearCache | String | 1,144 µs | 130 µs | 1.010 | 4.20 KB |
+| Plain | Json | 1,121 µs | 80 µs | 1.000 | 880 B |
+| MemoryCacheTtl | Json | 1,131 µs | 96 µs | 1.009 | 1.01 KB |
+| HybridCache | Json | 2,307 µs | 193 µs | 2.058 | 4.86 KB |
+| FusionCache | Json | 3,486 µs | 196 µs | 3.110 | 9.23 KB |
+| NearCacheHybridCache | Json | 2,394 µs | 261 µs | 2.135 | 4.33 KB |
+| NearCache | Json | 1,155 µs | 110 µs | 1.030 | 1.65 KB |
 
 ### Per-call latency — Sailfish, 0.5ms
 
@@ -558,64 +568,64 @@ _p95/p99 are derived here from Sailfish's raw per-sample data (RawExecutionResul
 
 | Contender | Payload | Median | Mean | p95 | p99 | Ratio vs Plain [95% CI] | q-value |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Plain | String | 1,163 µs | 1,153 µs | 1,432 µs | 1,780 µs | 1.000 (baseline) | n/a |
-| MemoryCacheTtl | String | 665.0 ns | 702.2 ns | 1.4 µs | 2.5 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
-| HybridCache | String | 706.0 ns | 720.3 ns | 1.7 µs | 3.1 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
-| FusionCache | String | 1.7 µs | 2.0 µs | 5.5 µs | 11 µs | 0.002 [0.002, 0.002] | 1.0E-300 |
-| NearCacheHybridCache | String | 4.0 µs | 4.0 µs | 7.6 µs | 12 µs | 0.003 [0.003, 0.004] | 1.0E-300 |
-| NearCache | String | 1.1 µs | 1.2 µs | 2.2 µs | 3.4 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
-| Plain | Json | 922 µs | 949 µs | 1,340 µs | 2,069 µs | 1.000 (baseline) | n/a |
-| MemoryCacheTtl | Json | 664.0 ns | 783.9 ns | 2.5 µs | 5.6 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
-| HybridCache | Json | 3.1 µs | 3.1 µs | 8.8 µs | 13 µs | 0.003 [0.003, 0.003] | 1.0E-300 |
-| FusionCache | Json | 873.0 ns | 1.0 µs | 4.8 µs | 8.8 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
-| NearCacheHybridCache | Json | 5.0 µs | 5.6 µs | 16 µs | 30 µs | 0.006 [0.006, 0.006] | 1.0E-300 |
-| NearCache | Json | 3.0 µs | 3.7 µs | 13 µs | 18 µs | 0.004 [0.004, 0.004] | 1.0E-300 |
+| Plain | String | 1,205 µs | 1,178 µs | 1,453 µs | 1,676 µs | 1.000 (baseline) | n/a |
+| MemoryCacheTtl | String | 706.0 ns | 699.9 ns | 1.1 µs | 2.1 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
+| HybridCache | String | 832.0 ns | 873.7 ns | 1.5 µs | 3.7 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
+| FusionCache | String | 1.4 µs | 1.4 µs | 2.1 µs | 3.7 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
+| NearCacheHybridCache | String | 3.2 µs | 3.2 µs | 4.9 µs | 8.2 µs | 0.003 [0.003, 0.003] | 1.0E-300 |
+| NearCache | String | 748.0 ns | 789.3 ns | 1.2 µs | 2.1 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
+| Plain | Json | 1,179 µs | 1,152 µs | 1,394 µs | 1,598 µs | 1.000 (baseline) | n/a |
+| MemoryCacheTtl | Json | 456.0 ns | 448.4 ns | 789.0 ns | 1.2 µs | <0.001 [<0.001, <0.001] | 1.0E-300 |
+| HybridCache | Json | 1.6 µs | 1.6 µs | 2.3 µs | 4.6 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
+| FusionCache | Json | 1.4 µs | 1.3 µs | 2.0 µs | 4.2 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
+| NearCacheHybridCache | Json | 4.0 µs | 4.0 µs | 6.1 µs | 9.5 µs | 0.003 [0.003, 0.004] | 1.0E-300 |
+| NearCache | Json | 2.3 µs | 2.3 µs | 3.5 µs | 6.0 µs | 0.002 [0.002, 0.002] | 1.0E-300 |
 
 **Miss path**
 
 | Contender | Payload | Median | Mean | p95 | p99 | Ratio vs Plain [95% CI] | q-value |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Plain | String | 950 µs | 1,000 µs | 1,376 µs | 1,595 µs | 1.000 (baseline) | n/a |
-| MemoryCacheTtl | String | 1,100 µs | 1,107 µs | 1,572 µs | 1,993 µs | 1.107 [1.089, 1.125] | 1.0E-300 |
-| HybridCache | String | 1,775 µs | 1,843 µs | 2,419 µs | 2,968 µs | 1.843 [1.819, 1.868] | 1.0E-300 |
-| FusionCache | String | 2,948 µs | 3,029 µs | 3,942 µs | 4,850 µs | 3.029 [2.987, 3.072] | 1.0E-300 |
-| NearCacheHybridCache | String | 1,844 µs | 1,949 µs | 2,845 µs | 3,534 µs | 1.949 [1.921, 1.978] | 1.0E-300 |
-| NearCache | String | 1,154 µs | 1,171 µs | 1,739 µs | 2,734 µs | 1.171 [1.152, 1.191] | 1.0E-300 |
-| Plain | Json | 922 µs | 961 µs | 1,251 µs | 1,521 µs | 1.000 (baseline) | n/a |
-| MemoryCacheTtl | Json | 993 µs | 1,039 µs | 1,561 µs | 2,119 µs | 1.082 [1.067, 1.096] | 1.0E-300 |
-| HybridCache | Json | 1,863 µs | 1,912 µs | 2,569 µs | 3,190 µs | 1.990 [1.969, 2.011] | 1.0E-300 |
-| FusionCache | Json | 2,726 µs | 2,829 µs | 3,746 µs | 4,602 µs | 2.944 [2.913, 2.975] | 1.0E-300 |
-| NearCacheHybridCache | Json | 1,943 µs | 2,008 µs | 2,714 µs | 3,257 µs | 2.090 [2.065, 2.115] | 1.0E-300 |
-| NearCache | Json | 1,011 µs | 1,046 µs | 1,509 µs | 1,993 µs | 1.089 [1.074, 1.104] | 1.0E-300 |
+| Plain | String | 1,085 µs | 1,106 µs | 1,446 µs | 1,731 µs | 1.000 (baseline) | n/a |
+| MemoryCacheTtl | String | 1,123 µs | 1,139 µs | 1,499 µs | 1,764 µs | 1.030 [1.016, 1.045] | 7.7E-005 |
+| HybridCache | String | 2,010 µs | 2,067 µs | 2,585 µs | 2,967 µs | 1.870 [1.845, 1.894] | 1.0E-300 |
+| FusionCache | String | 3,368 µs | 3,370 µs | 4,014 µs | 4,559 µs | 3.048 [3.013, 3.083] | 1.0E-300 |
+| NearCacheHybridCache | String | 2,136 µs | 2,138 µs | 2,657 µs | 3,071 µs | 1.933 [1.907, 1.959] | 1.0E-300 |
+| NearCache | String | 1,130 µs | 1,126 µs | 1,393 µs | 1,586 µs | 1.018 [1.005, 1.032] | 0.002 |
+| Plain | Json | 1,089 µs | 1,088 µs | 1,427 µs | 1,643 µs | 1.000 (baseline) | n/a |
+| MemoryCacheTtl | Json | 1,043 µs | 1,066 µs | 1,332 µs | 1,556 µs | 0.979 [0.966, 0.993] | 0.029 |
+| HybridCache | Json | 2,035 µs | 2,096 µs | 2,645 µs | 3,062 µs | 1.926 [1.900, 1.953] | 1.0E-300 |
+| FusionCache | Json | 3,329 µs | 3,281 µs | 3,908 µs | 4,442 µs | 3.015 [2.976, 3.054] | 1.0E-300 |
+| NearCacheHybridCache | Json | 1,959 µs | 2,031 µs | 2,579 µs | 2,930 µs | 1.866 [1.841, 1.892] | 1.0E-300 |
+| NearCache | Json | 963 µs | 1,006 µs | 1,358 µs | 1,703 µs | 0.925 [0.911, 0.938] | 1.0E-300 |
 
 ### Cross-check: BenchmarkDotNet vs Sailfish — 0.5ms
 
 | Path | Contender | Payload | BDN median | Sailfish median | Difference |
 |---|---|---|---:|---:|---:|
-| Hit | Plain | String | 1,043 µs | 1,163 µs | 11.5 % |
-| Hit | MemoryCacheTtl | String | 41.3 ns | 665.0 ns | 1,511.7 % |
-| Hit | HybridCache | String | 50.8 ns | 706.0 ns | 1,290.9 % |
-| Hit | FusionCache | String | 140.0 ns | 1.7 µs | 1,088.5 % |
-| Hit | NearCacheHybridCache | String | 576.2 ns | 4.0 µs | 586.7 % |
-| Hit | NearCache | String | 219.4 ns | 1.1 µs | 411.9 % |
-| Hit | Plain | Json | 1,048 µs | 922 µs | -12.0 % |
-| Hit | MemoryCacheTtl | Json | 40.8 ns | 664.0 ns | 1,525.8 % |
-| Hit | HybridCache | Json | 510.9 ns | 3.1 µs | 503.1 % |
-| Hit | FusionCache | Json | 140.3 ns | 873.0 ns | 522.4 % |
-| Hit | NearCacheHybridCache | Json | 811.1 ns | 5.0 µs | 516.2 % |
-| Hit | NearCache | Json | 385.1 ns | 3.0 µs | 667.5 % |
-| Miss | Plain | String | 1,107 µs | 950 µs | -14.1 % |
-| Miss | MemoryCacheTtl | String | 1,089 µs | 1,100 µs | 1.1 % |
-| Miss | HybridCache | String | 2,101 µs | 1,775 µs | -15.5 % |
-| Miss | FusionCache | String | 3,187 µs | 2,948 µs | -7.5 % |
-| Miss | NearCacheHybridCache | String | 2,062 µs | 1,844 µs | -10.6 % |
-| Miss | NearCache | String | 1,116 µs | 1,154 µs | 3.4 % |
-| Miss | Plain | Json | 1,057 µs | 922 µs | -12.7 % |
-| Miss | MemoryCacheTtl | Json | 1,122 µs | 993 µs | -11.5 % |
-| Miss | HybridCache | Json | 2,106 µs | 1,863 µs | -11.5 % |
-| Miss | FusionCache | Json | 3,167 µs | 2,726 µs | -13.9 % |
-| Miss | NearCacheHybridCache | Json | 2,200 µs | 1,943 µs | -11.7 % |
-| Miss | NearCache | Json | 1,023 µs | 1,011 µs | -1.2 % |
+| Hit | Plain | String | 1,186 µs | 1,205 µs | 1.6 % |
+| Hit | MemoryCacheTtl | String | 42.1 ns | 706.0 ns | 1,575.9 % |
+| Hit | HybridCache | String | 51.9 ns | 832.0 ns | 1,502.8 % |
+| Hit | FusionCache | String | 142.3 ns | 1.4 µs | 864.7 % |
+| Hit | NearCacheHybridCache | String | 535.6 ns | 3.2 µs | 498.6 % |
+| Hit | NearCache | String | 175.4 ns | 748.0 ns | 326.5 % |
+| Hit | Plain | Json | 1,203 µs | 1,179 µs | -2.0 % |
+| Hit | MemoryCacheTtl | Json | 41.3 ns | 456.0 ns | 1,002.9 % |
+| Hit | HybridCache | Json | 522.1 ns | 1.6 µs | 202.8 % |
+| Hit | FusionCache | Json | 143.2 ns | 1.4 µs | 885.7 % |
+| Hit | NearCacheHybridCache | Json | 775.3 ns | 4.0 µs | 410.2 % |
+| Hit | NearCache | Json | 342.7 ns | 2.3 µs | 568.2 % |
+| Miss | Plain | String | 1,136 µs | 1,085 µs | -4.5 % |
+| Miss | MemoryCacheTtl | String | 1,093 µs | 1,123 µs | 2.8 % |
+| Miss | HybridCache | String | 2,277 µs | 2,010 µs | -11.7 % |
+| Miss | FusionCache | String | 3,357 µs | 3,368 µs | 0.3 % |
+| Miss | NearCacheHybridCache | String | 2,272 µs | 2,136 µs | -6.0 % |
+| Miss | NearCache | String | 1,128 µs | 1,130 µs | 0.2 % |
+| Miss | Plain | Json | 1,121 µs | 1,089 µs | -2.8 % |
+| Miss | MemoryCacheTtl | Json | 1,124 µs | 1,043 µs | -7.2 % |
+| Miss | HybridCache | Json | 2,311 µs | 2,035 µs | -11.9 % |
+| Miss | FusionCache | Json | 3,504 µs | 3,329 µs | -5.0 % |
+| Miss | NearCacheHybridCache | Json | 2,377 µs | 1,959 µs | -17.6 % |
+| Miss | NearCache | Json | 1,172 µs | 963 µs | -17.9 % |
 
 ### Per-call cost — BenchmarkDotNet, 2ms
 
@@ -623,35 +633,35 @@ _p95/p99 are derived here from Sailfish's raw per-sample data (RawExecutionResul
 
 | Contender | Payload | Mean | Error | Ratio vs Plain | Allocated |
 |---|---|---:|---:|---:|---:|
-| Plain | String | 3,256 µs | 55 µs | 1.000 | 3.47 KB |
-| MemoryCacheTtl | String | 41.2 ns | 0.1 ns | 1.27E-05 | 56 B |
-| HybridCache | String | 50.5 ns | 0.1 ns | 1.55E-05 | 56 B |
-| FusionCache | String | 140.4 ns | 0.3 ns | 4.31E-05 | 240 B |
-| NearCacheHybridCache | String | 570.9 ns | 2.4 ns | 0.000175 | 3.55 KB |
-| NearCache | String | 225.7 ns | 1.0 ns | 6.93E-05 | 2.08 KB |
-| Plain | Json | 3,255 µs | 53 µs | 1.000 | 937 B |
-| MemoryCacheTtl | Json | 40.9 ns | 0.1 ns | 1.26E-05 | 56 B |
-| HybridCache | Json | 509.8 ns | 0.4 ns | 0.000157 | 408 B |
-| FusionCache | Json | 141.4 ns | 0.5 ns | 4.35E-05 | 240 B |
-| NearCacheHybridCache | Json | 816.6 ns | 0.8 ns | 0.000251 | 1.00 KB |
-| NearCache | Json | 386.4 ns | 0.5 ns | 0.000119 | 408 B |
+| Plain | String | 3,226 µs | 39 µs | 1.000 | 3.47 KB |
+| MemoryCacheTtl | String | 41.9 ns | 0.1 ns | 1.3E-05 | 56 B |
+| HybridCache | String | 48.8 ns | 0.5 ns | 1.51E-05 | 56 B |
+| FusionCache | String | 140.0 ns | 0.3 ns | 4.34E-05 | 240 B |
+| NearCacheHybridCache | String | 528.0 ns | 3.4 ns | 0.000164 | 3.55 KB |
+| NearCache | String | 167.1 ns | 0.5 ns | 5.18E-05 | 2.08 KB |
+| Plain | Json | 3,239 µs | 57 µs | 1.000 | 937 B |
+| MemoryCacheTtl | Json | 41.0 ns | 0.1 ns | 1.27E-05 | 56 B |
+| HybridCache | Json | 504.1 ns | 0.7 ns | 0.000156 | 408 B |
+| FusionCache | Json | 140.3 ns | 0.4 ns | 4.33E-05 | 240 B |
+| NearCacheHybridCache | Json | 765.7 ns | 0.7 ns | 0.000236 | 1.00 KB |
+| NearCache | Json | 335.5 ns | 0.7 ns | 0.000104 | 408 B |
 
 **Miss path**
 
 | Contender | Payload | Mean | Error | Ratio vs Plain | Allocated |
 |---|---|---:|---:|---:|---:|
-| Plain | String | 3,134 µs | 92 µs | 1.000 | 3.41 KB |
-| MemoryCacheTtl | String | 3,206 µs | 212 µs | 1.023 | 3.56 KB |
-| HybridCache | String | 6,394 µs | 291 µs | 2.040 | 6.36 KB |
-| FusionCache | String | 9,578 µs | 282 µs | 3.056 | 12.62 KB |
-| NearCacheHybridCache | String | 6,355 µs | 227 µs | 2.028 | 7.18 KB |
-| NearCache | String | 3,172 µs | 185 µs | 1.012 | 4.20 KB |
-| Plain | Json | 3,072 µs | 101 µs | 1.000 | 880 B |
-| MemoryCacheTtl | Json | 3,145 µs | 173 µs | 1.024 | 1.01 KB |
-| HybridCache | Json | 6,557 µs | 394 µs | 2.134 | 4.73 KB |
-| FusionCache | Json | 9,524 µs | 299 µs | 3.100 | 9.19 KB |
-| NearCacheHybridCache | Json | 6,308 µs | 233 µs | 2.053 | 4.23 KB |
-| NearCache | Json | 3,196 µs | 179 µs | 1.040 | 1.65 KB |
+| Plain | String | 3,201 µs | 162 µs | 1.000 | 3.41 KB |
+| MemoryCacheTtl | String | 3,215 µs | 139 µs | 1.005 | 3.56 KB |
+| HybridCache | String | 6,389 µs | 237 µs | 1.996 | 6.36 KB |
+| FusionCache | String | 9,625 µs | 258 µs | 3.007 | 12.62 KB |
+| NearCacheHybridCache | String | 6,307 µs | 226 µs | 1.971 | 7.17 KB |
+| NearCache | String | 3,218 µs | 233 µs | 1.005 | 4.20 KB |
+| Plain | Json | 3,160 µs | 302 µs | 1.000 | 880 B |
+| MemoryCacheTtl | Json | 3,130 µs | 140 µs | 0.990 | 1.01 KB |
+| HybridCache | Json | 6,340 µs | 244 µs | 2.006 | 4.72 KB |
+| FusionCache | Json | 9,451 µs | 355 µs | 2.991 | 9.19 KB |
+| NearCacheHybridCache | Json | 6,341 µs | 254 µs | 2.006 | 4.23 KB |
+| NearCache | Json | 3,140 µs | 211 µs | 0.994 | 1.65 KB |
 
 ### Per-call latency — Sailfish, 2ms
 
@@ -661,64 +671,64 @@ _p95/p99 are derived here from Sailfish's raw per-sample data (RawExecutionResul
 
 | Contender | Payload | Median | Mean | p95 | p99 | Ratio vs Plain [95% CI] | q-value |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Plain | String | 2,947 µs | 2,955 µs | 3,403 µs | 4,126 µs | 1.000 (baseline) | n/a |
-| MemoryCacheTtl | String | 706.0 ns | 714.7 ns | 1.9 µs | 3.9 µs | <0.001 [<0.001, <0.001] | 1.0E-300 |
-| HybridCache | String | 957.0 ns | 1.1 µs | 3.4 µs | 7.9 µs | <0.001 [<0.001, <0.001] | 1.0E-300 |
-| FusionCache | String | 2.6 µs | 3.2 µs | 9.6 µs | 18 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
-| NearCacheHybridCache | String | 4.0 µs | 4.4 µs | 13 µs | 22 µs | 0.001 [0.001, 0.002] | 1.0E-300 |
-| NearCache | String | 1.3 µs | 1.4 µs | 3.1 µs | 5.4 µs | <0.001 [<0.001, <0.001] | 1.0E-300 |
-| Plain | Json | 2,899 µs | 2,905 µs | 3,467 µs | 4,077 µs | 1.000 (baseline) | n/a |
-| MemoryCacheTtl | Json | 498.0 ns | 497.3 ns | 790.0 ns | 1.3 µs | <0.001 [<0.001, <0.001] | 1.0E-300 |
-| HybridCache | Json | 1.7 µs | 1.8 µs | 3.6 µs | 5.1 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
-| FusionCache | Json | 1.5 µs | 1.5 µs | 2.2 µs | 4.4 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
-| NearCacheHybridCache | Json | 3.9 µs | 4.3 µs | 11 µs | 31 µs | 0.001 [0.001, 0.002] | 1.0E-300 |
-| NearCache | Json | 1.2 µs | 1.3 µs | 2.5 µs | 4.6 µs | <0.001 [<0.001, <0.001] | 1.0E-300 |
+| Plain | String | 3,170 µs | 3,157 µs | 3,658 µs | 4,062 µs | 1.000 (baseline) | n/a |
+| MemoryCacheTtl | String | 706.0 ns | 716.0 ns | 998.0 ns | 1.6 µs | <0.001 [<0.001, <0.001] | 1.0E-300 |
+| HybridCache | String | 832.0 ns | 886.3 ns | 1.7 µs | 3.4 µs | <0.001 [<0.001, <0.001] | 1.0E-300 |
+| FusionCache | String | 1.7 µs | 1.8 µs | 3.4 µs | 5.2 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
+| NearCacheHybridCache | String | 3.8 µs | 3.8 µs | 5.7 µs | 9.7 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
+| NearCache | String | 1.1 µs | 1.1 µs | 2.0 µs | 3.5 µs | <0.001 [<0.001, <0.001] | 1.0E-300 |
+| Plain | Json | 3,128 µs | 3,118 µs | 3,683 µs | 4,052 µs | 1.000 (baseline) | n/a |
+| MemoryCacheTtl | Json | 457.0 ns | 470.6 ns | 748.0 ns | 1.2 µs | <0.001 [<0.001, <0.001] | 1.0E-300 |
+| HybridCache | Json | 1.6 µs | 1.6 µs | 3.6 µs | 15 µs | 0.001 [<0.001, 0.001] | 1.0E-300 |
+| FusionCache | Json | 1.5 µs | 1.4 µs | 2.2 µs | 4.9 µs | <0.001 [<0.001, <0.001] | 1.0E-300 |
+| NearCacheHybridCache | Json | 3.4 µs | 3.3 µs | 5.2 µs | 11 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
+| NearCache | Json | 2.5 µs | 2.5 µs | 4.5 µs | 10 µs | 0.001 [0.001, 0.001] | 1.0E-300 |
 
 **Miss path**
 
 | Contender | Payload | Median | Mean | p95 | p99 | Ratio vs Plain [95% CI] | q-value |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Plain | String | 2,885 µs | 2,883 µs | 3,369 µs | 3,929 µs | 1.000 (baseline) | n/a |
-| MemoryCacheTtl | String | 2,959 µs | 2,965 µs | 3,525 µs | 4,109 µs | 1.028 [1.022, 1.035] | 1.0E-300 |
-| HybridCache | String | 5,706 µs | 5,710 µs | 6,306 µs | 7,624 µs | 1.980 [1.970, 1.990] | 1.0E-300 |
-| FusionCache | String | 8,584 µs | 8,615 µs | 9,588 µs | 12,343 µs | 2.988 [2.972, 3.004] | 1.0E-300 |
-| NearCacheHybridCache | String | 5,664 µs | 5,691 µs | 6,316 µs | 8,765 µs | 1.974 [1.963, 1.984] | 1.0E-300 |
-| NearCache | String | 2,911 µs | 2,908 µs | 3,313 µs | 3,970 µs | 1.009 [1.003, 1.015] | 0.002 |
-| Plain | Json | 2,885 µs | 2,888 µs | 3,328 µs | 4,209 µs | 1.000 (baseline) | n/a |
-| MemoryCacheTtl | Json | 2,939 µs | 2,947 µs | 3,525 µs | 4,187 µs | 1.020 [1.014, 1.027] | 7.3E-009 |
-| HybridCache | Json | 5,729 µs | 5,751 µs | 6,534 µs | 8,111 µs | 1.991 [1.981, 2.002] | 1.0E-300 |
-| FusionCache | Json | 8,580 µs | 8,629 µs | 9,810 µs | 14,889 µs | 2.988 [2.972, 3.004] | 1.0E-300 |
-| NearCacheHybridCache | Json | 5,592 µs | 5,608 µs | 6,234 µs | 7,363 µs | 1.942 [1.932, 1.953] | 1.0E-300 |
-| NearCache | Json | 2,948 µs | 2,968 µs | 3,553 µs | 4,333 µs | 1.028 [1.021, 1.034] | 1.0E-300 |
+| Plain | String | 3,102 µs | 3,094 µs | 3,579 µs | 3,881 µs | 1.000 (baseline) | n/a |
+| MemoryCacheTtl | String | 3,069 µs | 3,071 µs | 3,584 µs | 4,265 µs | 0.993 [0.984, 1.001] | 0.078 |
+| HybridCache | String | 6,111 µs | 6,118 µs | 6,945 µs | 8,452 µs | 1.978 [1.963, 1.992] | 1.0E-300 |
+| FusionCache | String | 9,237 µs | 9,257 µs | 10,282 µs | 11,485 µs | 2.993 [2.972, 3.014] | 1.0E-300 |
+| NearCacheHybridCache | String | 6,095 µs | 6,104 µs | 6,859 µs | 7,581 µs | 1.973 [1.959, 1.987] | 1.0E-300 |
+| NearCache | String | 3,095 µs | 3,098 µs | 3,575 µs | 3,938 µs | 1.002 [0.993, 1.010] | 0.838 |
+| Plain | Json | 3,115 µs | 3,124 µs | 3,613 µs | 3,977 µs | 1.000 (baseline) | n/a |
+| MemoryCacheTtl | Json | 3,133 µs | 3,122 µs | 3,632 µs | 3,927 µs | 0.999 [0.991, 1.008] | 0.966 |
+| HybridCache | Json | 6,118 µs | 6,120 µs | 6,916 µs | 7,713 µs | 1.959 [1.944, 1.974] | 1.0E-300 |
+| FusionCache | Json | 9,250 µs | 9,254 µs | 10,411 µs | 16,189 µs | 2.962 [2.941, 2.983] | 1.0E-300 |
+| NearCacheHybridCache | Json | 6,085 µs | 6,088 µs | 6,856 µs | 7,831 µs | 1.949 [1.934, 1.963] | 1.0E-300 |
+| NearCache | Json | 3,102 µs | 3,118 µs | 3,631 µs | 4,045 µs | 0.998 [0.990, 1.007] | 0.827 |
 
 ### Cross-check: BenchmarkDotNet vs Sailfish — 2ms
 
 | Path | Contender | Payload | BDN median | Sailfish median | Difference |
 |---|---|---|---:|---:|---:|
-| Hit | Plain | String | 3,250 µs | 2,947 µs | -9.3 % |
-| Hit | MemoryCacheTtl | String | 41.2 ns | 706.0 ns | 1,613.7 % |
-| Hit | HybridCache | String | 50.5 ns | 957.0 ns | 1,796.0 % |
-| Hit | FusionCache | String | 140.4 ns | 2.6 µs | 1,767.9 % |
-| Hit | NearCacheHybridCache | String | 570.6 ns | 4.0 µs | 600.7 % |
-| Hit | NearCache | String | 225.5 ns | 1.3 µs | 472.1 % |
-| Hit | Plain | Json | 3,265 µs | 2,899 µs | -11.2 % |
-| Hit | MemoryCacheTtl | Json | 40.9 ns | 498.0 ns | 1,117.6 % |
-| Hit | HybridCache | Json | 509.8 ns | 1.7 µs | 235.0 % |
-| Hit | FusionCache | Json | 141.4 ns | 1.5 µs | 928.4 % |
-| Hit | NearCacheHybridCache | Json | 816.5 ns | 3.9 µs | 379.5 % |
-| Hit | NearCache | Json | 386.5 ns | 1.2 µs | 222.9 % |
-| Miss | Plain | String | 3,149 µs | 2,885 µs | -8.4 % |
-| Miss | MemoryCacheTtl | String | 3,191 µs | 2,959 µs | -7.3 % |
-| Miss | HybridCache | String | 6,444 µs | 5,706 µs | -11.5 % |
-| Miss | FusionCache | String | 9,595 µs | 8,584 µs | -10.5 % |
-| Miss | NearCacheHybridCache | String | 6,356 µs | 5,664 µs | -10.9 % |
-| Miss | NearCache | String | 3,177 µs | 2,911 µs | -8.4 % |
-| Miss | Plain | Json | 3,067 µs | 2,885 µs | -5.9 % |
-| Miss | MemoryCacheTtl | Json | 3,144 µs | 2,939 µs | -6.5 % |
-| Miss | HybridCache | Json | 6,558 µs | 5,729 µs | -12.6 % |
-| Miss | FusionCache | Json | 9,497 µs | 8,580 µs | -9.7 % |
-| Miss | NearCacheHybridCache | Json | 6,321 µs | 5,592 µs | -11.5 % |
-| Miss | NearCache | Json | 3,192 µs | 2,948 µs | -7.6 % |
+| Hit | Plain | String | 3,232 µs | 3,170 µs | -1.9 % |
+| Hit | MemoryCacheTtl | String | 41.9 ns | 706.0 ns | 1,584.9 % |
+| Hit | HybridCache | String | 48.6 ns | 832.0 ns | 1,612.0 % |
+| Hit | FusionCache | String | 140.0 ns | 1.7 µs | 1,148.6 % |
+| Hit | NearCacheHybridCache | String | 526.7 ns | 3.8 µs | 619.6 % |
+| Hit | NearCache | String | 167.1 ns | 1.1 µs | 547.6 % |
+| Hit | Plain | Json | 3,223 µs | 3,128 µs | -3.0 % |
+| Hit | MemoryCacheTtl | Json | 41.0 ns | 457.0 ns | 1,014.3 % |
+| Hit | HybridCache | Json | 504.1 ns | 1.6 µs | 213.6 % |
+| Hit | FusionCache | Json | 140.3 ns | 1.5 µs | 965.2 % |
+| Hit | NearCacheHybridCache | Json | 765.6 ns | 3.4 µs | 345.9 % |
+| Hit | NearCache | Json | 335.6 ns | 2.5 µs | 643.4 % |
+| Miss | Plain | String | 3,197 µs | 3,102 µs | -3.0 % |
+| Miss | MemoryCacheTtl | String | 3,206 µs | 3,069 µs | -4.3 % |
+| Miss | HybridCache | String | 6,366 µs | 6,111 µs | -4.0 % |
+| Miss | FusionCache | String | 9,648 µs | 9,237 µs | -4.3 % |
+| Miss | NearCacheHybridCache | String | 6,278 µs | 6,095 µs | -2.9 % |
+| Miss | NearCache | String | 3,266 µs | 3,095 µs | -5.2 % |
+| Miss | Plain | Json | 3,092 µs | 3,115 µs | 0.7 % |
+| Miss | MemoryCacheTtl | Json | 3,135 µs | 3,133 µs | -0.0 % |
+| Miss | HybridCache | Json | 6,333 µs | 6,118 µs | -3.4 % |
+| Miss | FusionCache | Json | 9,391 µs | 9,250 µs | -1.5 % |
+| Miss | NearCacheHybridCache | Json | 6,302 µs | 6,085 µs | -3.4 % |
+| Miss | NearCache | Json | 3,118 µs | 3,102 µs | -0.5 % |
 
 <!-- END GENERATED RESULTS -->
 

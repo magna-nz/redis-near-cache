@@ -86,21 +86,21 @@ a 10 s TTL.
 <!-- HEADLINE -->
 | | Plain StackExchange.Redis | `IMemoryCache` + 10 s TTL | `HybridCache` + Redis L2 | FusionCache + backplane | **RedisNearCache** |
 |---|---:|---:|---:|---:|---:|
-| Reads/s | 164,527 | 14.43 M | 25.60 M | 6.59 M | 1.35 M |
-| Server commands/s | 166,527 | 22,420 | 45,409 | 37,663 | 104,596 |
-| Reads served stale | 0 | 83.1 % | 84.8 % | 85.0 % | 0.07 % |
-| Stalest read | – | 10.0 s | 10.0 s | 10.0 s | 76 ms |
-| Stale local entries after writes stop | – | 822 | 67 | 9,625 | 0 |
-| Reads served stale, writes through the library's API | 0 | 83.2 % | 83.0 % | 2.4 % | 0.13 % |
+| Reads/s | 164,427 | 14.51 M | 25.99 M | 6.42 M | 2.20 M |
+| Server commands/s | 166,427 | 22,322 | 45,448 | 37,315 | 110,426 |
+| Reads served stale | 0 | 83.1 % | 84.8 % | 85.0 % | 0.33 % |
+| Stalest read | – | 10.0 s | 10.0 s | 10.0 s | 105 ms |
+| Stale local entries after writes stop | – | 792 | 605 | 16,701 | 0 |
+| Reads served stale, writes through the library's API | 0 | 82.8 % | 83.2 % | 2.3 % | 0.41 % |
 <!-- /HEADLINE -->
 
 - **Only RedisNearCache stays fresh when something else writes.** The TTL caches served most reads stale, up to the
   whole TTL; FusionCache's backplane only carries writes made through FusionCache.
 - **Freshness costs server traffic.** Every write invalidates the key on every instance tracking it, and each re-reads
   it on next access, so its command rate follows the write rate, not the read rate: well above a TTL cache, and below
-  plain StackExchange.Redis only while round trips are short (37 % fewer at 0 ms, 51 % more at 2 ms injected).
-- **In-process TTL caches read faster.** They return a stored object; RedisNearCache decodes bytes and checks
-  coherence on every hit (223 ns vs 41 ns per hit in BenchmarkDotNet). A cold read costs about what a plain `GET` does.
+  plain StackExchange.Redis only while round trips are short (34 % fewer at 0 ms, 53 % more at 2 ms injected).
+- **In-process TTL caches read faster.** They return a stored object; RedisNearCache decodes bytes on every hit
+  (169 ns vs 42 ns per hit in BenchmarkDotNet). A cold read costs about what a plain `GET` does.
 
 **[Full results, methodology and how to run them →](bench/RedisNearCache.Bench/README.md)**: latency sweeps (0, 0.5
 and 2 ms injected), writes through each library's API, cluster, TLS, Valkey, a chaos run, and per-call BenchmarkDotNet
