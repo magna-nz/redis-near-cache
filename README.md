@@ -57,7 +57,7 @@ Add `RedisNearCache.HybridCache` as well if you want it behind `HybridCache` or 
 | Platform | Mode | Tested |
 |---|---|---|
 | Redis 6+ (self-hosted, Docker, Kubernetes), Valkey | `Redirect` (default) | CI on Redis 6.2, 7.0, 7.2, 7.4, 8 and Valkey 8.1: standalone, replica, TLS, cluster, Sentinel. `Broadcast` also runs in the same jobs |
-| Azure Managed Redis, Redis Cloud, Redis Software (databases 7.4+) | [`Broadcast`](#redis-enterprise-azure-managed-redis-redis-cloud), with `KeyPrefixes` set | CI against Redis Software in Docker (`enterprise-up.sh`, the same proxy those services run). Not yet run against a real Azure or Redis Cloud instance; `RNC_ENTERPRISE_REDIS` points the Enterprise suite at one |
+| Azure Managed Redis, Redis Cloud, Redis Software (databases 7.4+) | [`Broadcast`](#redis-enterprise-azure-managed-redis-redis-cloud), with `KeyPrefixes` set; access keys or Entra ID tokens | CI against Redis Software in Docker (`enterprise-up.sh`, the same proxy those services run). Not yet run against a real Azure or Redis Cloud instance; `RNC_ENTERPRISE_REDIS` points the Enterprise suite at one |
 | Azure Cache for Redis (Basic, Standard, Premium), node-based ElastiCache (Redis OSS, Valkey) | `Redirect` | Their restrictions (disabled admin commands, hostname-announcing cluster) are emulated in CI, not tested against the real services; `RNC_EXTERNAL_REDIS` runs a check against one |
 | ElastiCache Serverless | Not supported | It disables `CLIENT TRACKING`, `CLIENT CACHING`, `CLIENT TRACKINGINFO`, `CLIENT LIST` and `CLIENT ID` |
 | Garnet | Not supported | It does not implement `CLIENT TRACKING` |
