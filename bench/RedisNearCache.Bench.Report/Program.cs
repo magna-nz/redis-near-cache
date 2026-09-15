@@ -429,7 +429,8 @@ internal static class Program
 
     private sealed class BdnMemory
     {
-        public long BytesAllocatedPerOperation { get; set; }
+        // Null when the benchmark produced no results (it threw); such benchmarks are reported as failed, not skipped silently.
+        public long? BytesAllocatedPerOperation { get; set; }
     }
 
     // AllowNamedFloatingPointLiterals: a job with very few iterations can produce a NaN/Infinity confidence
@@ -481,8 +482,14 @@ internal static class Program
 
                 foreach (var b in report.Benchmarks)
                 {
-                    if (b.Method is null || b.Statistics is null || b.Memory is null)
+                    if (b.Method is null)
                     {
+                        continue;
+                    }
+
+                    if (b.Statistics is null)
+                    {
+                        Console.Error.WriteLine($"warning: BenchmarkDotNet {path} {b.Type}.{b.Method} produced no results (see the bdn log), omitted from {file}");
                         continue;
                     }
 
@@ -493,7 +500,7 @@ internal static class Program
                     }
 
                     rows.Add(new BdnRow(path, b.Method, payload, b.Statistics.Mean, b.Statistics.ConfidenceInterval?.Margin ?? 0,
-                        b.Statistics.Median, b.Memory.BytesAllocatedPerOperation));
+                        b.Statistics.Median, b.Memory?.BytesAllocatedPerOperation ?? 0));
                 }
             }
         }
@@ -928,7 +935,10 @@ internal static class Program
         : bytes.ToString("N0", CultureInfo.InvariantCulture) + " B";
 
     // Hit-path ratios against a network round trip are tiny; keep three significant digits instead of rounding to 0.000.
-    private static string FormatRatio(double ratio) => ratio >= 0.1
+    // Sailfish writes its ratios rounded to 3 dp, so a hit path far below the baseline arrives as 0.
+    private static string FormatRatio(double ratio) => ratio == 0
+        ? "<0.001"
+        : ratio >= 0.1
         ? ratio.ToString("N3", CultureInfo.InvariantCulture)
         : ratio.ToString("G3", CultureInfo.InvariantCulture);
 

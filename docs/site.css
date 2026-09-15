@@ -209,6 +209,10 @@ code, pre, kbd { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Me
   align-items: start;
 }
 
+/* A row with no rail, for wide tables (Performance). */
+.row.row-wide { grid-template-columns: minmax(0, 1fr); }
+.row.row-wide > .prose { max-width: none; }
+
 .prose { min-width: 0; padding: 0 8px 20px 0; max-width: 72ch; }
 .rail {
   min-width: 0;

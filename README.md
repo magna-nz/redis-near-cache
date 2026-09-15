@@ -79,14 +79,31 @@ services.AddRedisNearCacheHybridCache();               // HybridCache's own L1 i
 
 ## What you get
 
-Measured on one machine against a local Redis 7.4, 20 application instances, 160 readers and 2,000
-foreign writes per second (details and caveats in the [docs](https://magna-nz.github.io/redis-near-cache/#performance)):
+Compared with the caches you would otherwise reach for, on one machine against Redis 7.4 in Docker: 20 application
+instances, 160 readers, and 2,000 writes per second made by another client straight to Redis. The TTL-based caches use
+a 10 s TTL.
 
-| | Near cache | Plain StackExchange.Redis |
-|---|---:|---:|
-| Reads per second | 1,369,673 | 190,756 |
-| Server commands per second | 59,585 | 192,758 |
-| Stale local entries after 60,000 foreign writes | 0 | n/a |
+<!-- HEADLINE -->
+| | Plain StackExchange.Redis | `IMemoryCache` + 10 s TTL | `HybridCache` + Redis L2 | FusionCache + backplane | **RedisNearCache** |
+|---|---:|---:|---:|---:|---:|
+| Reads/s | 164,527 | 14.43 M | 25.60 M | 6.59 M | 1.35 M |
+| Server commands/s | 166,527 | 22,420 | 45,409 | 37,663 | 104,596 |
+| Reads served stale | 0 | 83.1 % | 84.8 % | 85.0 % | 0.07 % |
+| Stalest read | – | 10.0 s | 10.0 s | 10.0 s | 76 ms |
+| Stale local entries after writes stop | – | 822 | 67 | 9,625 | 0 |
+| Reads served stale, writes through the library's API | 0 | 83.2 % | 83.0 % | 2.4 % | 0.13 % |
+<!-- /HEADLINE -->
+
+- **Only RedisNearCache stays fresh when something else writes.** The TTL caches served most reads stale, up to the
+  whole TTL; FusionCache's backplane only carries writes made through FusionCache.
+- **Freshness costs server traffic.** Every write invalidates the key on every instance tracking it, and each re-reads
+  it on next access: more commands than a TTL cache, still fewer than no cache.
+- **In-process TTL caches read faster.** They return a stored object; RedisNearCache decodes bytes and checks
+  coherence on every hit (223 ns vs 41 ns per hit in BenchmarkDotNet). A cold read costs about what a plain `GET` does.
+
+**[Full results, methodology and how to run them →](bench/RedisNearCache.Bench/README.md)**: latency sweeps (0, 0.5
+and 2 ms injected), writes through each library's API, cluster, TLS, Valkey, a chaos run, and per-call BenchmarkDotNet
+and Sailfish numbers.
 
 ## How it stays correct
 
@@ -106,6 +123,7 @@ on the **[documentation site](https://magna-nz.github.io/redis-near-cache/)**.
 ```sh
 ./up.sh                   # every container the tests need (standalone, replica, TLS, cluster, Sentinel, managed-style)
 dotnet test tests/RedisNearCache.Tests --filter "Category!=Soak"
+bench/run-matrix.sh --quick   # benchmarks, not run in CI; see bench/RedisNearCache.Bench/README.md
 ```
 
 ## License
