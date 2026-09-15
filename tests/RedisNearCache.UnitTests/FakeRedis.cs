@@ -68,7 +68,30 @@ internal sealed class FakeServer
     public int RoleCalls => Volatile.Read(ref _roleCalls);
     private int _roleCalls;
 
+    /// <summary>
+    /// Called with every <c>ExecuteAsync</c> command as space-separated text (e.g. "CLIENT TRACKING OFF") before it is
+    /// answered; the reply is withheld until the returned task completes. Lets a test hold a sweep mid-way.
+    /// </summary>
+    public Func<string, Task>? CommandHook { get; set; }
+
     private object? Handle(MethodInfo method, object?[] args)
+    {
+        var result = HandleCore(method, args);
+        if (method.Name == "ExecuteAsync" && CommandHook is { } hook && result is Task<RedisResult> reply)
+        {
+            var commandArgs = args.Length == 2 && args[1] is object[] rest ? rest : [];
+            return WithheldAsync(hook(string.Join(' ', commandArgs.Prepend(args[0]))), reply);
+        }
+        return result;
+    }
+
+    private static async Task<RedisResult> WithheldAsync(Task hold, Task<RedisResult> reply)
+    {
+        await hold.ConfigureAwait(false);
+        return await reply.ConfigureAwait(false);
+    }
+
+    private object? HandleCore(MethodInfo method, object?[] args)
     {
         switch (method.Name)
         {

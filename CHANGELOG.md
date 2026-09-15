@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fix: a replica pre-arm sweep requested while another sweep was still running (e.g. a configuration change arriving
+  right after a sweep disarmed a replica whose replication link was down) was silently dropped, so the replica was
+  only re-armed by the next 5 s topology check. Such a request now causes one more sweep as soon as the running one
+  finishes; sweeps still never run concurrently, and any number of requests during one sweep coalesce into a single
+  follow-up. This also removes the intermittent failure of `SweepDisarmsAPreArmedReplicaWhoseLinkIsDown`, whose rig
+  has no periodic topology check; `ConfigurationChangeDuringARunningSweepRunsAnotherSweep` reproduces it
+  deterministically by holding a sweep on its `CLIENT TRACKING OFF`.
 - Docs: `AddRedisNearCacheHybridCache` no longer claims that HybridCache's background write of a factory result can
   only cause "an occasional extra factory call, never a stale read". That write can land after a newer `SetAsync` or
   `RemoveAsync` from another caller and put the old value back in Redis, where every instance serves it until the entry

@@ -80,6 +80,7 @@ internal sealed class TrackingArmer : ITrackingArmer
     private int _disposed;
     private bool _hooked;
     private int _reconciling;
+    private int _preArmPending;
 
     /// <summary>
     /// Replicas armed ahead of time (see <see cref="PreArmReplicasAsync"/>), keyed by endpoint with the redirect id
@@ -681,8 +682,19 @@ internal sealed class TrackingArmer : ITrackingArmer
 
     // --- replica pre-arm --------------------------------------------------------------------------------
 
-    /// <summary>Runs <see cref="PreArmReplicasAsync"/> in the background, at most one sweep at a time.</summary>
+    /// <summary>
+    /// Runs <see cref="PreArmReplicasAsync"/> in the background, at most one sweep at a time. A request that arrives
+    /// while a sweep is running is not dropped (the state it reacts to may have changed after that sweep looked):
+    /// it leaves <see cref="_preArmPending"/> set, and the running sweep's owner runs one more sweep for all such
+    /// requests once it finishes.
+    /// </summary>
     private void QueuePreArmReplicas()
+    {
+        Volatile.Write(ref _preArmPending, 1);
+        RunPendingPreArmSweeps();
+    }
+
+    private void RunPendingPreArmSweeps()
     {
         if (Interlocked.CompareExchange(ref _reconciling, 1, 0) != 0) return;
         CancellationToken token;
@@ -692,20 +704,30 @@ internal sealed class TrackingArmer : ITrackingArmer
         {
             try
             {
-                await PreArmReplicasAsync(token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                // shutting down
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "RedisNearCache replica pre-arm sweep failed");
+                while (!token.IsCancellationRequested && Interlocked.Exchange(ref _preArmPending, 0) == 1)
+                {
+                    try
+                    {
+                        await PreArmReplicasAsync(token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    {
+                        return; // shutting down
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "RedisNearCache replica pre-arm sweep failed");
+                    }
+                }
             }
             finally
             {
                 Volatile.Write(ref _reconciling, 0);
             }
+
+            // A request that set the flag after the loop's last check but before _reconciling was cleared saw a sweep
+            // still running and returned; pick it up here.
+            if (!token.IsCancellationRequested && Volatile.Read(ref _preArmPending) == 1) RunPendingPreArmSweeps();
         }, CancellationToken.None);
     }
 
