@@ -22,7 +22,17 @@ internal sealed class RedisNearCache : IRedisNearCache
     private readonly InFlightTracker _inflight;
     private volatile bool _degraded;
     private int _startupSettled;
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<EndPoint, bool> _lostEndpoints = new();
+
+    /// <summary>
+    /// Endpoints whose tracking is lost: added on <see cref="ITrackingArmer.TrackingLost"/>, removed on
+    /// <see cref="ITrackingArmer.Armed"/> or <see cref="ITrackingArmer.EndpointRemoved"/>. Mutated only under
+    /// <see cref="_lostLock"/>, and only through <see cref="AddLost"/> and <see cref="RemoveLost"/>, which publish its
+    /// size to <see cref="_lostCount"/> before releasing the lock. See <see cref="CachingEnabled"/>.
+    /// </summary>
+    private readonly HashSet<EndPoint> _lostEndpoints = new();
+    private readonly object _lostLock = new();
+    private volatile int _lostCount;
+
     private int _disposed;
 
     /// <summary>
@@ -120,7 +130,7 @@ internal sealed class RedisNearCache : IRedisNearCache
         if (e.Reason != ArmReason.Initial) FlushLocal();
         if (e.Reason is not (ArmReason.Initial or ArmReason.Promoted)) Statistics.Rearm();
         // Re-enable caching only AFTER the flush, so no concurrent read can hit an entry the flush discards.
-        _lostEndpoints.TryRemove(e.EndPoint, out _);
+        RemoveLost(e.EndPoint);
         // An arm succeeded, so startup (or its recovery) is settled and the cache is no longer degraded.
         Volatile.Write(ref _startupSettled, 1);
         _degraded = false;
@@ -133,7 +143,7 @@ internal sealed class RedisNearCache : IRedisNearCache
         // The coherence source is reset BEFORE the loss is visible, so a waiter can never observe "not coherent"
         // against a still-completed source and spin.
         ResetCoherence();
-        _lostEndpoints[endPoint] = true;
+        AddLost(endPoint);
         FlushLocal();
     }
 
@@ -144,12 +154,63 @@ internal sealed class RedisNearCache : IRedisNearCache
         // flush unconditionally, even if tracking was never reported lost there. Then stop waiting on it: it will
         // never be re-armed, so it must not keep us in pass-through. Flush first, re-enable after, as in OnArmed.
         FlushLocal();
-        _lostEndpoints.TryRemove(endPoint, out _);
+        RemoveLost(endPoint);
         SignalCoherence();
     }
 
+    private void AddLost(EndPoint endPoint)
+    {
+        lock (_lostLock)
+        {
+            if (_lostEndpoints.Add(endPoint)) _lostCount = _lostEndpoints.Count;
+        }
+    }
+
+    private void RemoveLost(EndPoint endPoint)
+    {
+        lock (_lostLock)
+        {
+            if (_lostEndpoints.Remove(endPoint)) _lostCount = _lostEndpoints.Count;
+        }
+    }
+
     /// <summary>L1 may only be read or populated while tracking is believed to be armed everywhere.</summary>
-    private bool CachingEnabled => !_degraded && _lostEndpoints.IsEmpty;
+    /// <remarks>
+    /// Evaluated on every read, L1 hits included, so it must not lock: <c>ConcurrentDictionary.IsEmpty</c>, used here
+    /// before, takes every one of its locks when the dictionary is empty, which is the steady state.
+    /// <para>
+    /// Invariant: whenever <see cref="_lostLock"/> is free, <c>_lostCount == _lostEndpoints.Count</c>. Both mutators
+    /// hold the lock, change the set, and write the count from the set's own size before releasing it, so the count is
+    /// never derived from a count of events. A read sees the last completed write (an int write is atomic; the field
+    /// is volatile), so <c>_lostCount == 0</c> means the set was empty at the most recent add or remove to complete.
+    /// The count write is the moment a loss becomes, or stops being, visible to reads; the handlers place it exactly
+    /// where the old dictionary write was, so every ordering rule is unchanged:
+    /// </para>
+    /// <list type="bullet">
+    /// <item>Loss: the count is non-zero before <see cref="FlushLocal"/> starts. A read that checked just before the
+    /// write either served an entry (it linearizes before the loss) or is in flight and started before the flush's
+    /// <c>MarkAllInvalidated</c>, so its store is discarded by the in-flight re-check.</item>
+    /// <item>Arm and removal: the count drops only after <see cref="FlushLocal"/> returns, so no read is served an
+    /// entry that flush is about to discard.</item>
+    /// <item>Duplicate <c>TrackingLost</c> for one endpoint: the second <c>Add</c> returns false and writes nothing.
+    /// One <c>Armed</c> or <c>EndpointRemoved</c> clears it; an event counter would wait for a second one forever.</item>
+    /// <item><c>Armed</c> or <c>EndpointRemoved</c> for an endpoint that is not lost (every Initial arm, a Promoted
+    /// arm, a removal of an armed node): <c>Remove</c> returns false and writes nothing. An event counter would go
+    /// negative and report zero while a later loss is still in the set.</item>
+    /// <item>Removal racing re-arm of the same lost endpoint: both flush, then both remove; one <c>Remove</c> succeeds
+    /// and writes the size, the other is a no-op. The endpoint ends not lost whichever runs first, as before.</item>
+    /// <item>Events for different endpoints on different threads: the lock serializes the set, and each write reflects
+    /// the set after its own change, so no update is lost and a zero is only written when the set is empty.</item>
+    /// </list>
+    /// <para>
+    /// Not covered here, and not before: a <c>TrackingLost</c> and an <c>Armed</c>/<c>EndpointRemoved</c> for the SAME
+    /// endpoint on different threads, where the clear's <c>Remove</c> lands after the loss's <c>Add</c> although the
+    /// loss was the later event. The facade's result follows whichever mutation lands last. <see cref="Tracking.TrackingArmer"/>
+    /// excludes it by raising all three events under its lifecycle lock (DESIGN.md, Endpoint lifecycle), so the facade
+    /// sees one endpoint's events in the armer's order.
+    /// </para>
+    /// </remarks>
+    private bool CachingEnabled => !_degraded && _lostCount == 0;
 
     /// <inheritdoc />
     public bool IsCoherent => Volatile.Read(ref _startupSettled) == 1 && CachingEnabled && Volatile.Read(ref _disposed) == 0;
