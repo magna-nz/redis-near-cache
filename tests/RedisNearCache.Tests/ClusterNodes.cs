@@ -50,9 +50,11 @@ internal static class ClusterNodes
             "--port", port.ToString(),
             "--cluster-enabled", "yes",
             "--cluster-config-file", $"nodes-{port}.conf",
+            "--dbfilename", $"dump-{port}.rdb",
             "--cluster-announce-ip", "127.0.0.1",
             "--cluster-announce-port", port.ToString(),
             "--cluster-announce-bus-port", (port + 10_000).ToString(),
+            "--cluster-node-timeout", "3000",
             "--save", "",
             "--appendonly", "no",
             "--daemonize", "yes");

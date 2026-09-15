@@ -68,7 +68,7 @@ case "$IMAGE" in
   *)
     docker run -d --name "$HOSTNAME_CLUSTER_CONTAINER" -p 7200-7205:7200-7205 -p 17200-17205:17200-17205 "$IMAGE" bash -c '
       for p in 7200 7201 7202 7203 7204 7205; do
-        redis-server --port $p --cluster-enabled yes --cluster-config-file nodes-$p.conf \
+        redis-server --port $p --cluster-enabled yes --cluster-config-file nodes-$p.conf --dbfilename dump-$p.rdb \
           --cluster-announce-ip 127.0.0.1 --cluster-announce-port $p --cluster-announce-bus-port $((p+10000)) \
           --cluster-announce-hostname localhost --cluster-preferred-endpoint-type hostname \
           --cluster-node-timeout 3000 --save "" --appendonly no --daemonize yes
