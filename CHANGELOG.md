@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Docs: `AddRedisNearCacheHybridCache` no longer claims that HybridCache's background write of a factory result can
+  only cause "an occasional extra factory call, never a stale read". That write can land after a newer `SetAsync` or
+  `RemoveAsync` from another caller and put the old value back in Redis, where every instance serves it until the entry
+  expires or the key is written again (a cache-aside lost update, which `CLIENT TRACKING` cannot invalidate). The XML
+  remarks and docs now describe it, why the adapter does not refuse the write, and how to bound it; the benchmark's
+  multi-second `NearCacheHybridCache` stale tail is attributed to it; `HybridCacheWriteBackRaceTests` reproduces it.
 - Performance: the L1 hit path no longer takes a lock. Every read checked whether any master's tracking was lost with
   `ConcurrentDictionary.IsEmpty`, which acquires all of the dictionary's locks when it is empty, i.e. always in the
   steady state. The lost-endpoint set is now mutated under a private lock that publishes its size to a volatile
