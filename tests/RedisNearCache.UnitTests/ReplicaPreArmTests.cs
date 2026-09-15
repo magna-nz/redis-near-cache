@@ -246,6 +246,49 @@ public class ReplicaPreArmTests
             "the replica was not re-armed once its link came back: " + rig.Describe());
     }
 
+    /// <summary>
+    /// A sweep request that arrives while a sweep is still running must not be dropped: it has to cause one more sweep
+    /// once the running one finishes. The rig has no reconcile loop, so nothing else would ever retry it. The running
+    /// sweep is held on the disarm's CLIENT TRACKING OFF, i.e. after the pre-arm entry is gone but before the sweep ends.
+    /// </summary>
+    [Fact]
+    public async Task ConfigurationChangeDuringARunningSweepRunsAnotherSweep()
+    {
+        await using var rig = await Rig.StartAsync();
+        Assert.True(
+            await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000),
+            "the replica was never pre-armed: " + rig.Describe());
+
+        var offReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Replica.CommandHook = command =>
+        {
+            if (!string.Equals(command, "CLIENT TRACKING OFF", StringComparison.Ordinal)) return Task.CompletedTask;
+            offReached.TrySetResult();
+            return release.Task;
+        };
+
+        try
+        {
+            rig.Replica.LinkState = "sync";
+            rig.Mux.RaiseConfigurationChanged(rig.Replica);
+            Assert.True(await Task.WhenAny(offReached.Task, Task.Delay(3000)) == offReached.Task,
+                "the sweep never disarmed the replica whose link is down: " + rig.Describe());
+            Assert.False(rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint));
+
+            // The first sweep is still running (held on its OFF): this request must be remembered, not dropped.
+            rig.Replica.LinkState = "connected";
+            rig.Mux.RaiseConfigurationChanged(rig.Replica);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        Assert.True(await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000),
+            "the request that arrived during a running sweep was dropped; the replica was not re-armed: " + rig.Describe());
+    }
+
     [Fact]
     public async Task ReplicaThatIsNotAConnectedReplicaOnRoleIsNotTouched()
     {
