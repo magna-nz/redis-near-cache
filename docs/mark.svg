@@ -4,17 +4,22 @@
       <stop offset="0" stop-color="#3E5470"/>
       <stop offset="1" stop-color="#1B2431"/>
     </linearGradient>
+    <mask id="m">
+      <rect width="104" height="104" fill="#fff"/>
+      <rect x="19" y="31" width="40" height="58" rx="8" fill="#000"/>
+    </mask>
   </defs>
   <rect x="4" y="4" width="96" height="96" rx="22" fill="url(#g)"/>
-  <!-- server -->
-  <rect x="58" y="24" width="26" height="56" rx="5" fill="none" stroke="#E6E9EE" stroke-width="4"/>
-  <line x1="64" y1="40" x2="78" y2="40" stroke="#E6E9EE" stroke-width="4" stroke-linecap="round"/>
-  <line x1="64" y1="52" x2="78" y2="52" stroke="#E6E9EE" stroke-width="4" stroke-linecap="round"/>
-  <line x1="64" y1="64" x2="78" y2="64" stroke="#E6E9EE" stroke-width="4" stroke-linecap="round"/>
-  <!-- near cache (local) -->
-  <circle cx="32" cy="52" r="14" fill="none" stroke="#4FB8A6" stroke-width="5"/>
-  <circle cx="32" cy="52" r="5" fill="#4FB8A6"/>
-  <!-- invalidation push -->
-  <path d="M58 36 L46 44" stroke="#E2604F" stroke-width="4" stroke-linecap="round"/>
-  <path d="M50 38 L46 44 L53 46" fill="none" stroke="#E2604F" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- redis, mirrored behind the local copy -->
+  <g mask="url(#m)">
+    <rect x="46" y="18" width="34" height="54" rx="6" fill="none" stroke="#E6E9EE" stroke-width="4"/>
+    <line x1="54" y1="32" x2="72" y2="32" stroke="#E6E9EE" stroke-width="4" stroke-linecap="round"/>
+    <line x1="54" y1="45" x2="72" y2="45" stroke="#E6E9EE" stroke-width="4" stroke-linecap="round"/>
+    <line x1="54" y1="58" x2="72" y2="58" stroke="#E6E9EE" stroke-width="4" stroke-linecap="round"/>
+  </g>
+  <!-- local mirror in front; one row just went stale -->
+  <rect x="22" y="34" width="34" height="54" rx="6" fill="none" stroke="#4FB8A6" stroke-width="4"/>
+  <line x1="30" y1="48" x2="48" y2="48" stroke="#4FB8A6" stroke-width="4" stroke-linecap="round"/>
+  <line x1="30" y1="61" x2="48" y2="61" stroke="#E2604F" stroke-width="4" stroke-linecap="round"/>
+  <line x1="30" y1="74" x2="48" y2="74" stroke="#4FB8A6" stroke-width="4" stroke-linecap="round"/>
 </svg>
