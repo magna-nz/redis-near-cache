@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Performance: the L1 hit path no longer takes a lock. Every read checked whether any master's tracking was lost with
+  `ConcurrentDictionary.IsEmpty`, which acquires all of the dictionary's locks when it is empty, i.e. always in the
+  steady state. The lost-endpoint set is now mutated under a private lock that publishes its size to a volatile
+  counter, and reads compare that counter to zero. The ordering rules are unchanged: a loss stops L1 being read or
+  populated before the flush, and an arm or removal re-enables it only after. On an Apple M4 Pro against a local Redis
+  7.4 (4 instances × 2 readers, 400 foreign writes/s, 2,000 keys) reads went from 2.43 M/s to 7.29 M/s, local-hit
+  latency p50 / p99 from 2.3 / 3.9 µs to 0.3 / 1.9 µs, and a single-threaded BenchmarkDotNet hit from 223 ns to
+  172 ns; 0 stale local entries after quiescence in every run. In the 20-instance, 160-reader benchmark matrix, reads
+  at 0 ms went from 1.35 M/s to 2.20 M/s, and the rate of reads served stale in the window between a foreign write's
+  acknowledgement and its invalidation being handled rose from 0.07 % to 0.33 % (stalest 76 ms → 105 ms), most likely
+  because readers that used to park on the lock now keep every core busy, so invalidations are handled later; the
+  4-instance run, with cores to spare, saw its stale-read rate fall (0.023 % → 0.014 %). The benchmark tables in
+  README.md, bench/RedisNearCache.Bench/README.md and the docs were refreshed from that run.
 - Benchmarks: a comparison of RedisNearCache with plain StackExchange.Redis, `IMemoryCache` with a TTL, `HybridCache`
   with a Redis L2, FusionCache with the Redis backplane, and `HybridCache` over the RedisNearCache adapter. The load
   test (`--load`) now takes `--contender` and `--write-mode foreign|api`, measures stale reads and their age against a
