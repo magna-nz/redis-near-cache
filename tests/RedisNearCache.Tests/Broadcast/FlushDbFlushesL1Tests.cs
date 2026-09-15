@@ -22,11 +22,14 @@ public class FlushDbFlushesL1Tests : IClassFixture<BroadcastStandaloneCacheFixtu
         // generated a self-invalidation before the key was ever read: poll rather than asserting the very next
         // GetAsync is cached synchronously (see the remarks on Broadcast.ExternalWriteEvictsTests).
         Assert.True(await TestHelpers.ReadUntilCachedAsync(_fx.Cache, key, "v1"), $"{key} was not cached after SetAsync+GetAsync.");
+        var flushesBefore = _fx.Cache.Statistics.Flushes;
 
         RedisCli.Standalone("FLUSHDB");
 
-        var evicted = await Poll.UntilAsync(() => !_fx.Cache.TryGetLocal<string>(key, out _));
-        Assert.True(evicted, "L1 entry was not evicted after FLUSHDB within the deadline.");
-        Assert.True(_fx.Cache.Statistics.Flushes >= 1);
+        // Wait for the flush itself, not merely for the key to leave L1: the SetAsync above echoes back as a push in
+        // Broadcast mode and can evict the key on its own before the FLUSHDB's null invalidation arrives.
+        var flushed = await Poll.UntilAsync(() => _fx.Cache.Statistics.Flushes > flushesBefore, TimeSpan.FromSeconds(10));
+        Assert.True(flushed, "FLUSHDB did not flush L1 (no null invalidation handled) within the deadline.");
+        Assert.False(_fx.Cache.TryGetLocal<string>(key, out _), "the key was still in L1 after the flush.");
     }
 }
