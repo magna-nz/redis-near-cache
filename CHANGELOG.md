@@ -2,38 +2,56 @@
 
 ## Unreleased
 
-- Feature: `RedisNearCacheOptions.TrackingMode`, an enum defaulting to `Redirect` (today's behaviour, unchanged),
-  with a new `Broadcast` value for Redis Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis
-  Software), whose proxy rejects tracking on RESP2 (`ERR Client tracking is not supported when using RESP2`) and
-  rejects `REDIRECT` under RESP3, and whose `CLIENT LIST` does not show our subscriber connection, so the redirect
-  design cannot arm there. In `Broadcast`, RedisNearCache opens one small RESP3 connection of its own per master
-  (TLS and auth taken from the same connection settings as the private multiplexer, client name `<private client
-  name>-bcast`), sends `HELLO 3` and `CLIENT TRACKING ON BCAST PREFIX <p>` for every entry of `KeyPrefixes`, and
-  receives an invalidation push for every write or delete under those prefixes, whether or not this instance holds
-  the key; `FLUSHDB`/`FLUSHALL` arrive as the null invalidation and flush L1. Reads still go through the private
-  multiplexer, unchanged. Replicas are not pre-armed in this mode. If the broadcast connection dies, the cache goes
-  pass-through for that endpoint, reconnects with the same fast-then-5-second retry ladder as `Redirect`, re-arms,
-  and flushes L1, exactly as the existing "any reconnect = re-arm then flush" rule says; the private multiplexer's
-  `ConnectionFailed` for a master is treated as loss of that node's broadcast connection too, the tracking handshake
-  on a new socket has a `SyncTimeout` deadline, a killed cluster master is retired by the same `CLUSTER NODES` probe
-  as `Redirect`, and `CLIENT TRACKINGINFO` is used to verify the arm where the server has it (6.2+) and assumed
-  where it does not. The `CLIENT CACHING NO`
-  transaction for keys outside `KeyPrefixes` is skipped in `Broadcast`, since the reading connection is not tracked
-  and a plain `GET` is already untracked. `NOLOOP` does not apply (the broadcast connection never writes), so this
-  instance's own `SetAsync`/`RemoveAsync` echo back as pushes: harmless for coherence, but a read issued right after
-  a write can be discarded once by the in-flight rule and is cached by the read after it. Costs versus `Redirect`: `KeyPrefixes` should be set (empty means every
-  write in the database is broadcast to this client, logged once as a warning), invalidation volume scales with
-  the write rate under the prefixes rather than with what L1 holds, and the server's per-key tracking table is not
-  used, so the Enterprise `tracking_table_max_keys` limit does not apply. Also works on OSS Redis 6+ and Valkey,
-  but `Redirect` stays the default there because it only pushes for keys this instance actually read. The broadcast
-  connection reads the current user and password from the cloned connection settings at every connect, so an Entra ID
-  token rotated by `Microsoft.Azure.StackExchangeRedis` is used on reconnect; a live connection is not yet re-authenticated
-  in place, so it is closed at token expiry and re-armed with an L1 flush once per token lifetime. In `Redirect`
-  mode, the startup error raised when no subscriber connection is found on an endpoint now suggests setting
-  `TrackingMode.Broadcast` in case the endpoint is a Redis Enterprise-based service. Covered by two new suites:
-  `RedisNearCache.Tests.Broadcast` (Broadcast mode against OSS Redis, runs in every integration job) and
-  `RedisNearCache.Tests.Enterprise` (runs against `enterprise-up.sh`'s container in a new CI job, "integration on
-  Redis Enterprise (Redis Software in Docker)").
+- Feature: Entra ID (`Microsoft.Azure.StackExchangeRedis`) token rotation is honoured in `TrackingMode.Broadcast`
+  while a broadcast connection is live, not just on its next reconnect. RedisNearCache clones the caller's
+  `ConfigurationOptions`, and the clone shares the extension's token provider: StackExchange.Redis resolves
+  `User`/`Password` through `ConfigurationOptions.Defaults`, which `Clone()` copies by reference. The private
+  multiplexer is created from that same provider, so the extension registers it through its `AfterConnectAsync` hook
+  (the hook was seen to fire for a clone-built multiplexer on StackExchange.Redis 3.2.0; the re-authentication itself
+  is the extension's documented behaviour) and re-authenticates it exactly as it does any multiplexer it manages;
+  every broadcast connection reads the current object id and token when it connects; and a live broadcast connection
+  now compares its current credentials against the provider on every keepalive tick (10 s, up to about 15 s if a
+  `PING` is in flight) and, when they changed, re-authenticates in place with `AUTH <objectId> <token>` — no
+  `TrackingLost`, no L1 flush, tracking untouched. If the server rejects the rotated credential the connection keeps
+  the one it has (a failed `AUTH` leaves a Redis connection's authentication unchanged) and stays armed, the rejected
+  pair is not retried until the provider yields another, and a connection the server closes at token expiry is
+  re-armed with an L1 flush like any reconnect. The same mechanism generalises to any rotating credential supplied
+  through a custom `DefaultOptionsProvider` subclass whose `User`/`Password` overrides change (ACL password rotation,
+  for example); values set directly on `ConfigurationOptions.User`/ `Password` are static and shadow the provider, so
+  use the provider for credentials that rotate. Covered by three new integration tests in `CredentialRotationTests`
+  and two unit tests in `CredentialProviderCloneTests` (Broadcast suite, CI, OSS Redis with ACL users rotated under a
+  live cache): in-place re-authentication keeps the client id, tracking and L1; a reconnect after rotation uses the
+  current credentials; and a rejected credential keeps the socket armed until a good one arrives.
+- Feature: `RedisNearCacheOptions.TrackingMode`, an enum defaulting to `Redirect` (today's behaviour, unchanged), with
+  a new `Broadcast` value for Redis Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis Software),
+  whose proxy rejects tracking on RESP2 (`ERR Client tracking is not supported when using RESP2`) and rejects
+  `REDIRECT` under RESP3, and whose `CLIENT LIST` does not show our subscriber connection, so the redirect design
+  cannot arm there. In `Broadcast`, RedisNearCache opens one small RESP3 connection of its own per master (TLS and
+  auth taken from the same connection settings as the private multiplexer, client name `<private client name>-bcast`),
+  sends `HELLO 3` and `CLIENT TRACKING ON BCAST PREFIX <p>` for every entry of `KeyPrefixes`, and receives an
+  invalidation push for every write or delete under those prefixes, whether or not this instance holds the key;
+  `FLUSHDB`/`FLUSHALL` arrive as the null invalidation and flush L1. Reads still go through the private multiplexer,
+  unchanged. Replicas are not pre-armed in this mode. If the broadcast connection dies, the cache goes pass-through
+  for that endpoint, reconnects with the same fast-then-5-second retry ladder as `Redirect`, re-arms, and flushes L1,
+  exactly as the existing "any reconnect = re-arm then flush" rule says; the private multiplexer's `ConnectionFailed`
+  for a master is treated as loss of that node's broadcast connection too, the tracking handshake on a new socket has
+  a `SyncTimeout` deadline, a killed cluster master is retired by the same `CLUSTER NODES` probe as `Redirect`, and
+  `CLIENT TRACKINGINFO` is used to verify the arm where the server has it (6.2+) and assumed where it does not. The
+  `CLIENT CACHING NO` transaction for keys outside `KeyPrefixes` is skipped in `Broadcast`, since the reading
+  connection is not tracked and a plain `GET` is already untracked. `NOLOOP` does not apply (the broadcast connection
+  never writes), so this instance's own `SetAsync`/`RemoveAsync` echo back as pushes: harmless for coherence, but a
+  read issued right after a write can be discarded once by the in-flight rule and is cached by the read after it.
+  Costs versus `Redirect`: `KeyPrefixes` should be set (empty means every write in the database is broadcast to this
+  client, logged once as a warning), invalidation volume scales with the write rate under the prefixes rather than
+  with what L1 holds, and the server's per-key tracking table is not used, so the Enterprise `tracking_table_max_keys`
+  limit does not apply. Also works on OSS Redis 6+ and Valkey, but `Redirect` stays the default there because it only
+  pushes for keys this instance actually read. The broadcast connection reads the current user and password from the
+  cloned connection settings at every connect, and a live connection is now re-authenticated in place when they rotate
+  — see the Entra ID feature bullet above. In `Redirect` mode, the startup error raised when no subscriber connection
+  is found on an endpoint now suggests setting `TrackingMode.Broadcast` in case the endpoint is a Redis
+  Enterprise-based service. Covered by two new suites: `RedisNearCache.Tests.Broadcast` (Broadcast mode against OSS
+  Redis, runs in every integration job) and `RedisNearCache.Tests.Enterprise` (runs against `enterprise-up.sh`'s
+  container in a new CI job, "integration on Redis Enterprise (Redis Software in Docker)").
 - Infra: `enterprise-up.sh` brings up a single-node Redis Software (Redis Enterprise) container behind its proxy on
   `localhost:12000`, headless (`rladmin cluster create` + REST API), as the local stand-in for Azure Managed Redis,
   Redis Cloud and Redis Software. Not part of `up.sh` (boots in ~4 minutes, Redis documents the image as dev/test

@@ -42,6 +42,21 @@ namespace RedisNearCache.Tracking.Broadcast;
 /// reconnect, then <see cref="Armed"/> with <see cref="ArmReason.PushConnectionRestored"/>. Replicas are never
 /// pre-armed - there is no redirect target to pre-point - so <see cref="ReplicaRedirectTargets"/> is always empty.
 /// </para>
+/// <para>
+/// Credentials are read from the cloned <see cref="ConfigurationOptions"/> every time they are needed, never
+/// captured once. That matters for services whose credential is short-lived: Microsoft.Azure.StackExchangeRedis
+/// authenticates with a Microsoft Entra token by installing a <see cref="ConfigurationOptions.Defaults"/> provider
+/// whose <c>User</c>/<c>Password</c> return the current token and refresh it before expiry, and
+/// <c>ConfigurationOptions.Clone</c> carries that provider over by reference. So a reconnecting broadcast socket
+/// authenticates with the token that is current at that moment, and a live one is re-authenticated in place -
+/// a plain <c>AUTH</c>, which keeps the connection's <c>CLIENT TRACKING</c> state, not a second <c>HELLO</c> -
+/// within one keepalive tick of a rotation (<see cref="KeepAliveInterval"/>, plus a <c>PING</c> round trip if one is
+/// in flight), so the server never closes it at expiry and no
+/// <see cref="TrackingLost"/>/flush cycle is paid per token lifetime. A credential the server rejects is kept out of
+/// the way: the socket stays armed on the one it has, and the rotation is retried when the configuration yields another. The private multiplexer needs nothing from
+/// this tracker: it is built from the same options, so the provider sees it through <c>AfterConnectAsync</c> and
+/// re-authenticates it by its own mechanism (the Azure extension does; a hand-written provider must too).
+/// </para>
 /// </remarks>
 internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
 {
@@ -94,6 +109,9 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
     /// </summary>
     private readonly ConcurrentDictionary<EndPoint, int> _arming = new();
 
+    /// <summary>Total in-place re-authentications across every socket this tracker has ever armed.</summary>
+    private long _reauthentications;
+
     private readonly CancellationTokenSource _shutdown = new();
     private MasterProbe? _probe;
     private readonly object _lifecycle = new();
@@ -132,6 +150,13 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
 
     /// <summary>The prefixes actually sent to <c>CLIENT TRACKING ... BCAST</c>; empty means the whole keyspace.</summary>
     internal IReadOnlyList<string> Prefixes => _prefixes;
+
+    /// <summary>
+    /// How many times a live broadcast socket has been re-authenticated in place after the configuration handed
+    /// out a rotated credential. Cumulative over every socket this tracker has armed, and never reset, so a socket
+    /// that is replaced does not take its count with it.
+    /// </summary>
+    internal long Reauthentications => Interlocked.Read(ref _reauthentications);
 
     /// <inheritdoc />
     /// <remarks>
@@ -365,12 +390,18 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
         var token = handshake.Token;
         try
         {
+            // Read once, here, and remembered on the socket: the configuration can hand out a different credential
+            // on every read (a rotating Defaults provider), and the watchdog compares against what was actually
+            // sent, not against whatever the provider happens to return later.
+            var credentials = new BroadcastCredentials(_configuration.User, _configuration.Password);
+            socket.Authenticated = credentials;
+
             var hello = new List<string> { "HELLO", "3" };
-            if (_configuration.Password is { Length: > 0 } password)
+            if (credentials.HasPassword)
             {
                 hello.Add("AUTH");
-                hello.Add(_configuration.User is { Length: > 0 } user ? user : "default");
-                hello.Add(password);
+                hello.Add(credentials.User);
+                hello.Add(credentials.Password!);
             }
 
             hello.Add("SETNAME");
@@ -555,6 +586,12 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
     /// within <see cref="KeepAliveTimeout"/>, or when the write fails. Tracking died with it, so the endpoint is
     /// announced lost and re-armed on a new socket.
     /// </summary>
+    /// <remarks>
+    /// The same tick also carries credential rotation: the configuration's current user and password are compared
+    /// against what this socket authenticated with at the start of each iteration, before the <c>PING</c>, and no
+    /// timer of its own is involved - so rotated credentials reach a live socket within
+    /// <see cref="KeepAliveInterval"/>. A rotation the server rejects keeps the socket armed on its current credential; only the <c>PING</c> decides liveness.
+    /// </remarks>
     private void WatchSocket(EndPoint endPoint, Resp3Connection socket)
     {
         if (!TryGetShutdownToken(out var token)) return;
@@ -574,27 +611,18 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
                         break;
                     }
 
-                    using var pingTimeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-                    pingTimeout.CancelAfter(KeepAliveTimeout);
-                    try
-                    {
-                        await socket.ExecuteAsync(pingTimeout.Token, "PING").ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException) when (token.IsCancellationRequested)
-                    {
-                        return;
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        cause = $"it did not answer PING within {KeepAliveTimeout.TotalSeconds:0.#} s";
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogDebug(ex, "RedisNearCache keepalive PING failed on the broadcast socket to {EndPoint}", endPoint);
-                        cause = "its keepalive PING failed";
-                        break;
-                    }
+                    // Before the PING, so a socket whose credential expired mid-interval is re-authenticated on the
+                    // same tick that would otherwise find it closed by the server. Never fatal by itself: the PING
+                    // that follows is what decides whether the socket is alive.
+                    await ReauthenticateIfRotatedAsync(endPoint, socket, token).ConfigureAwait(false);
+
+                    var (outcome, error) = await ExecuteBoundedAsync(socket, token, "PING").ConfigureAwait(false);
+                    if (outcome == BoundedOutcome.Ok) continue;
+                    if (error is not null) _logger.LogDebug(error, "RedisNearCache keepalive PING failed on the broadcast socket to {EndPoint}", endPoint);
+                    cause = outcome == BoundedOutcome.TimedOut
+                        ? $"it did not answer PING within {KeepAliveTimeout.TotalSeconds:0.#} s"
+                        : "its keepalive PING failed";
+                    break;
                 }
             }
             catch (OperationCanceledException)
@@ -616,6 +644,102 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
                 _logger.LogWarning(ex, "RedisNearCache failed to handle the loss of the broadcast socket to {EndPoint}", endPoint);
             }
         }, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Re-authenticates one live socket in place when the configuration now yields a credential different from the
+    /// one it authenticated with. A no-op, and no round trip, in the common case where nothing rotated.
+    /// </summary>
+    /// <remarks>
+    /// A plain <c>AUTH</c>, never a second <c>HELLO</c>: re-authenticating an already authenticated Redis connection
+    /// leaves its <c>CLIENT TRACKING</c> state alone (<c>CLIENT TRACKINGINFO</c> still reports <c>on</c>, <c>bcast</c>
+    /// and the same prefixes afterwards), so the socket stays armed across a rotation and no invalidation is missed.
+    /// Nor is a failure fatal: a rejected <c>AUTH</c> leaves the connection authenticated as before, so the socket keeps
+    /// working and stays armed, the rejected pair is remembered so it is not retried every tick, and the rotation is
+    /// tried again as soon as the configuration yields something else. A closed socket is left to the keepalive
+    /// <c>PING</c> to diagnose, and the server closing the connection at credential expiry is an ordinary socket death.
+    /// The configuration's <c>User</c> and <c>Password</c> are two reads, not one atomic pair: a provider rotating both
+    /// could in principle be observed mid-update, which costs one rejected attempt and a retry on the next tick.
+    /// </remarks>
+    private async Task ReauthenticateIfRotatedAsync(EndPoint endPoint, Resp3Connection socket, CancellationToken token)
+    {
+        var current = new BroadcastCredentials(_configuration.User, _configuration.Password);
+        if (current == socket.Authenticated || current == socket.Rejected) return;
+
+        if (!current.HasPassword)
+        {
+            // A live connection cannot be de-authenticated, and a rotation to "no password" is not something a
+            // token provider does; keep the credential the socket has, and say so once.
+            if (socket.Authenticated?.HasPassword == true)
+                _logger.LogWarning("RedisNearCache: the configuration now yields no password for the broadcast socket to {EndPoint}; keeping the credential it authenticated with", endPoint);
+            socket.Rejected = current;
+            return;
+        }
+
+        var (outcome, error) = await ExecuteBoundedAsync(socket, token, "AUTH", current.User, current.Password!).ConfigureAwait(false);
+        switch (outcome)
+        {
+            case BoundedOutcome.Ok:
+                socket.Authenticated = current;
+                socket.Rejected = null;
+                Interlocked.Increment(ref _reauthentications);
+                _logger.LogInformation("RedisNearCache re-authenticated the broadcast socket to {EndPoint} with rotated credentials for user {User}", endPoint, current.User);
+                break;
+            case BoundedOutcome.Rejected:
+                socket.Rejected = current;
+                _logger.LogWarning(error, "RedisNearCache: the server rejected the rotated credentials for user {User} on the broadcast socket to {EndPoint}; keeping the credential it authenticated with until the configuration yields another", current.User, endPoint);
+                break;
+            case BoundedOutcome.TimedOut:
+                // Not remembered as rejected: a slow reply (a push backlog on the read loop, say) is worth another try.
+                _logger.LogWarning("RedisNearCache did not get an answer to AUTH on the broadcast socket to {EndPoint} within {Timeout} s while applying rotated credentials for user {User}; will retry", endPoint, KeepAliveTimeout.TotalSeconds, current.User);
+                break;
+            default:
+                _logger.LogDebug(error, "RedisNearCache could not send AUTH on the broadcast socket to {EndPoint}: it is closed; the keepalive decides its fate", endPoint);
+                break;
+        }
+    }
+
+    private enum BoundedOutcome
+    {
+        /// <summary>The command was answered without error.</summary>
+        Ok,
+        /// <summary>The server answered with an error reply.</summary>
+        Rejected,
+        /// <summary>No reply within <see cref="KeepAliveTimeout"/>.</summary>
+        TimedOut,
+        /// <summary>The socket is closed or the write failed.</summary>
+        Closed,
+    }
+
+    /// <summary>
+    /// Sends one command on an armed socket with the keepalive deadline and classifies the result instead of throwing,
+    /// so the <c>PING</c> and <c>AUTH</c> paths share one timeout and one reading of the failure. Only shutdown escapes.
+    /// </summary>
+    private async Task<(BoundedOutcome Outcome, Exception? Error)> ExecuteBoundedAsync(Resp3Connection socket, CancellationToken token, params string[] args)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        deadline.CancelAfter(KeepAliveTimeout);
+        try
+        {
+            await socket.ExecuteAsync(deadline.Token, args).ConfigureAwait(false);
+            return (BoundedOutcome.Ok, null);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            throw; // shutting down; the watchdog's own handler returns
+        }
+        catch (OperationCanceledException ex)
+        {
+            return (BoundedOutcome.TimedOut, ex);
+        }
+        catch (RedisNearCacheTrackingException ex)
+        {
+            return (BoundedOutcome.Rejected, ex); // the server's error reply, with its message
+        }
+        catch (Exception ex)
+        {
+            return (BoundedOutcome.Closed, ex); // ObjectDisposedException, the connection's own closed-socket error, IO
+        }
     }
 
     /// <summary>
