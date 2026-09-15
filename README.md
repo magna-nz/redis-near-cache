@@ -97,7 +97,8 @@ a 10 s TTL.
 - **Only RedisNearCache stays fresh when something else writes.** The TTL caches served most reads stale, up to the
   whole TTL; FusionCache's backplane only carries writes made through FusionCache.
 - **Freshness costs server traffic.** Every write invalidates the key on every instance tracking it, and each re-reads
-  it on next access: more commands than a TTL cache, still fewer than no cache.
+  it on next access, so its command rate follows the write rate, not the read rate: well above a TTL cache, and below
+  plain StackExchange.Redis only while round trips are short (37 % fewer at 0 ms, 51 % more at 2 ms injected).
 - **In-process TTL caches read faster.** They return a stored object; RedisNearCache decodes bytes and checks
   coherence on every hit (223 ns vs 41 ns per hit in BenchmarkDotNet). A cold read costs about what a plain `GET` does.
 

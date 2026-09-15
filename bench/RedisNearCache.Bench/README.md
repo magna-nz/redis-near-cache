@@ -69,8 +69,10 @@ What that says:
   served 0.07 % of reads stale, the stalest 76 ms old, and held 0 stale entries after writes stopped.
 - **It costs server traffic that a TTL cache doesn't spend.** Every write invalidates the key on every instance that
   tracks it (19 instances per write here), and each of those re-reads it on the next access (`GET` plus a pipelined
-  `PTTL`). That is 104,596 commands/s against 22,420 for `IMemoryCache` with a 10 s TTL, and still 37 % fewer than plain
-  StackExchange.Redis while serving 8.2x the reads.
+  `PTTL`). That is 104,596 commands/s against 22,420 for `IMemoryCache` with a 10 s TTL. The rate follows writes, not
+  reads: at 0 ms it is 37 % fewer commands than plain StackExchange.Redis while serving 8.2x the reads, but at 2 ms
+  injected latency, where plain StackExchange.Redis readers slow to 64,853 commands/s, RedisNearCache sends 98,145
+  (51 % more) while serving 13x the reads.
 - **In-process TTL caches read faster.** `IMemoryCache` and `HybridCache` hand back a stored object reference (about
   40–50 ns per hit); RedisNearCache decodes the value from its stored bytes and takes a lock-protected coherence check
   on every hit (223 ns for a 1 KB string, see [Findings](#findings)). Under 160 spinning readers that shows up as
