@@ -55,7 +55,7 @@ public class NodeRestartClusterTests : IClassFixture<ClusterCacheFixture>
         RestartNode(RestartPort);
 
         var clusterBack = await Poll.UntilAsync(
-            () => ClusterCacheFixture.MasterPorts.All(ClusterStateOk),
+            () => ClusterCacheFixture.MasterPorts.All(ClusterNodes.ClusterStateOk),
             TimeSpan.FromSeconds(30), TimeSpan.FromMilliseconds(200));
         Assert.True(clusterBack, "the cluster never returned to cluster_state:ok after the node restart.");
 
@@ -109,46 +109,10 @@ public class NodeRestartClusterTests : IClassFixture<ClusterCacheFixture>
         // SHUTDOWN legitimately drops the connection mid-command, so a non-zero exit here is not a failure.
         DockerExec.Run(RedisCli.ClusterContainer, "redis-cli", "-p", port.ToString(), "SHUTDOWN", "NOSAVE");
 
-        var down = SpinUntil(() => !PingOk(port), TimeSpan.FromSeconds(15));
+        var down = ClusterNodes.SpinUntil(() => !ClusterNodes.PingOk(port), TimeSpan.FromSeconds(15));
         Assert.True(down, $"node {port} did not shut down.");
 
-        var started = DockerExec.Run(
-            RedisCli.ClusterContainer,
-            "redis-server",
-            "--port", port.ToString(),
-            "--cluster-enabled", "yes",
-            "--cluster-config-file", $"nodes-{port}.conf",
-            "--cluster-announce-ip", "127.0.0.1",
-            "--cluster-announce-port", port.ToString(),
-            "--cluster-announce-bus-port", (port + 10_000).ToString(),
-            "--save", "",
-            "--appendonly", "no",
-            "--daemonize", "yes");
-
-        Assert.True(started.ExitCode == 0, $"could not restart node {port}: {started.StdErr} {started.StdOut}");
-    }
-
-    private static bool SpinUntil(Func<bool> condition, TimeSpan timeout)
-    {
-        var deadline = DateTime.UtcNow + timeout;
-        while (DateTime.UtcNow < deadline)
-        {
-            if (condition()) return true;
-            Thread.Sleep(100);
-        }
-        return condition();
-    }
-
-    private static bool PingOk(int port)
-    {
-        var r = DockerExec.Run(RedisCli.ClusterContainer, "redis-cli", "-p", port.ToString(), "PING");
-        return r.ExitCode == 0 && r.StdOut.Contains("PONG", StringComparison.Ordinal);
-    }
-
-    private static bool ClusterStateOk(int port)
-    {
-        var r = DockerExec.Run(RedisCli.ClusterContainer, "redis-cli", "-p", port.ToString(), "CLUSTER", "INFO");
-        return r.ExitCode == 0 && r.StdOut.Contains("cluster_state:ok", StringComparison.Ordinal);
+        ClusterNodes.StartNode(port);
     }
 
     private static bool SafeIsConnected(IConnectionMultiplexer mux, EndPoint endpoint)

@@ -19,13 +19,14 @@ internal sealed class ForeignClient : IAsyncDisposable
 
     public IDatabase Db => Multiplexer.GetDatabase();
 
-    public static async Task<ForeignClient> ConnectAsync(string connectionString)
+    public static async Task<ForeignClient> ConnectAsync(string connectionString, bool allowAdmin = false)
     {
         var cfg = ConfigurationOptions.Parse(connectionString);
         cfg.ClientName = $"chaos-foreign-{Guid.NewGuid():N}";
         cfg.AbortOnConnectFail = false;
         cfg.ConnectRetry = 5;
         cfg.ConnectTimeout = 5_000;
+        if (allowAdmin) cfg.AllowAdmin = true;
         var mux = await ConnectionMultiplexer.ConnectAsync(cfg);
         return new ForeignClient(mux);
     }

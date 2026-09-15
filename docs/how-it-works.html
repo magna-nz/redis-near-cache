@@ -371,6 +371,32 @@ flowchart LR
     <figcaption>Ids from the spike's cluster run: two nodes both handed out id 7, which is why an id is only meaningful together with its node.</figcaption>
   </figure>
 
+  <h2>Broadcast mode (Redis Enterprise, Azure Managed Redis, Redis Cloud)</h2>
+  <p>The redirect design above cannot arm behind the proxy that fronts Redis Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis Software, databases 7.4+). It rejects tracking on RESP2, rejects <code>REDIRECT</code> under RESP3, and does not show the subscriber connection in <code>CLIENT LIST</code>. What it does accept is RESP3 broadcast tracking on the connection that asks for it, and that is what <code>TrackingMode.Broadcast</code> uses.</p>
+  <p>In that mode RedisNearCache opens one small RESP3 connection of its own per master, sends <code>HELLO 3</code>, then <code>CLIENT TRACKING ON BCAST PREFIX &lt;p&gt;</code> for every entry of <code>KeyPrefixes</code>. From then on the server pushes an invalidation for every write or delete under those prefixes, from any client, whether or not this instance has read the key; <code>FLUSHDB</code> and <code>FLUSHALL</code> flush L1. Reads still go through the private RESP2 multiplexer, untracked.</p>
+  <figure>
+    <div class="diagram">
+<pre class="mermaid">
+flowchart LR
+    subgraph P[your process]
+      direction TB
+      L1[(L1)]
+      I[private multiplexer<br/>RESP2 · reads]
+      B[broadcast connection<br/>RESP3 · one per master]
+    end
+    W[any writer]
+    M[(master behind<br/>the Enterprise proxy)]
+    I -- "GET product:7 (untracked)" --> M
+    B -- "HELLO 3, then CLIENT TRACKING ON BCAST PREFIX product:" --> M
+    W -- "SET product:7" --> M
+    M -. "invalidate product:7" .-> B
+    B -. "evict" .-> L1
+</pre>
+    </div>
+    <figcaption>The push arrives for any write under a prefix, not only for keys this instance read, so set <code>KeyPrefixes</code>: invalidation volume follows the write rate under them rather than what L1 holds.</figcaption>
+  </figure>
+  <p>The reconnect rule does not change. If a broadcast connection is lost, that master goes pass-through; the connection reconnects, re-arms, and L1 is flushed, exactly as for the interactive and subscriber pair in <code>Redirect</code> mode. <code>Broadcast</code> also works on Redis 6+ and Valkey, but <code>Redirect</code> stays the default there, because it only pushes for keys this instance actually read.</p>
+
   <h2>What was ruled out, and why</h2>
   <table>
     <thead><tr><th>Option</th><th>Finding</th></tr></thead>
@@ -379,7 +405,8 @@ flowchart LR
       <tr><td>RESP3 push messages (the 3.x default)</td><td>StackExchange.Redis collapses to one connection and drops the <code>invalidate</code> pushes. Server says tracking is on; zero messages arrive.</td></tr>
       <tr><td>Lua to bypass admin mode</td><td><code>CLIENT TRACKING</code> is flagged <code>noscript</code>.</td></tr>
       <tr><td><code>OPTIN</code> / <code>CLIENT CACHING YES</code></td><td>Would need to decide, before every read, whether to track it - before the library knows whether the key is cacheable. Ruled out in favour of <code>OPTOUT</code>: the connection is armed <code>OPTOUT</code>, and a read outside <code>KeyPrefixes</code> is preceded by <code>CLIENT CACHING NO</code> inside a <code>MULTI</code>/<code>EXEC</code>, which keeps the two commands adjacent on the wire even on a multiplexed connection.</td></tr>
-      <tr><td>Raw-socket sidecar per node</td><td>Works, kept as fallback. It re-implements TLS, auth, topology and reconnects that the library already provides.</td></tr>
+      <tr><td>Raw-socket sidecar per node</td><td>Superseded: this is now built as <code>TrackingMode.Broadcast</code>, an own RESP3 connection per master armed with <code>CLIENT TRACKING ON BCAST PREFIX</code>, for Redis Enterprise-based services, whose proxy rejects tracking on RESP2 and rejects <code>REDIRECT</code> under RESP3.</td></tr>
+      <tr><td>Redis Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis Software)</td><td>Their proxy hides the subscriber connection from <code>CLIENT LIST</code> and rejects <code>REDIRECT</code>, so the redirect design above cannot arm there; supported instead through <code>TrackingMode.Broadcast</code>.</td></tr>
       <tr><td>Garnet</td><td>Does not implement <code>CLIENT TRACKING</code>. Redis 6+ and Valkey do.</td></tr>
     </tbody>
   </table>

@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 480" width="1000" height="480" role="img" aria-label="Broadcast mode: your code reads through RedisNearCache, which serves from L1 or reads over the private multiplexer; a separate RESP3 broadcast connection per master is armed with CLIENT TRACKING ON BCAST PREFIX, and the Redis Enterprise proxy pushes an invalidation to it for every write under those prefixes, which evicts from L1; your own multiplexer and any other writer send writes to Redis directly.">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3E5470"/></marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#C0392B"/></marker>
+    <style>
+      .t { font-family: Inter, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1B2431; font-size: 13px; }
+      .b { font-weight: 600; }
+      .m { fill: #5B6B7F; font-size: 12px; }
+      .code { font-family: "JetBrains Mono", Menlo, Consolas, monospace; font-size: 11.5px; fill: #1B2431; }
+      .lbl { font-family: Inter, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12px; fill: #3E5470; paint-order: stroke; stroke: #F6F7F9; stroke-width: 6px; stroke-linejoin: round; }
+      .lbl-red { fill: #C0392B; }
+      .box { fill: #FFFFFF; stroke: #C9D1DB; stroke-width: 1.5; }
+      .flow { stroke: #3E5470; stroke-width: 1.8; fill: none; }
+      .red { stroke: #C0392B; stroke-width: 1.8; fill: none; }
+    </style>
+  </defs>
+
+  <!-- card background so the figure reads on light and dark pages alike -->
+  <rect x="0" y="0" width="1000" height="480" rx="12" fill="#F6F7F9"/>
+
+  <!-- process boundary -->
+  <rect x="24" y="24" width="640" height="420" rx="10" fill="none" stroke="#9AA7B6" stroke-width="1.5" stroke-dasharray="7 5"/>
+  <text x="40" y="48" class="t m" style="letter-spacing:0.08em">YOUR PROCESS</text>
+
+  <!-- your code -->
+  <rect x="48" y="96" width="150" height="52" rx="6" class="box"/>
+  <text x="123" y="127" class="t b" text-anchor="middle">Your code</text>
+
+  <!-- facade -->
+  <rect x="250" y="76" width="250" height="160" rx="8" class="box"/>
+  <text x="375" y="102" class="t b" text-anchor="middle">IRedisNearCache</text>
+  <rect x="270" y="118" width="210" height="42" rx="6" fill="#E6F4F1" stroke="#1F7A6D" stroke-width="1.5"/>
+  <text x="375" y="144" class="t b" text-anchor="middle" fill="#1F7A6D">L1 · MemoryCache</text>
+  <rect x="270" y="172" width="210" height="42" rx="6" class="box"/>
+  <text x="375" y="198" class="t" text-anchor="middle">in-flight tracker</text>
+
+  <!-- private multiplexer -->
+  <rect x="250" y="262" width="250" height="100" rx="8" class="box"/>
+  <text x="375" y="284" class="t b" text-anchor="middle">Private multiplexer</text>
+  <text x="375" y="302" class="t m" text-anchor="middle">RESP2 · admin · own client name</text>
+  <rect x="270" y="314" width="210" height="36" rx="6" class="box"/>
+  <text x="375" y="337" class="t" text-anchor="middle">interactive · reads</text>
+
+  <!-- broadcast connection -->
+  <rect x="250" y="372" width="250" height="60" rx="8" fill="#FBEAE7" stroke="#C0392B" stroke-width="1.5"/>
+  <text x="375" y="396" class="t b" text-anchor="middle" fill="#C0392B">broadcast connection</text>
+  <text x="375" y="416" class="t m" text-anchor="middle">RESP3 · own socket · one per master</text>
+
+  <!-- your multiplexer -->
+  <rect x="48" y="330" width="150" height="64" rx="6" class="box"/>
+  <text x="123" y="356" class="t b" text-anchor="middle">Your multiplexer</text>
+  <text x="123" y="376" class="t m" text-anchor="middle">untouched</text>
+
+  <!-- redis -->
+  <rect x="740" y="262" width="240" height="170" rx="8" fill="#FFFFFF" stroke="#3E5470" stroke-width="2"/>
+  <text x="860" y="288" class="t b" text-anchor="middle">Redis Enterprise proxy</text>
+  <text x="860" y="308" class="t m" text-anchor="middle">Azure Managed Redis · Redis Cloud</text>
+  <text x="860" y="326" class="t m" text-anchor="middle">Redis Software · databases 7.4+</text>
+  <text x="860" y="354" class="t m" text-anchor="middle">armed by the broadcast connection</text>
+  <text x="860" y="380" class="code" text-anchor="middle">HELLO 3</text>
+  <text x="860" y="398" class="code" text-anchor="middle">CLIENT TRACKING ON</text>
+  <text x="860" y="416" class="code" text-anchor="middle">BCAST PREFIX product:</text>
+
+  <!-- other writers -->
+  <rect x="755" y="96" width="210" height="64" rx="6" class="box"/>
+  <text x="860" y="122" class="t b" text-anchor="middle">Other writers</text>
+  <text x="860" y="144" class="t m" text-anchor="middle">redis-cli · Java · Go · Lua</text>
+
+  <!-- flows -->
+  <line x1="198" y1="122" x2="248" y2="122" class="flow" marker-end="url(#arrow)"/>
+  <text x="223" y="113" class="lbl" text-anchor="middle">GetAsync</text>
+
+  <line x1="375" y1="236" x2="375" y2="260" class="flow" marker-end="url(#arrow)"/>
+  <text x="386" y="253" class="lbl">GET on miss</text>
+
+  <line x1="480" y1="332" x2="738" y2="332" class="flow" marker-end="url(#arrow)"/>
+  <text x="609" y="324" class="lbl" text-anchor="middle">GET key · read is not tracked</text>
+
+  <line x1="738" y1="402" x2="502" y2="402" class="red" marker-end="url(#arrow-red)"/>
+  <text x="619" y="393" class="lbl lbl-red" text-anchor="middle">every write under a prefix</text>
+  <text x="619" y="421" class="lbl lbl-red" text-anchor="middle">invalidate [key] · RESP3 push</text>
+
+  <path d="M250 402 L232 402 L232 139 L268 139" class="red" marker-end="url(#arrow-red)"/>
+  <text x="224" y="273" class="lbl lbl-red" text-anchor="end">evict</text>
+
+  <path d="M123 394 L123 452 L860 452 L860 436" class="flow" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+  <text x="494" y="470" class="lbl" text-anchor="middle">writes from your multiplexer go straight to Redis and are pushed like any other writer's</text>
+
+  <line x1="860" y1="160" x2="860" y2="260" class="flow" marker-end="url(#arrow)"/>
+  <text x="869" y="214" class="lbl">SET product:7</text>
+</svg>
