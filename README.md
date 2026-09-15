@@ -77,34 +77,26 @@ services.AddRedisNearCache("localhost:6379");
 services.AddRedisNearCacheHybridCache();               // HybridCache's own L1 is disabled; ours is the coherent one
 ```
 
-## What you get
+## Performance
 
-Compared with the caches you would otherwise reach for, on one machine against Redis 7.4 in Docker: 20 application
-instances, 160 readers, and 2,000 writes per second made by another client straight to Redis. The TTL-based caches use
-a 10 s TTL.
+20 app instances, 160 readers, and 2,000 writes/s from another service straight to Redis. Redis 7.4 on one machine,
+TTL caches set to 10 s.
 
 <!-- HEADLINE -->
-| | Plain StackExchange.Redis | `IMemoryCache` + 10 s TTL | `HybridCache` + Redis L2 | FusionCache + backplane | **RedisNearCache** |
-|---|---:|---:|---:|---:|---:|
-| Reads/s | 164,427 | 14.51 M | 25.99 M | 6.42 M | 2.20 M |
-| Server commands/s | 166,427 | 22,322 | 45,448 | 37,315 | 110,426 |
-| Reads served stale | 0 | 83.1 % | 84.8 % | 85.0 % | 0.33 % |
-| Stalest read | – | 10.0 s | 10.0 s | 10.0 s | 105 ms |
-| Stale local entries after writes stop | – | 792 | 605 | 16,701 | 0 |
-| Reads served stale, writes through the library's API | 0 | 82.8 % | 83.2 % | 2.3 % | 0.41 % |
+| | Reads/s | Reads served stale | Stalest read |
+|---|---:|---:|---:|
+| **RedisNearCache** | **2.20 M** | **0.33 %** | **105 ms** |
+| Plain StackExchange.Redis | 164,427 | 0 % | – |
+| `IMemoryCache` + 10 s TTL | 14.51 M | 83.1 % | 10.0 s |
+| `HybridCache` + Redis L2 | 25.99 M | 84.8 % | 10.0 s |
+| FusionCache + backplane | 6.42 M | 85.0 % | 10.0 s |
 <!-- /HEADLINE -->
 
-- **Only RedisNearCache stays fresh when something else writes.** The TTL caches served most reads stale, up to the
-  whole TTL; FusionCache's backplane only carries writes made through FusionCache.
-- **Freshness costs server traffic.** Every write invalidates the key on every instance tracking it, and each re-reads
-  it on next access, so its command rate follows the write rate, not the read rate: well above a TTL cache, and below
-  plain StackExchange.Redis only while round trips are short (34 % fewer at 0 ms, 53 % more at 2 ms injected).
-- **In-process TTL caches read faster.** They return a stored object; RedisNearCache decodes bytes on every hit
-  (169 ns vs 42 ns per hit in BenchmarkDotNet). A cold read costs about what a plain `GET` does.
+- **13x the reads of plain StackExchange.Redis**, and still fresh: any write from any client evicts the local copy.
+- **TTL caches read faster, but served over 80 % of reads stale**, some up to the full 10 s.
 
-**[Full results, methodology and how to run them →](bench/RedisNearCache.Bench/README.md)**: latency sweeps (0, 0.5
-and 2 ms injected), writes through each library's API, cluster, TLS, Valkey, a chaos run, and per-call BenchmarkDotNet
-and Sailfish numbers.
+**[Full results and methodology →](bench/RedisNearCache.Bench/README.md)** Covers server traffic, latency sweeps,
+writes through each library's own API, cluster, TLS, Valkey, chaos, and per-call costs.
 
 ## How it stays correct
 
