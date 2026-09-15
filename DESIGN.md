@@ -42,6 +42,7 @@ user writes ──► user's own multiplexer / any client ──► Redis ──
 | In-flight set | An invalidation can arrive between sending GET and storing the reply. Reply is discarded if the key was invalidated meanwhile. |
 | `OPTOUT`, not `OPTIN` | `CLIENT CACHING YES`/`NO` only needs to be adjacent to the next command, which a `MULTI`/`EXEC` guarantees even on a multiplexed connection (verified on Redis 7.4 and through StackExchange.Redis 3.2). `OPTOUT` keeps the common, cacheable read a single `GET`; `OPTIN` would wrap every cacheable read in a four-command transaction instead. |
 | No Garnet | Garnet does not implement `CLIENT TRACKING`. Valkey and Redis 6+ do. |
+| Broadcast on an own RESP3 socket, not RESP3 on the multiplexer | StackExchange.Redis 3.x consumes RESP3 invalidate pushes internally; BCAST decouples tracking from the reading connection so reads can stay on the multiplexer. |
 
 ## Components and ownership
 
@@ -49,6 +50,7 @@ user writes ──► user's own multiplexer / any client ──► Redis ──
 |---|---|---|
 | Contracts | `src/RedisNearCache/Abstractions/` | — |
 | `TrackingArmer`, `MasterRole`, `InvalidationListener` | `src/RedisNearCache/Tracking/` | `RedisNearCacheConnection` |
+| `BroadcastTracker`, `Resp3Connection`, `Resp3Reader` (Broadcast mode) | `src/RedisNearCache/Tracking/Broadcast/` | `RedisNearCacheConnection`, `MasterRole` |
 | `L1Cache`, `RedisNearCache` facade | `src/RedisNearCache/Caching/` | armer + listener events |
 | `AddRedisNearCache` | `src/RedisNearCache/DependencyInjection/` | all of the above |
 | HybridCache / IDistributedCache adapters | `src/RedisNearCache.HybridCache/` | `IRedisNearCache` |
@@ -125,6 +127,54 @@ next topology check and removed (flush). The promoted one, if it was pre-armed w
 as `Promoted` (no re-arm, so the reads it served since the failover stay tracked, and no pass-through gap; L1 is
 flushed once for the entries read from the demoted master); otherwise it is armed with `TopologyChanged` (flush).
 
+## Broadcast mode (Redis Enterprise-based services)
+
+`TrackingMode.Broadcast` (`RedisNearCacheOptions.TrackingMode`) is for Redis Enterprise-based services (Azure
+Managed Redis, Redis Cloud, Redis Software, databases 7.4+): their proxy rejects tracking outright on RESP2
+(`ERR Client tracking is not supported when using RESP2`) and rejects `REDIRECT` on RESP3, and its `CLIENT LIST`
+does not list our subscriber connection, so the redirect design above cannot arm there. What the proxy does accept
+is RESP3 `BCAST PREFIX` tracking on the connection that asks for it: a connection that never reads receives a push
+for every write under its prefixes (`FLUSHDB`/`FLUSHALL` arriving as the null invalidation).
+
+RedisNearCache opens one small RESP3 connection of its own per master (TLS and auth taken from the same connection
+settings as the private multiplexer, client name `<private client name>-bcast`), sends `HELLO 3` followed by
+`CLIENT TRACKING ON BCAST PREFIX <p>` for every entry of `KeyPrefixes`, and feeds the pushes it receives into the
+existing invalidation path, whether or not this instance holds the key. Reads stay on the private multiplexer,
+unchanged. Replicas are not pre-armed in this mode: there is no redirect target to keep warm across a promotion,
+so a newly promoted master gets its own broadcast connection like any other master at the next topology change.
+
+Lifecycle mirrors `Redirect`'s reconnect rule exactly: `TrackingLost` → reconnect → `Armed`, in that order, for
+this connection just as for the interactive/subscriber pair. A broadcast connection that goes quiet is caught two
+ways: a lost socket (closed or reset) fires `TrackingLost` immediately, and a keepalive `PING` sent every 10 s with
+a 5 s reply timeout catches a connection the proxy has silently dropped. Either one flushes L1 and puts that
+endpoint in pass-through until the connection is re-established and re-armed, per the existing "any reconnect on
+any master means re-arm then flush" rule. The 5 s per-endpoint sweep that reconciles `Redirect` arming against
+topology changes does the same job here, re-arming a broadcast connection that fell behind a topology change, and a
+lost endpoint is retired by the same `MasterRole.IsKnownMasterAsync` probe as in `Redirect` (multiplexer view first,
+then `CLUSTER NODES` from a connected node), so a killed cluster master is forgotten once its slots have moved rather
+than holding the cache in pass-through. The private multiplexer's `ConnectionFailed` for a master is treated as loss of
+that node's broadcast connection too (one spare flush if the node was fine, no stale window if it was not), and its
+`ConnectionRestored` and `ConfigurationChanged` trigger a reconcile. The tracking handshake on a new socket has a
+deadline (`SyncTimeout`), so a peer that accepts the TCP connection and then goes quiet cannot hold `Ready` open. `CLIENT TRACKINGINFO` is used to verify the arm where the server has it (6.2+)
+and assumed where it does not, as `Redirect` does.
+
+`NOLOOP` cannot help here: it suppresses pushes for writes made by the tracking connection itself, and the broadcast
+connection never writes. So this instance's own `SetAsync` and `RemoveAsync` (sent on the private multiplexer) echo
+back as pushes. That is harmless for coherence (the facade already evicts the key around its own write) but it means
+a `GetAsync` issued right after a `SetAsync` can have its reply discarded once by the in-flight rule when the echo
+lands between the `GET` reply and the store; the next read caches the key. Tests that write through the cache and
+then expect an L1 hit poll for it (`TestHelpers.ReadUntilCachedAsync`) rather than asserting the first read.
+
+The `CLIENT CACHING NO` transaction that `Redirect` sends for reads outside `KeyPrefixes` is skipped in `Broadcast`:
+the reading connection was never tracked, so a plain `GET` is already untracked. Empty `KeyPrefixes` is legal but
+means every write in the database is broadcast to this client (logged once as a warning); a prefix that overlaps
+another already configured is dropped with a log line, because Redis rejects overlapping prefixes for one client.
+Costs versus `Redirect`: prefixes should be set, invalidation volume scales with the write rate under them rather
+than with what L1 holds, and the server's per-key tracking table is not used, so the Enterprise
+`tracking_table_max_keys` limit does not apply. `Broadcast` also works on OSS Redis 6+ and Valkey — the CI matrix
+runs the Broadcast suite on every image — but `Redirect` stays the default there because it only pushes for keys
+this instance actually read.
+
 ## Not in v1
 
-RESP3 push tracking, `OPTIN` tracking, Garnet, write-through population of L1 (`SetAsync` evicts and lets the next read re-track).
+`OPTIN` tracking, Garnet, write-through population of L1 (`SetAsync` evicts and lets the next read re-track).

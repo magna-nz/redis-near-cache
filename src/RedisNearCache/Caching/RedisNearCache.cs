@@ -15,6 +15,7 @@ internal sealed class RedisNearCache : IRedisNearCache
     private readonly RedisNearCacheConnection _connection;
     private readonly ITrackingArmer _armer;
     private readonly IInvalidationListener _listener;
+    private readonly string[] _keyPrefixes;
     private readonly RedisNearCacheOptions _options;
     private readonly ILogger<RedisNearCache> _logger;
 
@@ -70,6 +71,8 @@ internal sealed class RedisNearCache : IRedisNearCache
         _armer = armer;
         _listener = listener;
         _options = options.Value;
+        // Read once: the broadcast tracker arms the server with this same set at start, and the two must agree.
+        _keyPrefixes = _options.KeyPrefixes.ToArray();
         _logger = logger;
 
         _l1 = new L1Cache(_options);
@@ -261,8 +264,8 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     private bool MatchesPrefixes(string key)
     {
-        var prefixes = _options.KeyPrefixes;
-        if (prefixes.Count == 0)
+        var prefixes = _keyPrefixes;
+        if (prefixes.Length == 0)
         {
             return true;
         }
@@ -325,9 +328,11 @@ internal sealed class RedisNearCache : IRedisNearCache
             RedisValue value;
             long? ttlMilliseconds = null;
             var ttlUnknown = false; // PTTL failed: the value is good but must not be stored without its cap
-            if (!cacheable && CachingEnabled && Volatile.Read(ref _untrackedReadsUnavailable) == 0)
+            if (!cacheable && CachingEnabled && _options.TrackingMode == TrackingMode.Redirect && Volatile.Read(ref _untrackedReadsUnavailable) == 0)
             {
                 // Outside KeyPrefixes: nothing will be stored, so do not let the server track the key either.
+                // (Redirect mode only: in Broadcast mode the reading connection is not tracked at all, and the
+                // server only pushes for keys under KeyPrefixes, so a plain GET is already untracked.)
                 // The connection is armed in OPTOUT mode, and CLIENT CACHING NO applies to the next command on the
                 // same connection. A MULTI/EXEC is the only way StackExchange.Redis writes two commands adjacently
                 // on a multiplexed connection; the pair is atomic on the server, so no other read slips between.
@@ -492,7 +497,8 @@ internal sealed class RedisNearCache : IRedisNearCache
         ThrowIfDisposed();
         byte[] bytes = _options.Serializer.Serialize(value);
         var db = _connection.Multiplexer.GetDatabase();
-        // Tracking is armed with NOLOOP, so the server will not echo this write back as an invalidation.
+        // In Redirect mode tracking is armed with NOLOOP, so the server does not echo this write back; in Broadcast
+        // mode it does (the push connection never writes), and the echo is harmless: it evicts what we evict here.
         // Any read of this key in flight before or during the write must therefore be discarded by us:
         // mark before the write (reads already on the wire) and after it (reads that raced the send).
         InvalidateLocal(key);

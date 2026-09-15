@@ -62,13 +62,7 @@ namespace RedisNearCache.Tracking;
 internal sealed class TrackingArmer : ITrackingArmer
 {
     /// <summary>Delays between arm attempts. One fewer entry than the number of attempts.</summary>
-    private static readonly TimeSpan[] RetryDelays =
-    [
-        TimeSpan.FromMilliseconds(100),
-        TimeSpan.FromMilliseconds(300),
-        TimeSpan.FromSeconds(1),
-        TimeSpan.FromSeconds(1),
-    ];
+    private static readonly TimeSpan[] RetryDelays = TrackingRetry.Delays;
 
     private readonly RedisNearCacheConnection _connection;
     private readonly ILogger<TrackingArmer> _logger;
@@ -329,7 +323,20 @@ internal sealed class TrackingArmer : ITrackingArmer
             _logger.LogWarning(lastError,
                 "RedisNearCache gave up arming CLIENT TRACKING on {EndPoint} ({Reason}) after {Attempts} attempts; invalidations from this node will not be received until it is re-armed",
                 endPoint, reason, RetryDelays.Length + 1);
-            return lastError ?? new RedisNearCacheTrackingException($"No subscriber connection of client {_connection.ClientName} was found on {endPoint}.");
+            if (lastError is RedisServerException rejected)
+            {
+                // The server refused a command the redirect design needs (CLIENT LIST, CLIENT TRACKING OFF, ...):
+                // the usual reason is a proxy, so say what to do rather than hand back the bare server error.
+                return new RedisNearCacheTrackingException(
+                    $"{endPoint} rejected a command RedisNearCache needs for REDIRECT tracking: {rejected.Message}. If this is a Redis " +
+                    "Enterprise-based service (Azure Managed Redis, Redis Cloud, Redis Software), set " +
+                    "RedisNearCacheOptions.TrackingMode = TrackingMode.Broadcast.", rejected);
+            }
+
+            return lastError ?? new RedisNearCacheTrackingException(
+                $"No subscriber connection of client {_connection.ClientName} was found on {endPoint}. If this is a Redis " +
+                "Enterprise-based service (Azure Managed Redis, Redis Cloud, Redis Software), its proxy hides that connection " +
+                "from CLIENT LIST and rejects REDIRECT: set RedisNearCacheOptions.TrackingMode = TrackingMode.Broadcast.");
         }
         finally
         {
@@ -414,7 +421,8 @@ internal sealed class TrackingArmer : ITrackingArmer
             throw new RedisNearCacheTrackingException(
                 $"{endPoint} rejected CLIENT TRACKING ON REDIRECT: {ex.Message}. RedisNearCache needs RESP2 two-connection " +
                 "tracking (REDIRECT), which Redis Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis Software) " +
-                "and ElastiCache Serverless do not support.", ex);
+                "and ElastiCache Serverless do not support. For the Enterprise-based services set " +
+                "RedisNearCacheOptions.TrackingMode = TrackingMode.Broadcast.", ex);
         }
     }
 
@@ -961,7 +969,7 @@ internal sealed class TrackingArmer : ITrackingArmer
     }
 
     /// <summary>Interval between background retries once the fast backoff ladder has been exhausted.</summary>
-    private static readonly TimeSpan SlowRetryInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan SlowRetryInterval = TrackingRetry.SlowInterval;
 
     /// <summary>
     /// An arm exhausted its retries. Forget the (dead) redirect id so the endpoint is not mistaken for armed,
@@ -1081,72 +1089,10 @@ internal sealed class TrackingArmer : ITrackingArmer
     /// True while the endpoint is still a master of the deployment (see <see cref="MasterRole"/>). For a disconnected
     /// cluster master this asks a connected node for <c>CLUSTER NODES</c>; when no node can answer it stays a master.
     /// </summary>
-    private async Task<bool> IsKnownMasterAsync(EndPoint endPoint, CancellationToken cancellationToken)
-    {
-        IServer[] servers;
-        try
-        {
-            servers = _connection.Multiplexer.GetServers();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "RedisNearCache could not enumerate servers to check whether {EndPoint} is still a master", endPoint);
-            return true;
-        }
+    private MasterProbe? _probe;
 
-        if (servers.Length == 0) return true;
-        var local = MasterRole.FromMultiplexer(endPoint, ToViews(servers));
-        if (local is { } decided) return decided;
-
-        foreach (var server in servers.Where(s => s.IsConnected && s.EndPoint is not null && !s.EndPoint.Equals(endPoint)).OrderBy(s => s.IsReplica ? 1 : 0))
-        {
-            ClusterConfiguration? configuration;
-            try
-            {
-                configuration = await server.ClusterNodesAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "RedisNearCache could not read CLUSTER NODES from {Server}", server.EndPoint);
-                continue;
-            }
-
-            if (configuration is null) continue;
-            var nodes = configuration.Nodes
-                .Select(n => new ClusterNodeView(n.EndPoint, n.Hostname, n.IsReplica, n.Slots.Count > 0))
-                .ToList();
-
-            var known = MasterRole.FromClusterNodes(endPoint, nodes);
-            if (!known && endPoint is DnsEndPoint dns)
-            {
-                // Names did not match; the host may still resolve to the address the cluster reports for a slot owner.
-                try
-                {
-                    var addresses = await Dns.GetHostAddressesAsync(dns.Host, cancellationToken).ConfigureAwait(false);
-                    known = MasterRole.FromClusterNodes(endPoint, nodes, addresses);
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogDebug(ex, "RedisNearCache could not resolve {Host} while checking whether {EndPoint} still owns slots", dns.Host, endPoint);
-                }
-            }
-
-            _logger.LogDebug("RedisNearCache CLUSTER NODES from {Server}: {EndPoint} {State}", server.EndPoint, endPoint,
-                known ? "still serves slots as a master" : "serves no slots as a master");
-            return known;
-        }
-
-        _logger.LogDebug("RedisNearCache could not read the cluster topology from any connected node; still treating {EndPoint} as a master", endPoint);
-        return true;
-    }
+    private Task<bool> IsKnownMasterAsync(EndPoint endPoint, CancellationToken cancellationToken) =>
+        (_probe ??= new MasterProbe(_connection.Multiplexer, _logger)).IsKnownMasterAsync(endPoint, cancellationToken);
 
     // --- helpers --------------------------------------------------------------------------------------
 
@@ -1173,24 +1119,13 @@ internal sealed class TrackingArmer : ITrackingArmer
     {
         try
         {
-            return ToViews(_connection.Multiplexer.GetServers());
+            return MasterRole.ToViews(_connection.Multiplexer.GetServers());
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "RedisNearCache could not enumerate servers");
             return [];
         }
-    }
-
-    private static List<ServerView> ToViews(IServer[] servers)
-    {
-        var views = new List<ServerView>(servers.Length);
-        foreach (var server in servers)
-        {
-            if (server.EndPoint is { } endPoint) views.Add(new ServerView(endPoint, server.IsConnected, server.IsReplica, server.ServerType));
-        }
-
-        return views;
     }
 
     private void Raise<T>(Action<T>? handler, T argument, string name)

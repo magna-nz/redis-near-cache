@@ -379,7 +379,8 @@ flowchart LR
       <tr><td>RESP3 push messages (the 3.x default)</td><td>StackExchange.Redis collapses to one connection and drops the <code>invalidate</code> pushes. Server says tracking is on; zero messages arrive.</td></tr>
       <tr><td>Lua to bypass admin mode</td><td><code>CLIENT TRACKING</code> is flagged <code>noscript</code>.</td></tr>
       <tr><td><code>OPTIN</code> / <code>CLIENT CACHING YES</code></td><td>Would need to decide, before every read, whether to track it - before the library knows whether the key is cacheable. Ruled out in favour of <code>OPTOUT</code>: the connection is armed <code>OPTOUT</code>, and a read outside <code>KeyPrefixes</code> is preceded by <code>CLIENT CACHING NO</code> inside a <code>MULTI</code>/<code>EXEC</code>, which keeps the two commands adjacent on the wire even on a multiplexed connection.</td></tr>
-      <tr><td>Raw-socket sidecar per node</td><td>Works, kept as fallback. It re-implements TLS, auth, topology and reconnects that the library already provides.</td></tr>
+      <tr><td>Raw-socket sidecar per node</td><td>Superseded: this is now built as <code>TrackingMode.Broadcast</code>, an own RESP3 connection per master armed with <code>CLIENT TRACKING ON BCAST PREFIX</code>, for Redis Enterprise-based services, whose proxy rejects tracking on RESP2 and rejects <code>REDIRECT</code> under RESP3.</td></tr>
+      <tr><td>Redis Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis Software)</td><td>Their proxy hides the subscriber connection from <code>CLIENT LIST</code> and rejects <code>REDIRECT</code>, so the redirect design above cannot arm there; supported instead through <code>TrackingMode.Broadcast</code>.</td></tr>
       <tr><td>Garnet</td><td>Does not implement <code>CLIENT TRACKING</code>. Redis 6+ and Valkey do.</td></tr>
     </tbody>
   </table>

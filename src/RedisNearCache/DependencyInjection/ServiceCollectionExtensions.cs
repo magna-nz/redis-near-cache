@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using RedisNearCache.Internal;
 using RedisNearCache.Tracking;
+using RedisNearCache.Tracking.Broadcast;
 
 namespace RedisNearCache;
 
@@ -33,8 +34,20 @@ public static class ServiceCollectionExtensions
             return RedisNearCacheConnection.Connect(options, logger);
         });
 
+        // Broadcast mode: one object is both the armer and the listener, because the socket that is armed is the
+        // socket the pushes arrive on. Registered once so both interfaces resolve the same instance; never
+        // constructed in Redirect mode.
+        services.TryAddSingleton(sp =>
+        {
+            var connection = sp.GetRequiredService<RedisNearCacheConnection>();
+            var options = sp.GetRequiredService<IOptions<RedisNearCacheOptions>>().Value;
+            var logger = CreateLogger<BroadcastTracker>(sp);
+            return new BroadcastTracker(connection, options, logger);
+        });
+
         services.TryAddSingleton<ITrackingArmer>(sp =>
         {
+            if (Mode(sp) == TrackingMode.Broadcast) return sp.GetRequiredService<BroadcastTracker>();
             var connection = sp.GetRequiredService<RedisNearCacheConnection>();
             var logger = CreateLogger<TrackingArmer>(sp);
             return new TrackingArmer(connection, logger);
@@ -42,6 +55,7 @@ public static class ServiceCollectionExtensions
 
         services.TryAddSingleton<IInvalidationListener>(sp =>
         {
+            if (Mode(sp) == TrackingMode.Broadcast) return sp.GetRequiredService<BroadcastTracker>();
             var connection = sp.GetRequiredService<RedisNearCacheConnection>();
             var logger = CreateLogger<InvalidationListener>(sp);
             return new InvalidationListener(connection, logger);
@@ -72,6 +86,9 @@ public static class ServiceCollectionExtensions
             configure?.Invoke(options);
         });
     }
+
+    private static TrackingMode Mode(IServiceProvider serviceProvider) =>
+        serviceProvider.GetRequiredService<IOptions<RedisNearCacheOptions>>().Value.TrackingMode;
 
     /// <summary>
     /// Resolves <see cref="ILoggerFactory"/> defensively: RedisNearCache does not register logging itself, so

@@ -137,4 +137,16 @@ internal static class MasterRole
 
     private static IPAddress Normalize(IPAddress address) =>
         address.AddressFamily == AddressFamily.InterNetworkV6 && address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
+
+    /// <summary>Snapshot of every server the multiplexer reports, for <see cref="FromMultiplexer"/>.</summary>
+    public static List<ServerView> ToViews(IServer[] servers)
+    {
+        var views = new List<ServerView>(servers.Length);
+        foreach (var server in servers)
+        {
+            if (server.EndPoint is { } endPoint) views.Add(new ServerView(endPoint, server.IsConnected, server.IsReplica, server.ServerType));
+        }
+
+        return views;
+    }
 }

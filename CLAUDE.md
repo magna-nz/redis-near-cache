@@ -12,7 +12,7 @@ The SDK is not on PATH on this machine.
     ./up.sh                       # recreates every container below; same script CI runs
     bench/run-matrix.sh [--quick] # benchmark comparison, not in CI; bench/RedisNearCache.Bench/README.md
 
-Containers (image overridable with RNC_REDIS_IMAGE, default redis:7.4):
+Containers (image overridable with RNC_REDIS_IMAGE, default redis:7.4; enterprise-up.sh uses RNC_ENTERPRISE_IMAGE instead):
 
     docker-compose.yml   standalone :6379, replica :6380, TLS :6390
     cluster-up.sh        3-master cluster 127.0.0.1:7100-7105             (redis-near-cache-cluster)
@@ -20,8 +20,11 @@ Containers (image overridable with RNC_REDIS_IMAGE, default redis:7.4):
                                                                           (redis-near-cache-sentinel)
     managed-up.sh        restricted admin commands :6410                  (redis-near-cache-restricted)
                          hostname-announcing cluster localhost:7200-7205  (redis-near-cache-cluster-hostname, 7.0+)
+    enterprise-up.sh     single-node Redis Software behind its proxy :12000  (redis-near-cache-enterprise; not in up.sh,
+                         ~4 min to boot, image redislabs/redis; the local stand-in for Azure Managed Redis / Redis Cloud)
 
-Integration tests expect all of them to be running. `ExternalManagedEndpointTests` is skipped unless
+Integration tests expect all of them except the Enterprise one to be running; the `Enterprise` suite is skipped
+unless `RNC_ENTERPRISE_REDIS` (e.g. `localhost:12000`) is set. `ExternalManagedEndpointTests` is skipped unless
 `RNC_EXTERNAL_REDIS` holds a connection string to a real (e.g. ElastiCache / Azure Managed Redis) endpoint.
 
 ## Rules

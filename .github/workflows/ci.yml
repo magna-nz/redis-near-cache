@@ -16,7 +16,7 @@ permissions:
 env:
   # Suites that must have run (and passed at least this many tests) in every integration job; see
   # .github/scripts/check-suites-ran.sh. Managed is added per job because its count depends on the server.
-  RNC_REQUIRED_SUITES: Core=1 Chaos=1 EdgeCases=1 Compat=1 Resilience=1 HybridCache=1 Sentinel=4
+  RNC_REQUIRED_SUITES: Core=1 Chaos=1 EdgeCases=1 Compat=1 Resilience=1 HybridCache=1 Sentinel=4 Broadcast=1
 
 jobs:
   unit:
@@ -106,6 +106,39 @@ jobs:
           name: integration-results-${{ strategy.job-index }}
           path: tests/RedisNearCache.Tests/TestResults/*.trx
 
+  enterprise:
+    # Broadcast tracking mode against the real Redis Enterprise proxy: enterprise-up.sh runs Redis Software
+    # (dev/test licence) in Docker, the same proxy that fronts Azure Managed Redis and Redis Cloud.
+    name: integration on Redis Enterprise (Redis Software in Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Start single-node Redis Software behind its proxy (:12000)
+        run: ./enterprise-up.sh
+      - name: Build
+        run: dotnet build -c Release -nologo
+      - name: Broadcast-mode tests against the Enterprise proxy
+        env:
+          RNC_ENTERPRISE_REDIS: localhost:12000
+        run: dotnet test tests/RedisNearCache.Tests -c Release --no-build -nologo --filter "FullyQualifiedName~RedisNearCache.Tests.Enterprise" --logger "trx;LogFileName=enterprise.trx"
+      - name: Check the suite ran
+        if: always()
+        run: .github/scripts/check-suites-ran.sh tests/RedisNearCache.Tests/TestResults/enterprise.trx Enterprise=1
+      - name: Container logs
+        if: failure()
+        run: docker logs --tail 200 redis-near-cache-enterprise
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: enterprise-test-results
+          path: tests/RedisNearCache.Tests/TestResults/*.trx
+
   soak:
     name: soak tests (manual)
     if: github.event_name == 'workflow_dispatch'
@@ -121,7 +154,9 @@ jobs:
 
   pack:
     name: pack
-    # A release must pass on every supported server, not only Redis 7.4.
+    # A release must pass on every supported server, not only Redis 7.4. The Enterprise job runs on every push and
+    # pull request too, but does not gate packaging: it depends on a third-party licensed image whose pull or
+    # bootstrap can fail for reasons unrelated to this library.
     needs: [unit, integration, matrix]
     runs-on: ubuntu-latest
     steps:

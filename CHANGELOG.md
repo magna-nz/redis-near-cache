@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- Feature: `RedisNearCacheOptions.TrackingMode`, an enum defaulting to `Redirect` (today's behaviour, unchanged),
+  with a new `Broadcast` value for Redis Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis
+  Software), whose proxy rejects tracking on RESP2 (`ERR Client tracking is not supported when using RESP2`) and
+  rejects `REDIRECT` under RESP3, and whose `CLIENT LIST` does not show our subscriber connection, so the redirect
+  design cannot arm there. In `Broadcast`, RedisNearCache opens one small RESP3 connection of its own per master
+  (TLS and auth taken from the same connection settings as the private multiplexer, client name `<private client
+  name>-bcast`), sends `HELLO 3` and `CLIENT TRACKING ON BCAST PREFIX <p>` for every entry of `KeyPrefixes`, and
+  receives an invalidation push for every write or delete under those prefixes, whether or not this instance holds
+  the key; `FLUSHDB`/`FLUSHALL` arrive as the null invalidation and flush L1. Reads still go through the private
+  multiplexer, unchanged. Replicas are not pre-armed in this mode. If the broadcast connection dies, the cache goes
+  pass-through for that endpoint, reconnects with the same fast-then-5-second retry ladder as `Redirect`, re-arms,
+  and flushes L1, exactly as the existing "any reconnect = re-arm then flush" rule says; the private multiplexer's
+  `ConnectionFailed` for a master is treated as loss of that node's broadcast connection too, the tracking handshake
+  on a new socket has a `SyncTimeout` deadline, a killed cluster master is retired by the same `CLUSTER NODES` probe
+  as `Redirect`, and `CLIENT TRACKINGINFO` is used to verify the arm where the server has it (6.2+) and assumed
+  where it does not. The `CLIENT CACHING NO`
+  transaction for keys outside `KeyPrefixes` is skipped in `Broadcast`, since the reading connection is not tracked
+  and a plain `GET` is already untracked. `NOLOOP` does not apply (the broadcast connection never writes), so this
+  instance's own `SetAsync`/`RemoveAsync` echo back as pushes: harmless for coherence, but a read issued right after
+  a write can be discarded once by the in-flight rule and is cached by the read after it. Costs versus `Redirect`: `KeyPrefixes` should be set (empty means every
+  write in the database is broadcast to this client, logged once as a warning), invalidation volume scales with
+  the write rate under the prefixes rather than with what L1 holds, and the server's per-key tracking table is not
+  used, so the Enterprise `tracking_table_max_keys` limit does not apply. Also works on OSS Redis 6+ and Valkey,
+  but `Redirect` stays the default there because it only pushes for keys this instance actually read. The broadcast
+  connection reads the current user and password from the cloned connection settings at every connect, so an Entra ID
+  token rotated by `Microsoft.Azure.StackExchangeRedis` is used on reconnect; a live connection is not yet re-authenticated
+  in place, so it is closed at token expiry and re-armed with an L1 flush once per token lifetime. In `Redirect`
+  mode, the startup error raised when no subscriber connection is found on an endpoint now suggests setting
+  `TrackingMode.Broadcast` in case the endpoint is a Redis Enterprise-based service. Covered by two new suites:
+  `RedisNearCache.Tests.Broadcast` (Broadcast mode against OSS Redis, runs in every integration job) and
+  `RedisNearCache.Tests.Enterprise` (runs against `enterprise-up.sh`'s container in a new CI job, "integration on
+  Redis Enterprise (Redis Software in Docker)").
+- Infra: `enterprise-up.sh` brings up a single-node Redis Software (Redis Enterprise) container behind its proxy on
+  `localhost:12000`, headless (`rladmin cluster create` + REST API), as the local stand-in for Azure Managed Redis,
+  Redis Cloud and Redis Software. Not part of `up.sh` (boots in ~4 minutes, Redis documents the image as dev/test
+  only). Probing that proxy established what the docs only imply: RESP2 tracking is rejected outright
+  (`ERR Client tracking is not supported when using RESP2`), `REDIRECT` is a syntax error under RESP3, and the
+  library today fails even earlier because `CLIENT LIST` through the proxy does not list the multiplexer's subscriber
+  connection. RESP3 default per-key tracking and `BCAST PREFIX` tracking both work through the proxy, including
+  `NOLOOP`, `CLIENT CACHING NO` inside `MULTI`, and the null invalidation on `FLUSHDB`; `BCAST` pushes are delivered
+  to a connection that never reads.
 - Fix: a replica pre-arm sweep requested while another sweep was still running (e.g. a configuration change arriving
   right after a sweep disarmed a replica whose replication link was down) was silently dropped, so the replica was
   only re-armed by the next 5 s topology check. Such a request now causes one more sweep as soon as the running one

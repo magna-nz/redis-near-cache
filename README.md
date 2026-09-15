@@ -43,15 +43,30 @@ dotnet add package RedisNearCache
 ```
 
 Add `RedisNearCache.HybridCache` as well if you want it behind `HybridCache` or `IDistributedCache`.
-Needs Redis 6 or newer, or Valkey. Garnet does not implement `CLIENT TRACKING`, and neither Redis
-Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis Software) nor ElastiCache Serverless are
-supported.
+Needs Redis 6 or newer, or Valkey, reached directly. Redis Enterprise-based services (Azure Managed Redis,
+Redis Cloud, Redis Software) are supported through [`TrackingMode.Broadcast`](#redis-enterprise-azure-managed-redis-redis-cloud).
+Garnet does not implement `CLIENT TRACKING` and ElastiCache Serverless is not supported.
 
 ## Use
+
+Redis or Valkey reached directly (self-hosted, ElastiCache node-based, Azure Cache for Redis):
 
 ```csharp
 services.AddRedisNearCache("localhost:6379");
 ```
+
+Redis Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis Software), whose proxy needs the
+broadcast mode [described below](#redis-enterprise-azure-managed-redis-redis-cloud):
+
+```csharp
+services.AddRedisNearCache("my-cache.region.redis.azure.net:10000,ssl=true,password=<access-key>", o =>
+{
+    o.TrackingMode = TrackingMode.Broadcast;   // default is Redirect, for Redis reached directly
+    o.KeyPrefixes.Add("user:");                 // invalidations are broadcast per prefix, so set one
+});
+```
+
+Everything after registration is the same in both modes.
 
 ```csharp
 var cache = provider.GetRequiredService<IRedisNearCache>();
@@ -76,6 +91,35 @@ Behind `HybridCache`:
 services.AddRedisNearCache("localhost:6379");
 services.AddRedisNearCacheHybridCache();               // HybridCache's own L1 is disabled; ours is the coherent one
 ```
+
+## Redis Enterprise, Azure Managed Redis, Redis Cloud
+
+```csharp
+services.AddRedisNearCache("my-cache.region.redis.azure.net:10000,ssl=true,password=<access-key>", o =>
+{
+    o.TrackingMode = TrackingMode.Broadcast;
+    o.KeyPrefixes.Add("product:");
+});
+```
+
+The proxy in front of these Redis Enterprise-based services (databases 7.4+, the versions on which they support
+client-side caching) rejects tracking on RESP2 and rejects `REDIRECT` under RESP3, and its `CLIENT LIST` does not
+show our subscriber connection, so the default `Redirect` mode cannot arm there. `TrackingMode.Broadcast` opens
+one small RESP3 connection of its own per master (same TLS and auth as the private multiplexer, client name
+`<private client name>-bcast`) and arms it with `CLIENT TRACKING ON BCAST PREFIX <p>` for every entry of
+`KeyPrefixes`, so it receives an invalidation push for every write or delete under those prefixes, whether or
+not this instance holds the key; reads still go through the private multiplexer unchanged. If that connection
+dies, the cache goes pass-through for that endpoint and re-arms on reconnect, flushing L1, exactly like `Redirect`
+mode. Set `KeyPrefixes`: with none configured every write in the database is broadcast to this client. Invalidation
+volume scales with the write rate under the prefixes rather than with what L1 holds, and the server's per-key
+tracking table (subject to the Enterprise `tracking_table_max_keys` limit) is not used. If you register a custom
+certificate validation callback, `Broadcast`'s own connection cannot see `ConfigurationOptions.CertificateValidation`;
+supply it through `ConfigurationOptions.SslClientAuthenticationOptions` instead. With Entra ID tokens (`Microsoft.Azure.StackExchangeRedis`) a reconnect picks up the
+rotated token, because the cloned options share the token provider, but a live broadcast connection is not yet
+re-authenticated in place: it is closed when its token expires and re-armed, which flushes L1 once per token
+lifetime. Prefer an access key with `Broadcast` until in-place re-authentication ships.
+This also works on OSS Redis 6+
+and Valkey, but `Redirect` stays the default there since it only pushes for keys this instance actually read.
 
 ## Performance
 
@@ -104,6 +148,8 @@ writes through each library's own API, cluster, TLS, Valkey, chaos, and per-call
   straight from Redis until every master is armed again.
 - A read whose key was invalidated while the reply was in flight is not cached.
 - If tracking cannot be armed at all, every read goes to Redis and nothing is cached, ever, until it can.
+- In `TrackingMode.Broadcast`, a dedicated RESP3 connection per master receives a push for every write under
+  `KeyPrefixes`; the same reconnect-then-flush rule applies if that connection is lost.
 
 ## Docs
 

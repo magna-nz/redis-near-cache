@@ -23,6 +23,8 @@ internal enum ArmReason
     /// entries that were read from the demoted master.
     /// </summary>
     Promoted,
+    /// <summary>The broadcast push connection to this endpoint was re-established; tracking on it died with the socket.</summary>
+    PushConnectionRestored,
 }
 
 /// <summary>Raised after CLIENT TRACKING ON REDIRECT succeeded on one endpoint.</summary>

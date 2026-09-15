@@ -21,9 +21,17 @@ public sealed class RedisNearCacheOptions
     /// <c>OPTOUT</c> mode and such reads are sent with <c>CLIENT CACHING NO</c> (inside a MULTI/EXEC so the two are
     /// adjacent on the wire), so writes to them push no invalidation. While the cache is in pass-through, or if the
     /// transaction could not run, such a read falls back to a plain GET and is tracked like any other. Empty
-    /// (default) means every key read through RedisNearCache is cached and tracked.
+    /// (default) means every key read through RedisNearCache is cached and tracked. In <see cref="TrackingMode.Broadcast"/>
+    /// these are also the <c>BCAST PREFIX</c> arguments. Read once when the cache is created; later changes are ignored.
     /// </summary>
     public IList<string> KeyPrefixes { get; } = new List<string>();
+
+    /// <summary>
+    /// How invalidations reach this instance. <see cref="TrackingMode.Redirect"/> (default) for Redis and Valkey
+    /// servers reached directly; <see cref="TrackingMode.Broadcast"/> for Redis Enterprise-based services
+    /// (Azure Managed Redis, Redis Cloud, Redis Software), which combine with <see cref="KeyPrefixes"/>.
+    /// </summary>
+    public TrackingMode TrackingMode { get; set; } = TrackingMode.Redirect;
 
     /// <summary>Maximum number of entries held in L1. Least-recently-used entries are evicted beyond this.</summary>
     public long L1SizeLimit { get; set; } = 10_000;
