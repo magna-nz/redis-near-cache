@@ -145,7 +145,7 @@ public class ClusterMasterFailoverTests
             await provider.DisposeAsync();
             try
             {
-                RestoreCluster(TargetMasterPort, _out);
+                await RestoreClusterAsync(TargetMasterPort, _out);
             }
             catch (Exception ex) when (failure is not null)
             {
@@ -190,7 +190,7 @@ public class ClusterMasterFailoverTests
     /// caught-up replica, <c>CLUSTER FAILOVER</c> run on it hands mastership straight back, so ports 7100-7102 are
     /// masters again for the rest of the Broadcast suite.
     /// </summary>
-    private static void RestoreCluster(int port, ITestOutputHelper output)
+    private static async Task RestoreClusterAsync(int port, ITestOutputHelper output)
     {
         ClusterNodes.StartNode(port);
 
@@ -200,15 +200,9 @@ public class ClusterMasterFailoverTests
         var isReplica = ClusterNodes.SpinUntil(() => RoleIsConnectedReplica(port), TimeSpan.FromSeconds(30), TimeSpan.FromMilliseconds(200));
         Assert.True(isReplica, $"node {port} never rejoined as a connected replica of its new master.");
 
-        var failover = DockerExec.Run(RedisCli.ClusterContainer, "redis-cli", "-p", port.ToString(), "CLUSTER", "FAILOVER");
-        Assert.True(failover.ExitCode == 0 && failover.StdOut.Contains("OK", StringComparison.Ordinal),
-            $"CLUSTER FAILOVER on {port} did not report OK: {failover.StdOut} {failover.StdErr}");
-
-        var isMasterAgain = ClusterNodes.SpinUntil(() => RoleIsMaster(port), TimeSpan.FromSeconds(30), TimeSpan.FromMilliseconds(200));
-        Assert.True(isMasterAgain, $"node {port} did not become a master again after CLUSTER FAILOVER.");
-
-        var clusterOk = ClusterNodes.SpinUntil(() => BroadcastClusterCacheFixture.MasterPorts.All(ClusterNodes.ClusterStateOk), TimeSpan.FromSeconds(30), TimeSpan.FromMilliseconds(200));
-        Assert.True(clusterOk, "the cluster never returned to cluster_state:ok after restoring the killed master.");
+        // Fail back and re-pair the replicas exactly as cluster-up.sh left them, so the redirect-mode cluster tests
+        // that run after this one find the topology they assume.
+        await ClusterNodes.RestoreDefaultTopologyAsync(output.WriteLine);
 
         var info = DockerExec.Run(RedisCli.ClusterContainer, "redis-cli", "-p", port.ToString(), "CLUSTER", "INFO");
         output.WriteLine($"final CLUSTER INFO on {port}: {info.StdOut}");
@@ -220,12 +214,6 @@ public class ClusterMasterFailoverTests
     {
         var lines = RoleLines(port);
         return lines is { Length: >= 4 } && lines[0] == "slave" && lines[3] == "connected";
-    }
-
-    private static bool RoleIsMaster(int port)
-    {
-        var lines = RoleLines(port);
-        return lines is { Length: >= 1 } && lines[0] == "master";
     }
 
     private static string[]? RoleLines(int port)

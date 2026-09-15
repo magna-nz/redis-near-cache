@@ -1,3 +1,4 @@
+using System.Globalization;
 using RedisNearCache.Tests.Chaos;
 using Xunit;
 
@@ -57,5 +58,49 @@ internal static class ClusterNodes
             "--daemonize", "yes");
 
         Assert.True(started.ExitCode == 0, $"could not restart node {port}: {started.StdErr} {started.StdOut}");
+    }
+
+    /// <summary>The replica of each default master, as <c>cluster-up.sh</c> pairs them.</summary>
+    public static readonly (int Master, int Replica)[] DefaultPairs = [(7100, 7103), (7101, 7104), (7102, 7105)];
+
+    /// <summary>
+    /// Puts the cluster back exactly as <c>cluster-up.sh</c> left it: 7100-7102 masters owning their default
+    /// slot ranges, and 7103-7105 replicating them in that order. A failover test that only waits for its own
+    /// node to be a master again leaves the demoted node briefly as an empty master, or attached to a different
+    /// master, and the next test to read <c>CLUSTER NODES</c> then finds no (or the wrong) replica.
+    /// </summary>
+    public static async Task RestoreDefaultTopologyAsync(Action<string>? log = null)
+    {
+        var mastersBack = await Resilience.ResilienceSupport.RestoreDefaultMastersAsync().ConfigureAwait(false);
+        log?.Invoke($"layout after fail-back: {Resilience.ResilienceSupport.DescribeLayout()}");
+        Assert.True(mastersBack, "could not fail the cluster back to masters 7100-7102: " + Resilience.ResilienceSupport.DescribeLayout());
+        Assert.True(
+            await Poll.UntilAsync(Resilience.ResilienceSupport.IsDefaultLayout, TimeSpan.FromSeconds(60), TimeSpan.FromMilliseconds(250)).ConfigureAwait(false),
+            "the cluster did not return to the default slot layout: " + Resilience.ResilienceSupport.DescribeLayout());
+
+        // Re-pair every replica with its original master. CLUSTER REPLICATE is idempotent, so it is sent whenever the
+        // pairing is not already right, and the poll below waits for gossip to agree.
+        foreach (var (master, replica) in DefaultPairs)
+        {
+            var nodes = Resilience.ResilienceSupport.ClusterNodes();
+            var masterNode = Resilience.ResilienceSupport.NodeOnPort(nodes, master);
+            var replicaNode = Resilience.ResilienceSupport.NodeOnPort(nodes, replica);
+            if (masterNode is null || replicaNode is null) continue;
+            if (!replicaNode.IsMaster && replicaNode.MasterId == masterNode.Id) continue;
+            var r = DockerExec.Run(RedisCli.ClusterContainer, "redis-cli", "-p", replica.ToString(CultureInfo.InvariantCulture), "CLUSTER", "REPLICATE", masterNode.Id);
+            log?.Invoke($"CLUSTER REPLICATE {master} on {replica}: {r.StdOut.Trim()} {r.StdErr.Trim()}");
+        }
+
+        Assert.True(
+            await Poll.UntilAsync(() =>
+            {
+                var nodes = Resilience.ResilienceSupport.ClusterNodes();
+                return DefaultPairs.All(pair =>
+                    Resilience.ResilienceSupport.NodeOnPort(nodes, pair.Master) is { IsMaster: true } m
+                    && Resilience.ResilienceSupport.NodeOnPort(nodes, pair.Replica) is { IsMaster: false } rep
+                    && rep.MasterId == m.Id)
+                    && DefaultPairs.All(pair => ClusterStateOk(pair.Master));
+            }, TimeSpan.FromSeconds(60), TimeSpan.FromMilliseconds(250)).ConfigureAwait(false),
+            "replicas did not re-attach to their original masters: " + Resilience.ResilienceSupport.DescribeLayout());
     }
 }
