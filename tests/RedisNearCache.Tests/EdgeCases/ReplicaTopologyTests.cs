@@ -121,12 +121,18 @@ public class MasterConnectionKillWithReplicaTests
                 $"killing the master's interactive connection did not re-arm it while a replica was present. stats={cache.Statistics}");
             _out.WriteLine($"after master kill: {cache.Statistics}");
 
-            // The re-arm flushed L1 and may still be gating caching for a moment; poll until a read is cached
-            // again, then reads must be hits and tracking must work again.
-            Assert.True(await TestHelpers.ReadUntilCachedAsync(cache, key, "v1"), "the key was not re-cached after the re-arm.");
-            var hits = cache.Statistics.Hits;
-            Assert.Equal("v1", await cache.GetAsync<string>(key));
-            Assert.Equal(hits + 1, cache.Statistics.Hits);
+            // The kill is not a single event: the interactive reconnect re-arms and flushes, and the multiplexer's own
+            // reconnect bookkeeping (and the replica pre-arm sweep) can follow a moment later. Let that settle, then
+            // reads must be cached again and served as hits. A read that races one last flush is retried rather than
+            // failing the test, which is about recovery, not about the exact number of flushes.
+            await Chaos.ChaosSupport.QuiesceAsync(cache, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(15));
+            var servedLocally = await Poll.UntilAsync(async () =>
+            {
+                if (!await TestHelpers.ReadUntilCachedAsync(cache, key, "v1", TimeSpan.FromSeconds(5))) return false;
+                var hits = cache.Statistics.Hits;
+                return await cache.GetAsync<string>(key) == "v1" && cache.Statistics.Hits == hits + 1;
+            }, TimeSpan.FromSeconds(15));
+            Assert.True(servedLocally, $"reads were not served locally again after the re-arm. stats={cache.Statistics}");
 
             RedisCli.Standalone("SET", key, "v2");
             var evicted = await Poll.UntilAsync(() => !cache.TryGetLocal<string>(key, out _), TimeSpan.FromSeconds(5));

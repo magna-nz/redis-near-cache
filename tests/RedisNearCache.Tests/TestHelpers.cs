@@ -71,4 +71,33 @@ internal static class TestHelpers
             return value == expected && cache.TryGetLocal<string>(key, out _);
         }, timeout ?? TimeSpan.FromSeconds(10));
     }
+
+    /// <summary>
+    /// <see cref="ReadUntilCachedAsync"/> that also says why it failed: how many attempts ran, what the last one saw
+    /// (value, L1 hit, coherence, or the exception), and the statistics before and after. For assertions after a
+    /// disruption, where "not cached" alone cannot tell a stuck lost endpoint from failing reads or discarded replies.
+    /// </summary>
+    public static async Task<(bool Cached, string Report)> ReadUntilCachedDiagnosedAsync(IRedisNearCache cache, string key, string expected, TimeSpan? timeout = null)
+    {
+        var statsBefore = cache.Statistics.ToString();
+        var attempts = 0;
+        var last = "no attempt";
+        var cached = await Poll.UntilAsync(async () =>
+        {
+            attempts++;
+            try
+            {
+                var value = await cache.GetAsync<string>(key);
+                var local = cache.TryGetLocal<string>(key, out _);
+                last = $"value={value ?? "<null>"} expected={expected} local={local} coherent={cache.IsCoherent}";
+                return value == expected && local;
+            }
+            catch (Exception ex) when (ex is StackExchange.Redis.RedisException or StackExchange.Redis.RedisTimeoutException)
+            {
+                last = $"{ex.GetType().Name}: {ex.Message} coherent={cache.IsCoherent}";
+                return false;
+            }
+        }, timeout ?? TimeSpan.FromSeconds(10));
+        return (cached, $"{attempts} attempts, last {last}; stats before {statsBefore}, after {cache.Statistics}");
+    }
 }
