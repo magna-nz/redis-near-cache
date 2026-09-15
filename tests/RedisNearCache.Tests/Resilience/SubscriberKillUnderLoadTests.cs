@@ -91,8 +91,9 @@ public class SubscriberKillUnderLoadTests
 
             // And the connection that survived the storm is genuinely tracked, not just quiet.
             var probe = keys[0];
-            Assert.True(await TestHelpers.ReadUntilCachedAsync(cache, probe, (await foreign.Db.StringGetAsync(probe)).ToString(), TimeSpan.FromSeconds(15)),
-                "the key was not cached again after the kill storm.");
+            var (recached, report) = await TestHelpers.ReadUntilCachedDiagnosedAsync(
+                cache, probe, (await foreign.Db.StringGetAsync(probe)).ToString(), TimeSpan.FromSeconds(15));
+            Assert.True(recached, $"the key was not cached again after the kill storm: {report}");
             await foreign.Db.StringSetAsync(probe, "final");
             var evicted = await Poll.UntilAsync(() => !cache.TryGetLocal<string>(probe, out _), TimeSpan.FromSeconds(10));
             Assert.True(evicted, "invalidations stopped arriving after the last subscriber kill.");

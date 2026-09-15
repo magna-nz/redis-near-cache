@@ -94,28 +94,9 @@ public class ReshardDuringReadsTests
             // Tracking on the new owner works: a foreign write to a migrated key still evicts.
             var probe = keys.First(k => handle.Multiplexer.GetHashSlot(k) < SlotsToMove);
             var current = (await foreign.Db.StringGetAsync(probe)).ToString();
-            var statsBeforeProbe = cache.Statistics.ToString();
-            var attempts = 0;
-            string lastAttempt = "none";
-            var recached = await Poll.UntilAsync(async () =>
-            {
-                attempts++;
-                try
-                {
-                    var value = await cache.GetAsync<string>(probe);
-                    var local = cache.TryGetLocal<string>(probe, out _);
-                    lastAttempt = $"value={value ?? "<null>"} expected={current} local={local} coherent={cache.IsCoherent}";
-                    return value == current && local;
-                }
-                catch (Exception ex) when (ex is RedisException or RedisTimeoutException)
-                {
-                    lastAttempt = $"{ex.GetType().Name}: {ex.Message}";
-                    return false;
-                }
-            }, TimeSpan.FromSeconds(30));
+            var (recached, report) = await TestHelpers.ReadUntilCachedDiagnosedAsync(cache, probe, current, TimeSpan.FromSeconds(30));
             Assert.True(recached,
-                $"a migrated key (slot {handle.Multiplexer.GetHashSlot(probe)}) was not cached again after the reshard: {attempts} attempts, " +
-                $"last {lastAttempt}; stats before the probe {statsBeforeProbe}, after {cache.Statistics}; layout {ResilienceSupport.DescribeLayout()}");
+                $"a migrated key (slot {handle.Multiplexer.GetHashSlot(probe)}) was not cached again after the reshard: {report}; layout {ResilienceSupport.DescribeLayout()}");
             await foreign.Db.StringSetAsync(probe, "after-reshard");
             var evicted = await Poll.UntilAsync(() => !cache.TryGetLocal<string>(probe, out _), TimeSpan.FromSeconds(15));
             Assert.True(evicted,
