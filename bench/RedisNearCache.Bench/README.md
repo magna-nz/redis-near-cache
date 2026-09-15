@@ -282,9 +282,15 @@ Things the comparison surfaced that are worth knowing beyond the tables:
   connections, 42 flushes and 16 re-arms, and the audit still found 0 stale entries.
 - **`NearCacheHybridCache` with writes through HybridCache** showed a similar rare long tail, at 0.5 ms latency in this run
   (p99 3.9 s, max 9.5 s over 4,256 stale reads; the previous run showed it at 2 ms instead, where this one had p99
-  2.6 ms). The suspected cause is HybridCache's background write-back of a value computed
-  before a newer `SetAsync` landing after it; not confirmed, and it contradicts the adapter's documentation, so it is
-  being investigated separately.
+  2.6 ms). The tail is explained by a cache-aside lost update in HybridCache, not an invalidation gap: a reader's
+  factory loads the old source value, the writer then updates the source and awaits `SetAsync`, and the reader's
+  background write of its factory result lands after that, overwriting the newer entry in Redis until its 10 s
+  expiry. After the initial fill (about a third of the ~900 source loads/s averaged over each run) the factory runs
+  almost only on cold keys whose entry has just expired, and a cold key is not written again for ~25 s on average, so
+  one such race serves the old value for nearly the whole expiry; on a hot key it lasts only until the next write
+  (~300 ms). A run sees a handful of such cold-key races at most, which is why the tail comes and goes between runs
+  and latencies. Reproduced deterministically by `tests/RedisNearCache.Tests/HybridCache/HybridCacheWriteBackRaceTests.cs`;
+  see the `AddRedisNearCacheHybridCache` documentation for why the adapter does not refuse the write and how to bound it.
 - **Allocations on a hit:** RedisNearCache keeps values as bytes and decodes on every hit (2.08 KB for a 1 KB string,
   408 B for the record), where `IMemoryCache` returns the stored object (56 B, all BenchmarkDotNet's).
 

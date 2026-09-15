@@ -59,8 +59,25 @@ public static class ServiceCollectionExtensions
     /// <para>
     /// One consequence: <c>HybridCache</c> persists a freshly computed value to the distributed tier in the
     /// background, so a second <c>GetOrCreateAsync</c> for the same key issued before that write lands (a few
-    /// hundred microseconds to a few milliseconds) may run the factory again. Concurrent callers are still
-    /// coalesced by <c>HybridCache</c>'s stampede protection. This is an occasional extra factory call, never a stale read.
+    /// hundred microseconds to a few milliseconds) may run the factory again. Concurrent callers on the same
+    /// <c>HybridCache</c> instance are still coalesced by its stampede protection.
+    /// </para>
+    /// <para>
+    /// <b>A factory result can overwrite a newer value.</b> That background write is an unconditional
+    /// <c>SET</c>, and it reaches the <see cref="IDistributedCache"/> boundary through the same member, with the
+    /// same options, as an explicit <c>HybridCache.SetAsync</c>. If another caller, in this process or another,
+    /// updates the source and then calls <c>SetAsync</c> (or <c>RemoveAsync</c>) after a factory has loaded the
+    /// old source value but before its write lands, the old value replaces the newer entry in Redis. Every
+    /// instance then serves it until that entry expires (the reader's
+    /// <see cref="HybridCacheEntryOptions.Expiration"/>, counted from its <c>GetOrCreateAsync</c>) or the key is
+    /// written or removed again. This is the cache-aside lost update, not an invalidation gap: Redis itself holds
+    /// the old value, so <c>CLIENT TRACKING</c> has nothing to invalidate. The adapter does not try to refuse
+    /// the write: it could only tell it apart by parsing <c>HybridCache</c>'s internal payload header and
+    /// trusting clocks to agree across processes, and even that would not help after a <c>RemoveAsync</c>, which
+    /// leaves nothing to compare against. Keep <see cref="HybridCacheEntryOptions.Expiration"/> short for data
+    /// that is changed elsewhere, which bounds how long a lost update is served; when the data itself lives in
+    /// Redis, read it through <see cref="IRedisNearCache"/> directly, which never writes a read back to Redis and
+    /// does not cache a read whose key was invalidated while its reply was in flight.
     /// </para>
     /// <para>
     /// <see cref="HybridCacheEntryOptions.Expiration"/> (the overall/distributed lifetime) is left at
