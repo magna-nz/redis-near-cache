@@ -25,13 +25,18 @@ public static class MicroJobSettings
     public const int QuickMissIterationCount = 3;
     public const int QuickMissWarmupCount = 1;
 
-    /// <summary>Extra keys beyond the arithmetic total, to absorb BenchmarkDotNet's own pilot/overhead-estimation
-    /// invocations (which are not reflected in InvocationCount x (WarmupCount + IterationCount)).</summary>
-    private const int BdnOverheadBuffer = 50;
+    /// <summary>
+    /// Extra batches beyond warmup + measured iterations: BenchmarkDotNet also invokes the workload in its JIT stage and,
+    /// with <c>[MemoryDiagnoser]</c>, runs one more full batch after the actual run to measure allocations
+    /// (<c>Engine.GetExtraStats</c>). A pool of warmup + iterations + 50 keys ran out in that extra batch. Keys are cheap,
+    /// so size generously: 8 spare batches plus a flat 500.
+    /// </summary>
+    private const int BdnSpareBatches = 8;
+    private const int BdnOverheadBuffer = 500;
 
     public static int BdnMissPoolSize(bool quick) => quick
-        ? QuickMissInvocationCount * (QuickMissIterationCount + QuickMissWarmupCount) + BdnOverheadBuffer
-        : MissInvocationCount * (MissIterationCount + MissWarmupCount) + BdnOverheadBuffer;
+        ? QuickMissInvocationCount * (QuickMissIterationCount + QuickMissWarmupCount + BdnSpareBatches) + BdnOverheadBuffer
+        : MissInvocationCount * (MissIterationCount + MissWarmupCount + BdnSpareBatches) + BdnOverheadBuffer;
 
     // --- Sailfish: sample-size driven, no fixed invocation/iteration split -------------------------------------
     public const int SailfishHitMinimumSampleSize = 50;
