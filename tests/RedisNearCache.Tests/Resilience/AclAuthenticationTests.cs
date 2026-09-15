@@ -23,11 +23,9 @@ public class AclAuthenticationTests
 
     public AclAuthenticationTests(ITestOutputHelper output) => _out = output;
 
-    /// <summary><c>&amp;*</c> (pub/sub patterns) needs Redis 6.2+, which is the oldest server in the CI matrix.</summary>
-    private static void CreateUser() =>
-        RedisCli.Standalone("ACL", "SETUSER", AclUser, "on", $">{AclPassword}", "~*", "&*", "+@all");
+    private static void CreateUser() => ResilienceSupport.CreateAclUser(AclUser, AclPassword);
 
-    private static void DeleteUser() => RedisCli.Standalone("ACL", "DELUSER", AclUser);
+    private static void DeleteUser() => ResilienceSupport.DeleteAclUser(AclUser);
 
     [Fact]
     public async Task AclAuthenticatedUserWorks()

@@ -114,12 +114,38 @@ mode. Set `KeyPrefixes`: with none configured every write in the database is bro
 volume scales with the write rate under the prefixes rather than with what L1 holds, and the server's per-key
 tracking table (subject to the Enterprise `tracking_table_max_keys` limit) is not used. If you register a custom
 certificate validation callback, `Broadcast`'s own connection cannot see `ConfigurationOptions.CertificateValidation`;
-supply it through `ConfigurationOptions.SslClientAuthenticationOptions` instead. With Entra ID tokens (`Microsoft.Azure.StackExchangeRedis`) a reconnect picks up the
-rotated token, because the cloned options share the token provider, but a live broadcast connection is not yet
-re-authenticated in place: it is closed when its token expires and re-armed, which flushes L1 once per token
-lifetime. Prefer an access key with `Broadcast` until in-place re-authentication ships.
-This also works on OSS Redis 6+
+supply it through `ConfigurationOptions.SslClientAuthenticationOptions` instead. `Broadcast` also works on OSS Redis 6+
 and Valkey, but `Redirect` stays the default there since it only pushes for keys this instance actually read.
+
+Entra ID authentication (`Microsoft.Azure.StackExchangeRedis`) works with `Broadcast`, including in-place
+re-authentication of a live connection when the token rotates. Configure `ConfigurationOptions` with the
+extension and pass it as `RedisNearCacheOptions.Configuration`:
+
+```csharp
+var cfg = ConfigurationOptions.Parse("my-cache.region.redis.azure.net:10000");
+await cfg.ConfigureForAzureWithTokenCredentialAsync(new DefaultAzureCredential());   // Microsoft.Azure.StackExchangeRedis
+
+services.AddRedisNearCache(o =>
+{
+    o.Configuration = cfg;
+    o.TrackingMode = TrackingMode.Broadcast;
+    o.KeyPrefixes.Add("product:");
+});
+```
+
+RedisNearCache clones `cfg`, and the clone shares the extension's token provider: StackExchange.Redis resolves
+`User`/`Password` through `ConfigurationOptions.Defaults`, which `Clone()` copies by reference. The private
+multiplexer is created from that same provider, so the extension registers it through its `AfterConnectAsync` hook (verified
+for a clone-built multiplexer) and re-authenticates it exactly as it does any multiplexer it manages; every broadcast connection reads the current object id and token when it connects; and a live
+broadcast connection compares its current credentials against the provider on every keepalive tick (10 s, up to about 15 s if a `PING` is in flight),
+re-authenticating in place with `AUTH <objectId> <token>` when they changed — no `TrackingLost`, no L1 flush. If the server rejects the rotated credential, the connection keeps the one it has (a failed `AUTH` leaves a Redis
+connection's authentication unchanged) and stays armed; the rotation is retried as soon as the provider yields a
+different credential, and a connection the server closes at token expiry is re-armed with an L1 flush like any
+reconnect. The broadcast connection's in-place re-authentication works the same for any rotating credential supplied through a custom
+`DefaultOptionsProvider` subclass whose `User`/`Password` overrides change (ACL password rotation, for example);
+values set directly on `ConfigurationOptions.User`/`Password` are static and shadow the provider, so use the
+provider for rotation; re-authenticating the private multiplexer itself is the provider's job, which the Azure
+extension does and a hand-written provider must do through the same `AfterConnectAsync` hook.
 
 ## Performance
 

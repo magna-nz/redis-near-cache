@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Feature: Entra ID (`Microsoft.Azure.StackExchangeRedis`) token rotation is honoured in `TrackingMode.Broadcast`
+  while a broadcast connection is live, not just on its next reconnect. RedisNearCache clones the caller's
+  `ConfigurationOptions`, and the clone shares the extension's token provider: StackExchange.Redis resolves
+  `User`/`Password` through `ConfigurationOptions.Defaults`, which `Clone()` copies by reference. The private
+multiplexer is created from that same provider, so the extension registers it through its `AfterConnectAsync` hook
+  (the hook was seen to fire for a clone-built multiplexer on StackExchange.Redis 3.2.0; the
+re-authentication itself is the extension's documented behaviour) and re-authenticates it exactly as it does any multiplexer it manages; every broadcast connection reads the current object id and token when it connects;
+  and a live broadcast connection now compares its current credentials against the provider on every keepalive
+  tick (10 s, up to about 15 s if a `PING` is in flight) and, when they changed, re-authenticates in place with `AUTH <objectId> <token>` — no `TrackingLost`,
+  no L1 flush, tracking untouched. If the server rejects the rotated credential the connection keeps the one it has (a failed `AUTH` leaves a Redis connection's authentication unchanged) and stays armed, the rejected pair is not retried until the provider yields another, and a connection the server closes at token expiry is re-armed with an L1 flush like any reconnect. The same mechanism generalises to any
+  rotating credential supplied through a custom `DefaultOptionsProvider` subclass whose `User`/`Password`
+  overrides change (ACL password rotation, for example); values set directly on `ConfigurationOptions.User`/
+  `Password` are static and shadow the provider, so use the provider for credentials that rotate. Covered by three
+  new integration tests in `CredentialRotationTests` and two unit tests in `CredentialProviderCloneTests` (Broadcast suite, CI, OSS Redis with ACL users rotated under a live
+  cache): in-place re-authentication keeps the client id, tracking and L1; a reconnect after rotation uses the
+  current credentials; and a rejected credential keeps the socket armed until a good one arrives.
 - Feature: `RedisNearCacheOptions.TrackingMode`, an enum defaulting to `Redirect` (today's behaviour, unchanged),
   with a new `Broadcast` value for Redis Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis
   Software), whose proxy rejects tracking on RESP2 (`ERR Client tracking is not supported when using RESP2`) and
@@ -26,9 +42,8 @@
   the write rate under the prefixes rather than with what L1 holds, and the server's per-key tracking table is not
   used, so the Enterprise `tracking_table_max_keys` limit does not apply. Also works on OSS Redis 6+ and Valkey,
   but `Redirect` stays the default there because it only pushes for keys this instance actually read. The broadcast
-  connection reads the current user and password from the cloned connection settings at every connect, so an Entra ID
-  token rotated by `Microsoft.Azure.StackExchangeRedis` is used on reconnect; a live connection is not yet re-authenticated
-  in place, so it is closed at token expiry and re-armed with an L1 flush once per token lifetime. In `Redirect`
+  connection reads the current user and password from the cloned connection settings at every connect, and a live
+  connection is now re-authenticated in place when they rotate — see the Entra ID feature bullet above. In `Redirect`
   mode, the startup error raised when no subscriber connection is found on an endpoint now suggests setting
   `TrackingMode.Broadcast` in case the endpoint is a Redis Enterprise-based service. Covered by two new suites:
   `RedisNearCache.Tests.Broadcast` (Broadcast mode against OSS Redis, runs in every integration job) and

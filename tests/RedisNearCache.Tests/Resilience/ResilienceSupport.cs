@@ -284,6 +284,20 @@ internal static class ResilienceSupport
         return r.ExitCode == 0 && r.StdOut.Contains("cluster_state:ok", StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Creates (or replaces) an ACL user on the standalone server with full access. <c>&amp;*</c> (pub/sub patterns)
+    /// needs Redis 6.2+, the oldest server in the CI matrix.
+    /// </summary>
+    public static void CreateAclUser(string user, string password) =>
+        RedisCli.Standalone("ACL", "SETUSER", user, "on", $">{password}", "~*", "&*", "+@all");
+
+    /// <summary>Best-effort: <c>ACL DELUSER</c> on a name that does not (or no longer) exist is a harmless no-op.</summary>
+    public static void DeleteAclUser(string user)
+    {
+        try { RedisCli.Standalone("ACL", "DELUSER", user); }
+        catch (InvalidOperationException) { /* already gone, or the server is mid-restart; nothing left to clean up */ }
+    }
+
     /// <summary>The layout <c>cluster-up.sh</c> creates and every other cluster test assumes.</summary>
     public static readonly (int Port, int From, int To)[] DefaultSlotLayout =
     [
