@@ -86,13 +86,12 @@ TTL caches set to 10 s.
 | | Reads/s | Reads served stale | Stalest read |
 |---|---:|---:|---:|
 | **RedisNearCache** | **2.20 M** | **0.33 %** | **105 ms** |
-| Plain StackExchange.Redis | 164,427 | 0 % | – |
 | `IMemoryCache` + 10 s TTL | 14.51 M | 83.1 % | 10.0 s |
 | `HybridCache` + Redis L2 | 25.99 M | 84.8 % | 10.0 s |
 | FusionCache + backplane | 6.42 M | 85.0 % | 10.0 s |
 <!-- /HEADLINE -->
 
-- **13x the reads of plain StackExchange.Redis**, and still fresh: any write from any client evicts the local copy.
+- **Only RedisNearCache stays fresh**: any write from any client evicts the local copy.
 - **TTL caches read faster, but served over 80 % of reads stale**, some up to the full 10 s.
 
 **[Full results and methodology →](bench/RedisNearCache.Bench/README.md)** Covers server traffic, latency sweeps,
