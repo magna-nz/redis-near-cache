@@ -79,6 +79,21 @@ Their proxy rejects tracking on RESP2 and rejects `REDIRECT` under RESP3, so the
 arm there. `Broadcast` opens its own small RESP3 connection per master, arms it with `CLIENT TRACKING ON BCAST
 PREFIX` for each `KeyPrefixes` entry, and feeds invalidations from that instead; reads are unchanged.
 
+Entra ID authentication (`Microsoft.Azure.StackExchangeRedis`) works with `Broadcast`, including in-place
+re-authentication of a live connection when the token rotates:
+
+```csharp
+var cfg = ConfigurationOptions.Parse("my-cache.region.redis.azure.net:10000");
+await cfg.ConfigureForAzureWithTokenCredentialAsync(new DefaultAzureCredential());   // Microsoft.Azure.StackExchangeRedis
+
+services.AddRedisNearCache(o =>
+{
+    o.Configuration = cfg;
+    o.TrackingMode = TrackingMode.Broadcast;
+    o.KeyPrefixes.Add("product:");
+});
+```
+
 ## How it stays correct
 
 - The private connection is armed with `CLIENT TRACKING ON REDIRECT <subscriber> NOLOOP` on every master.

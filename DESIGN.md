@@ -175,6 +175,24 @@ than with what L1 holds, and the server's per-key tracking table is not used, so
 runs the Broadcast suite on every image — but `Redirect` stays the default there because it only pushes for keys
 this instance actually read.
 
+**Credentials.** RedisNearCache clones the caller's `ConfigurationOptions`, and the clone shares the extension's
+token provider: StackExchange.Redis resolves `User`/`Password` through `ConfigurationOptions.Defaults`, which
+`Clone()` copies by reference, so an Entra ID token provider installed by `Microsoft.Azure.StackExchangeRedis` (or
+any custom `DefaultOptionsProvider` subclass) is visible to every connection RedisNearCache opens. The private
+multiplexer is created from that same provider, so the extension registers it through its `AfterConnectAsync` hook
+(the hook was seen to fire for a clone-built multiplexer on StackExchange.Redis 3.2.0; the
+re-authentication itself is the extension's documented behaviour) and re-authenticates it exactly as it does any multiplexer it manages. Every broadcast connection reads the current object id and token when it connects,
+and a live broadcast connection compares its current credentials against the provider on every keepalive tick
+(10 s, up to about 15 s if a `PING` is in flight); when they changed, it re-authenticates in place with `AUTH <objectId> <token>` without dropping tracking (verified by hand, not by CI, on Redis 6.2, 7.4, Valkey 8.1 and the Redis Enterprise proxy: `CLIENT TRACKINGINFO`
+is unchanged after `AUTH` and pushes keep arriving),
+without a `TrackingLost`, and without an L1 flush. A failed `AUTH` is treated as connection death: the connection
+is re-armed with the current credentials, flushing L1 as for any other reconnect. Values set directly on `ConfigurationOptions.User`/`Password` (a `password=` in a connection
+string included) are static and shadow the provider, so a rotating credential must come through the provider.
+Re-authenticating the private multiplexer is the provider's own job (the Azure extension does it through
+`AfterConnectAsync`); this tracker only re-authenticates its broadcast connections. If the server rejects a rotated credential the connection keeps the one it has (a failed
+`AUTH` leaves a Redis connection's authentication unchanged) and stays armed, the rejected pair is not retried until the
+provider yields another, and a connection the server closes at expiry is an ordinary socket death.
+
 ## Not in v1
 
 `OPTIN` tracking, Garnet, write-through population of L1 (`SetAsync` evicts and lets the next read re-track).

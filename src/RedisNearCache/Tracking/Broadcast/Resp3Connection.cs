@@ -57,6 +57,21 @@ internal sealed class Resp3Connection : IAsyncDisposable
     /// </summary>
     public long ClientId { get; set; }
 
+    /// <summary>
+    /// The credentials this connection authenticated with, as read from the configuration at handshake time (null
+    /// password when the deployment needs no auth). The owner compares them with the configuration's current values to
+    /// notice a rotation and updates them after re-authenticating in place. Held as plain strings for the socket's
+    /// lifetime, as the multiplexer's own <c>ConfigurationOptions</c> holds them.
+    /// </summary>
+    internal BroadcastCredentials? Authenticated { get; set; }
+
+    /// <summary>
+    /// The credentials the server most recently rejected (or that could not be applied), so the same pair is not
+    /// retried on every keepalive tick; cleared when a rotation succeeds. A failed <c>AUTH</c> leaves the connection
+    /// authenticated as before, so a rejected rotation does not make the socket unusable.
+    /// </summary>
+    internal BroadcastCredentials? Rejected { get; set; }
+
     /// <summary>Completes (always successfully) when the read loop ends, whatever ended it. Never faults.</summary>
     public Task Completion => _completion.Task;
 
@@ -224,4 +239,27 @@ internal sealed class Resp3Connection : IAsyncDisposable
         _writeGate.Dispose();
         _shutdown.Dispose();
     }
+}
+
+/// <summary>
+/// A user/password pair as sent to a broadcast socket, normalised to what goes on the wire: no user means Redis's
+/// <c>default</c> user, and an empty password means no password. Record equality is what "rotated" means.
+/// </summary>
+internal sealed record BroadcastCredentials
+{
+    /// <summary>Normalises the configuration's raw values.</summary>
+    public BroadcastCredentials(string? user, string? password)
+    {
+        User = user is { Length: > 0 } ? user : "default";
+        Password = password is { Length: > 0 } ? password : null;
+    }
+
+    /// <summary>The user name as sent to the server.</summary>
+    public string User { get; }
+
+    /// <summary>The password, or null when the deployment needs no auth.</summary>
+    public string? Password { get; }
+
+    /// <summary>True when there is a password to authenticate with at all.</summary>
+    public bool HasPassword => Password is not null;
 }
