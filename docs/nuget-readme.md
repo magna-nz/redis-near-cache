@@ -2,6 +2,9 @@
 
 Client-side caching on top of StackExchange.Redis. Keeps the values you read in memory and drops them the moment Redis says they changed.
 
+**Works with:** Redis 6+ and Valkey (self-hosted, Docker, Kubernetes); Azure Managed Redis, Redis Cloud and Redis
+Software, using `TrackingMode.Broadcast`.
+
 Redis 6 can tell a client when a key it has read changes (`CLIENT TRACKING`). RedisNearCache uses that to keep a local copy of what you read: a hit is served from memory, and a write from anywhere evicts the copy a few milliseconds later. It is a package you add next to StackExchange.Redis, not a replacement for it: your existing multiplexer keeps doing everything it does today, and RedisNearCache opens one extra connection for the tracked reads.
 
 StackExchange.Redis [never picked up client tracking](https://github.com/StackExchange/StackExchange.Redis/issues/1461), and the 3.x rewrite still ships without it. RedisNearCache sits on top of it rather than forking it.
