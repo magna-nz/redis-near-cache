@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Benchmarks: a comparison of RedisNearCache with plain StackExchange.Redis, `IMemoryCache` with a TTL, `HybridCache`
+  with a Redis L2, FusionCache with the Redis backplane, and `HybridCache` over the RedisNearCache adapter. The load
+  test (`--load`) now takes `--contender` and `--write-mode foreign|api`, measures stale reads and their age against a
+  per-key version registry, and writes JSON; new BenchmarkDotNet (`--bdn`, out-of-process) and Sailfish
+  (`bench/RedisNearCache.Bench.Sailfish`) per-call suites; `bench/run-matrix.sh` runs everything against a dedicated
+  container with injected latency and renders a report. Results and how to run them:
+  [bench/RedisNearCache.Bench/README.md](bench/RedisNearCache.Bench/README.md). Not run in CI.
+
 ## 0.5.2 (2026-09-14)
 
 - Feature: `RespectServerTtl` option (default `true`). On every miss, `PTTL` is pipelined with the `GET` (one

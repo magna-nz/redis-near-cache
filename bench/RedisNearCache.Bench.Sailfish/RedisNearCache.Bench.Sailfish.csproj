@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>RedisNearCache.Bench.Sailfish</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/RedisNearCache/RedisNearCache.csproj" />
+    <ProjectReference Include="../../src/RedisNearCache.HybridCache/RedisNearCache.HybridCache.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Sailfish needs its own process/output: it requires Perfolizer >= 0.7.1, which is binary-incompatible with
+         the Perfolizer 0.6.1 that BenchmarkDotNet (in the sibling RedisNearCache.Bench project) requires exactly.
+         Splitting into two projects gives each its own deps.json/bin instead of forcing one Perfolizer version on
+         both (which crashes whichever tool didn't ask for it: verified directly). -->
+    <PackageReference Include="Sailfish" />
+    <PackageReference Include="Perfolizer" VersionOverride="0.7.1" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <!-- Pinned explicitly so the 2.x-built packages below bind to the repo's StackExchange.Redis 3.x at runtime. -->
+    <PackageReference Include="StackExchange.Redis" />
+    <PackageReference Include="Microsoft.Extensions.Caching.Memory" />
+    <PackageReference Include="Microsoft.Extensions.Caching.Hybrid" />
+    <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" />
+    <PackageReference Include="ZiggyCreatures.FusionCache" />
+    <PackageReference Include="ZiggyCreatures.FusionCache.Serialization.SystemTextJson" />
+    <PackageReference Include="ZiggyCreatures.FusionCache.Backplane.StackExchangeRedis" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Contenders/** and the Micro/ helpers below are the real files in RedisNearCache.Bench; linked here (not
+         moved), so RedisNearCache.Bench.csproj remains the one place that owns them. -->
+    <Compile Include="../RedisNearCache.Bench/Contenders/**/*.cs" LinkBase="Contenders" />
+    <Compile Include="../RedisNearCache.Bench/Micro/Payloads.cs" Link="Micro/Payloads.cs" />
+    <Compile Include="../RedisNearCache.Bench/Micro/MicroConfig.cs" Link="Micro/MicroConfig.cs" />
+    <Compile Include="../RedisNearCache.Bench/Micro/MicroJobSettings.cs" Link="Micro/MicroJobSettings.cs" />
+    <Compile Include="../RedisNearCache.Bench/Micro/MissKeyPool.cs" Link="Micro/MissKeyPool.cs" />
+  </ItemGroup>
+</Project>

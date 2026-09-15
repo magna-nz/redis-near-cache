@@ -10,6 +10,7 @@ The SDK is not on PATH on this machine.
     ~/.dotnet/dotnet build
     ~/.dotnet/dotnet test tests/RedisNearCache.Tests --filter "Category!=Soak"
     ./up.sh                       # recreates every container below; same script CI runs
+    bench/run-matrix.sh [--quick] # benchmark comparison, not in CI; bench/RedisNearCache.Bench/README.md
 
 Containers (image overridable with RNC_REDIS_IMAGE, default redis:7.4):
 
