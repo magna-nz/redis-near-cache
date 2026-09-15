@@ -76,11 +76,14 @@ public class EnterpriseTests
             Assert.True(await TestHelpers.ReadUntilCachedAsync(handle.Cache, key, "v1"), $"{key} was not cached against the Enterprise endpoint.");
 
             foreign = await ForeignClient.ConnectAsync(ConnectionString, allowAdmin: true);
+            var flushesBefore = handle.Cache.Statistics.Flushes;
             await foreign.Multiplexer.GetServer(foreign.Multiplexer.GetEndPoints()[0]).FlushDatabaseAsync();
 
-            var evicted = await Poll.UntilAsync(() => !handle.Cache.TryGetLocal<string>(key, out _), TimeSpan.FromSeconds(15));
-            Assert.True(evicted, "a foreign FLUSHDB did not evict L1 within the deadline.");
-            Assert.True(handle.Cache.Statistics.Flushes >= 1);
+            // Wait for the flush itself: in Broadcast mode the SetAsync above echoes back as a push and can evict the key
+            // before the FLUSHDB's null invalidation arrives, so "the key left L1" alone does not prove the flush.
+            var flushed = await Poll.UntilAsync(() => handle.Cache.Statistics.Flushes > flushesBefore, TimeSpan.FromSeconds(15));
+            Assert.True(flushed, "a foreign FLUSHDB did not flush L1 (no null invalidation handled) within the deadline.");
+            Assert.False(handle.Cache.TryGetLocal<string>(key, out _), "the key was still in L1 after the flush.");
         }
         finally
         {
