@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 (2026-09-16)
 
 - Feature: Entra ID (`Microsoft.Azure.StackExchangeRedis`) token rotation is honoured in `TrackingMode.Broadcast`
   while a broadcast connection is live, not just on its next reconnect. RedisNearCache clones the caller's
