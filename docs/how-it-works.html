@@ -57,7 +57,7 @@
   <h1>RedisNearCache Mechanics</h1>
   <p class="lede">A near cache whose entries are invalidated by the Redis server itself. This page shows the parts, the message flow, and the failure cases that shaped the design.</p>
 
-  <h2>The one-sentence version</h2>
+  <h2>What it does</h2>
   <p>Your app keeps an in-process copy of the Redis values it reads. Redis remembers which keys each tracked connection has read, and when <em>any</em> client writes one of those keys, Redis pushes a message naming it, and the local copy is thrown away. Nothing in the write path has to cooperate. A Java service, a Go job, or someone at <code>redis-cli</code> all invalidate you the same way.</p>
 
   <h2>Why not an app-level backplane</h2>
@@ -285,7 +285,7 @@ sequenceDiagram
     <figcaption>The reply is still returned to the caller, which is correct for a read that was valid when issued. It is simply not cached.</figcaption>
   </figure>
 
-  <h2>Reconnects, the part that actually needs care</h2>
+  <h2>Reconnects</h2>
   <p>Tracking is per-connection state on the server. The spike showed two silent failure modes, both handled by re-arming and flushing.</p>
   <table>
     <thead><tr><th>What breaks</th><th>What the server does</th><th>What we do</th></tr></thead>
