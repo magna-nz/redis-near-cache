@@ -93,16 +93,19 @@ internal static class ClusterNodes
             log?.Invoke($"CLUSTER REPLICATE {master} on {replica}: {r.StdOut.Trim()} {r.StdErr.Trim()}");
         }
 
+        // Every master's view, not just one: CLUSTER REPLICATE is applied on the replica at once but reaches the other
+        // nodes by gossip, and a test reading CLUSTER NODES from a different master would otherwise see a master with
+        // no replica.
         Assert.True(
-            await Poll.UntilAsync(() =>
+            await Poll.UntilAsync(() => DefaultPairs.All(viewer =>
             {
-                var nodes = Resilience.ResilienceSupport.ClusterNodes();
+                var nodes = Resilience.ResilienceSupport.ClusterNodes(viewer.Master);
                 return DefaultPairs.All(pair =>
                     Resilience.ResilienceSupport.NodeOnPort(nodes, pair.Master) is { IsMaster: true } m
                     && Resilience.ResilienceSupport.NodeOnPort(nodes, pair.Replica) is { IsMaster: false } rep
                     && rep.MasterId == m.Id)
-                    && DefaultPairs.All(pair => ClusterStateOk(pair.Master));
-            }, TimeSpan.FromSeconds(60), TimeSpan.FromMilliseconds(250)).ConfigureAwait(false),
+                    && ClusterStateOk(viewer.Master);
+            }), TimeSpan.FromSeconds(60), TimeSpan.FromMilliseconds(250)).ConfigureAwait(false),
             "replicas did not re-attach to their original masters: " + Resilience.ResilienceSupport.DescribeLayout());
     }
 }

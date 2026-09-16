@@ -150,9 +150,14 @@ a 5 s reply timeout catches a connection the proxy has silently dropped. Either 
 endpoint in pass-through until the connection is re-established and re-armed, per the existing "any reconnect on
 any master means re-arm then flush" rule. The 5 s per-endpoint sweep that reconciles `Redirect` arming against
 topology changes does the same job here, re-arming a broadcast connection that fell behind a topology change, and a
-lost endpoint is retired by the same `MasterRole.IsKnownMasterAsync` probe as in `Redirect` (multiplexer view first,
+lost endpoint is retired by the same `MasterProbe` check as in `Redirect` (multiplexer view first,
 then `CLUSTER NODES` from a connected node), so a killed cluster master is forgotten once its slots have moved rather
-than holding the cache in pass-through. The private multiplexer's `ConnectionFailed` for a master is treated as loss of
+than holding the cache in pass-through. Forgetting it is what lets the facade cache again, so the retry loop does it
+only once every master that serves slots now (the promoted replica included) has an armed broadcast connection; until
+then the endpoint stays lost, logged as a warning from the third round. While it waits, a reconcile runs and the private
+multiplexer is reconfigured (on the first round, then every sixth), because StackExchange.Redis otherwise learns a promoted node's role only at its
+periodic check, and nothing bounds how long that takes. (The reconcile still forgets a lost endpoint the multiplexer
+already reports as a replica, e.g. a killed master that restarted and rejoined, without this check.) The private multiplexer's `ConnectionFailed` for a master is treated as loss of
 that node's broadcast connection too (one spare flush if the node was fine, no stale window if it was not), and its
 `ConnectionRestored` and `ConfigurationChanged` trigger a reconcile. The tracking handshake on a new socket has a
 deadline (`SyncTimeout`), so a peer that accepts the TCP connection and then goes quiet cannot hold `Ready` open. `CLIENT TRACKINGINFO` is used to verify the arm where the server has it (6.2+)
