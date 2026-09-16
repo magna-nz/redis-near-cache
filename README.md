@@ -10,9 +10,7 @@
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License" /></a>
   </p>
   <p>
-    <a href="#redis-enterprise-azure-managed-redis-redis-cloud"><img src="https://img.shields.io/badge/works%20with-Azure%20Managed%20Redis-0078D4" alt="Works with Azure Managed Redis" /></a>
-    <a href="#redis-enterprise-azure-managed-redis-redis-cloud"><img src="https://img.shields.io/badge/works%20with-Redis%20Cloud-DC382D" alt="Works with Redis Cloud" /></a>
-    <a href="#redis-enterprise-azure-managed-redis-redis-cloud"><img src="https://img.shields.io/badge/works%20with-Redis%20Software-DC382D" alt="Works with Redis Software" /></a>
+    <a href="#redis-enterprise-azure-managed-redis-redis-cloud"><img src="https://img.shields.io/badge/works%20with-Azure%20Managed%20Redis%20%C2%B7%20Redis%20Cloud%20%C2%B7%20Redis%20Software-DC382D" alt="Works with Azure Managed Redis, Redis Cloud and Redis Software" /></a>
     <a href="#entraid-auth"><img src="https://img.shields.io/badge/supports-EntraID-0078D4" alt="Supports EntraID" /></a>
   </p>
   <p><a href="https://magna-nz.github.io/redis-near-cache/">Documentation</a></p>
