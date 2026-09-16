@@ -50,6 +50,9 @@ internal sealed class RedisNearCache : IRedisNearCache
     /// </summary>
     private int _ttlCapUnavailable;
 
+    /// <summary>Set once the first TTL read failed on both the raw and the typed command, so the warning is said once.</summary>
+    private int _ttlCapWarned;
+
     /// <summary>
     /// Set once the server has rejected CLIENT CACHING inside a transaction (EXECABORT): untracked reads are not
     /// possible there, so keys outside KeyPrefixes are read with a plain, tracked GET, as before 0.5.2. Logged once.
@@ -375,9 +378,33 @@ internal sealed class RedisNearCache : IRedisNearCache
                 }
                 catch (Exception ex)
                 {
-                    // The value is good; only the cap is unknown (a timeout, a dropped connection). Serve it, store nothing.
-                    _logger.LogDebug(ex, "RedisNearCache could not read PTTL for {Key}; the value is served but not cached", key);
-                    ttlUnknown = true;
+                    // The raw PTTL failed for a reason the server did not state: a timeout, a dropped connection, or a
+                    // slot whose owner this command could not be routed to (a resharding cluster). The value is good,
+                    // so try the typed TTL once before giving up on the cap: it is routed and redirected like any other
+                    // keyed command, where a raw Execute is not. Without this a key can stay uncacheable for as long as
+                    // the condition lasts, silently, because a read with no cap is served but never stored.
+                    try
+                    {
+                        var typed = await db.KeyTimeToLiveAsync(key).WaitAsync(cancellationToken).ConfigureAwait(false);
+                        // Null is "no expiry" here, and also the (already invalidated) key that vanished meanwhile: the
+                        // in-flight check below discards that reply, so storing it uncapped is not a staleness window.
+                        ttlMilliseconds = typed is { } remaining ? (long)remaining.TotalMilliseconds : -1;
+                        _logger.LogDebug(ex, "RedisNearCache could not read PTTL for {Key} directly; the typed TTL answered instead", key);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception fallback)
+                    {
+                        // Both failed: serve the value, store nothing. Said once at Warning rather than per read, because
+                        // a lasting failure here means this instance caches nothing while looking healthy.
+                        if (Interlocked.Exchange(ref _ttlCapWarned, 1) == 0)
+                            _logger.LogWarning(fallback, "RedisNearCache cannot read the TTL of {Key} ({Reason}), so its value is served but not cached; this is reported once", key, ex.Message);
+                        else
+                            _logger.LogDebug(fallback, "RedisNearCache could not read the TTL of {Key}; the value is served but not cached", key);
+                        ttlUnknown = true;
+                    }
                 }
             }
             else

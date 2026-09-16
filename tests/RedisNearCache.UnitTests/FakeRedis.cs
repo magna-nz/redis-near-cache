@@ -224,6 +224,13 @@ internal sealed class FakeMultiplexer
     public int PttlCalls => Volatile.Read(ref _pttlCalls);
     private int _pttlCalls;
 
+    /// <summary>When set, the typed TTL (the facade's fallback when the raw PTTL fails) faults with this exception.</summary>
+    public Exception? TypedTtlFailure { get; set; }
+
+    /// <summary>How many typed TTL calls the fake has answered (or faulted).</summary>
+    public int TypedTtlCalls => Volatile.Read(ref _typedTtlCalls);
+    private int _typedTtlCalls;
+
     private object? HandleDatabase(MethodInfo method, object?[] args)
     {
         switch (method.Name)
@@ -235,6 +242,12 @@ internal sealed class FakeMultiplexer
                 return PttlFailure is { } failure
                     ? Task.FromException<RedisResult>(failure)
                     : Task.FromResult(RedisResult.Create((RedisValue)StoredTtlMilliseconds));
+            // The typed TTL, which the facade falls back to when the raw PTTL fails: routed and redirected like any
+            // other keyed command. Null means no expiry (and a key that is already gone), as StackExchange.Redis does.
+            case "KeyTimeToLiveAsync" when args.Length > 0 && args[0] is RedisKey:
+                Interlocked.Increment(ref _typedTtlCalls);
+                if (TypedTtlFailure is { } typedFailure) return Task.FromException<TimeSpan?>(typedFailure);
+                return Task.FromResult<TimeSpan?>(StoredTtlMilliseconds < 0 ? null : TimeSpan.FromMilliseconds(StoredTtlMilliseconds));
             default:
                 throw new NotSupportedException($"IDatabase.{method.Name} is not modelled by the fake");
         }
