@@ -108,10 +108,6 @@ services.AddRedisNearCacheHybridCache();               // HybridCache's own L1 i
 
 ### EntraID Auth
 
-Whatever you authenticate your own multiplexer with works here: a password, an ACL user (`user=`/`password=`,
-which must be allowed `CLIENT TRACKING` and `CLIENT LIST`), or a client certificate through
-`ConfigurationOptions.SslClientAuthenticationOptions`, which `Broadcast`'s own connection uses verbatim.
-
 Entra ID authentication (`Microsoft.Azure.StackExchangeRedis`) works with `Broadcast`, including in-place
 re-authentication of a live connection when the token rotates. Configure `ConfigurationOptions` with the
 extension and pass it as `RedisNearCacheOptions.Configuration`:
