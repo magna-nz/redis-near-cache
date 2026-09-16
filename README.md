@@ -18,7 +18,7 @@
 
 <br />
 
-Redis 6 can tell a client when a key it has read changes (`CLIENT TRACKING`). RedisNearCache uses that to
+Redis 6 can tell a client when a key it has read changes. RedisNearCache uses that to
 keep a local copy of what you read: a hit is served from memory, and a write from anywhere evicts the copy a
 few milliseconds later. It is a package you add next to StackExchange.Redis, not a replacement for it: your existing multiplexer
 keeps doing everything it does today, and RedisNearCache opens one extra connection for the tracked reads.
