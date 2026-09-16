@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 720" width="1000" height="720" role="img" aria-label="Your code reads through RedisNearCache, which serves from L1 or reads over a private multiplexer. In the default Redirect mode Redis 6+ or Valkey pushes invalidations to the multiplexer's subscriber connection; in Broadcast mode a separate RESP3 connection per master is armed with CLIENT TRACKING ON BCAST PREFIX and the Redis Enterprise proxy pushes an invalidation for every write under those prefixes. Either way the push evicts from L1, and your own multiplexer and any other writer send writes to Redis directly.">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3E5470"/></marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#C0392B"/></marker>
+    <style>
+      .t { font-family: Inter, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1B2431; font-size: 13px; }
+      .b { font-weight: 600; }
+      .m { fill: #5B6B7F; font-size: 12px; }
+      .code { font-family: "JetBrains Mono", Menlo, Consolas, monospace; font-size: 11.5px; fill: #1B2431; }
+      .lbl { font-family: Inter, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12px; fill: #3E5470; paint-order: stroke; stroke: #F6F7F9; stroke-width: 6px; stroke-linejoin: round; }
+      .lbl-red { fill: #C0392B; }
+      .box { fill: #FFFFFF; stroke: #C9D1DB; stroke-width: 1.5; }
+      .flow { stroke: #3E5470; stroke-width: 1.8; fill: none; }
+      .red { stroke: #C0392B; stroke-width: 1.8; fill: none; }
+      .rule { stroke: #E2E7ED; stroke-width: 1.2; }
+    </style>
+  </defs>
+
+  <!-- card background so the figure reads on light and dark pages alike -->
+  <rect x="0" y="0" width="1000" height="720" rx="12" fill="#F6F7F9"/>
+
+  <!-- process boundary -->
+  <rect x="24" y="24" width="640" height="574" rx="10" fill="none" stroke="#9AA7B6" stroke-width="1.5" stroke-dasharray="7 5"/>
+  <text x="40" y="48" class="t m" style="letter-spacing:0.08em">YOUR PROCESS</text>
+
+  <!-- your code -->
+  <rect x="48" y="96" width="150" height="52" rx="6" class="box"/>
+  <text x="123" y="127" class="t b" text-anchor="middle">Your code</text>
+
+  <!-- facade -->
+  <rect x="250" y="76" width="250" height="160" rx="8" class="box"/>
+  <text x="375" y="102" class="t b" text-anchor="middle">IRedisNearCache</text>
+  <rect x="270" y="118" width="210" height="42" rx="6" fill="#E6F4F1" stroke="#1F7A6D" stroke-width="1.5"/>
+  <text x="375" y="144" class="t b" text-anchor="middle" fill="#1F7A6D">L1 · MemoryCache</text>
+  <rect x="270" y="172" width="210" height="42" rx="6" class="box"/>
+  <text x="375" y="198" class="t" text-anchor="middle">in-flight tracker</text>
+
+  <!-- private multiplexer -->
+  <rect x="250" y="272" width="250" height="198" rx="8" class="box"/>
+  <text x="375" y="296" class="t b" text-anchor="middle">Private multiplexer</text>
+  <text x="375" y="314" class="t m" text-anchor="middle">RESP2 · admin · own client name</text>
+  <rect x="270" y="326" width="210" height="38" rx="6" class="box"/>
+  <text x="375" y="350" class="t" text-anchor="middle">interactive · reads</text>
+  <rect x="270" y="380" width="210" height="66" rx="6" fill="#FBEAE7" stroke="#C0392B" stroke-width="1.5"/>
+  <text x="375" y="406" class="t b" text-anchor="middle" fill="#C0392B">subscriber · redirect target</text>
+  <text x="375" y="426" class="t m" text-anchor="middle">Redirect mode · the default</text>
+
+  <!-- broadcast connection -->
+  <rect x="250" y="506" width="250" height="76" rx="8" fill="#FBEAE7" stroke="#C0392B" stroke-width="1.5"/>
+  <text x="375" y="530" class="t b" text-anchor="middle" fill="#C0392B">broadcast connection</text>
+  <text x="375" y="549" class="t m" text-anchor="middle">RESP3 · own socket · one per master</text>
+  <text x="375" y="567" class="t m" text-anchor="middle">Broadcast mode</text>
+
+  <!-- your multiplexer -->
+  <rect x="48" y="330" width="150" height="64" rx="6" class="box"/>
+  <text x="123" y="356" class="t b" text-anchor="middle">Your multiplexer</text>
+  <text x="123" y="376" class="t m" text-anchor="middle">untouched</text>
+
+  <!-- other writers -->
+  <rect x="740" y="96" width="240" height="64" rx="6" class="box"/>
+  <text x="860" y="122" class="t b" text-anchor="middle">Other writers</text>
+  <text x="860" y="144" class="t m" text-anchor="middle">redis-cli · Java · Go · Lua</text>
+
+  <!-- the server: one of two, and that choice is the mode -->
+  <rect x="740" y="262" width="240" height="396" rx="8" fill="#FFFFFF" stroke="#3E5470" stroke-width="2"/>
+  <text x="860" y="290" class="t b" text-anchor="middle">Redis</text>
+  <text x="860" y="308" class="t m" text-anchor="middle">the service you run picks the mode</text>
+
+  <line x1="756" y1="366" x2="964" y2="366" class="rule"/>
+
+  <text x="860" y="392" class="t b" text-anchor="middle">Redis 6+ / Valkey</text>
+  <text x="860" y="410" class="t m" text-anchor="middle">tracking table · key → client ids</text>
+  <text x="860" y="440" class="code" text-anchor="middle">CLIENT TRACKING ON</text>
+  <text x="860" y="458" class="code" text-anchor="middle">REDIRECT &lt;sub id&gt; NOLOOP</text>
+
+  <line x1="756" y1="498" x2="964" y2="498" class="rule"/>
+
+  <text x="860" y="524" class="t b" text-anchor="middle">Redis Enterprise proxy</text>
+  <text x="860" y="542" class="t m" text-anchor="middle">Azure Managed Redis · Redis Cloud</text>
+  <text x="860" y="560" class="t m" text-anchor="middle">Redis Software · databases 7.4+</text>
+  <text x="860" y="590" class="code" text-anchor="middle">HELLO 3</text>
+  <text x="860" y="608" class="code" text-anchor="middle">CLIENT TRACKING ON</text>
+  <text x="860" y="626" class="code" text-anchor="middle">BCAST PREFIX product:</text>
+
+  <!-- flows -->
+  <line x1="198" y1="122" x2="248" y2="122" class="flow" marker-end="url(#arrow)"/>
+  <text x="223" y="113" class="lbl" text-anchor="middle">GetAsync</text>
+
+  <line x1="375" y1="236" x2="375" y2="270" class="flow" marker-end="url(#arrow)"/>
+  <text x="386" y="258" class="lbl">GET on miss</text>
+
+  <line x1="480" y1="345" x2="738" y2="345" class="flow" marker-end="url(#arrow)"/>
+  <text x="609" y="336" class="lbl" text-anchor="middle">GET key · tracked only in Redirect</text>
+
+  <line x1="860" y1="160" x2="860" y2="260" class="flow" marker-end="url(#arrow)"/>
+  <text x="869" y="214" class="lbl">SET key</text>
+
+  <!-- Redirect: the server pushes to the subscriber connection -->
+  <line x1="738" y1="413" x2="482" y2="413" class="red" marker-end="url(#arrow-red)"/>
+  <text x="610" y="404" class="lbl lbl-red" text-anchor="middle">invalidate [key]</text>
+
+  <!-- Broadcast: the proxy pushes every write under a prefix -->
+  <line x1="738" y1="544" x2="502" y2="544" class="red" marker-end="url(#arrow-red)"/>
+  <text x="620" y="535" class="lbl lbl-red" text-anchor="middle">every write under a prefix</text>
+  <text x="620" y="563" class="lbl lbl-red" text-anchor="middle">invalidate [key] · RESP3 push</text>
+
+  <!-- either channel evicts the same L1 -->
+  <path d="M270 413 L232 413" class="red"/>
+  <path d="M250 544 L232 544 L232 139 L268 139" class="red" marker-end="url(#arrow-red)"/>
+  <text x="224" y="270" class="lbl lbl-red" text-anchor="end">evict</text>
+
+  <path d="M123 394 L123 684 L860 684 L860 662" class="flow" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+  <text x="494" y="704" class="lbl" text-anchor="middle">writes from your multiplexer go straight to Redis and are pushed like any other writer's</text>
+</svg>
