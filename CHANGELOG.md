@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.1 (2026-09-16)
+
+- Fix (`TrackingMode.Broadcast`, cluster): after a master failed over, the killed master was forgotten as soon as its
+  slots had moved, which let the cache serve from L1 again while the promoted replica had no tracking connection yet.
+  Writes to it produced no invalidations, so values read in that window could go stale. The window was about a second
+  in testing and unbounded until StackExchange.Redis noticed the promoted node's new role at its periodic check. The
+  killed master is now forgotten only once every master serving slots has an armed connection; until then the cache
+  stays in pass-through, the private multiplexer is reconfigured so the promotion is seen at once, and a wait that
+  lasts is logged at Warning naming the masters still unarmed.
+- Tests: the cluster failover test no longer predicts which replica is promoted or reads a replica pairing that other
+  nodes have not yet learned, which made it flaky in CI; it now also checks the ordering above.
+
 ## 1.0.0 (2026-09-16)
 
 - Fix: `EvictLocal` now marks the key for any read already in flight, as `SetAsync`, `RemoveAsync` and an invalidation
