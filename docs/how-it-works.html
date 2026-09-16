@@ -285,7 +285,7 @@ sequenceDiagram
     <figcaption>The reply is still returned to the caller, which is correct for a read that was valid when issued. It is simply not cached.</figcaption>
   </figure>
 
-  <h2>Reconnects, the part that actually needs care</h2>
+  <h2>Reconnects</h2>
   <p>Tracking is per-connection state on the server. The spike showed two silent failure modes, both handled by re-arming and flushing.</p>
   <table>
     <thead><tr><th>What breaks</th><th>What the server does</th><th>What we do</th></tr></thead>
