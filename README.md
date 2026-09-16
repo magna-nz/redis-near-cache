@@ -13,6 +13,7 @@
     <a href="#redis-enterprise-azure-managed-redis-redis-cloud"><img src="https://img.shields.io/badge/works%20with-Azure%20Managed%20Redis-0078D4" alt="Works with Azure Managed Redis" /></a>
     <a href="#redis-enterprise-azure-managed-redis-redis-cloud"><img src="https://img.shields.io/badge/works%20with-Redis%20Cloud-DC382D" alt="Works with Redis Cloud" /></a>
     <a href="#redis-enterprise-azure-managed-redis-redis-cloud"><img src="https://img.shields.io/badge/works%20with-Redis%20Software-DC382D" alt="Works with Redis Software" /></a>
+    <a href="#entraid-auth"><img src="https://img.shields.io/badge/supports-EntraID-0078D4" alt="Supports EntraID" /></a>
   </p>
   <p><a href="https://magna-nz.github.io/redis-near-cache/">Documentation</a></p>
 </div>
@@ -31,12 +32,12 @@ second connection that it owns does the tracking, and your existing one keeps wo
 RedisNearCache is for code that already runs on StackExchange.Redis.
 
 <div align="center">
-  <img src="docs/architecture-diagram.svg" alt="Your code reads through RedisNearCache; misses go over a tracked private connection; Redis pushes invalidations to a private subscriber connection which evicts the local copy" width="820" />
+  <img src="docs/overview-diagram.svg" alt="Your code reads through RedisNearCache; misses go over a private multiplexer; in the default Redirect mode Redis pushes invalidations to that multiplexer's subscriber connection, and in Broadcast mode a separate RESP3 connection per master receives a push for every write under a key prefix; either push evicts the local copy" width="820" />
   <br />
   <sub><strong>Only reads that go through the cache are tracked.</strong> Writes can come from anywhere.</sub>
   <br />
-  <sub>This is the default <code>Redirect</code> mode. On Redis Enterprise-based services invalidations arrive over
-  <a href="#redis-enterprise-azure-managed-redis-redis-cloud">Broadcast mode</a> instead.</sub>
+  <sub>One invalidation channel or the other, decided by the server you run: <code>Redirect</code> by default,
+  <a href="#redis-enterprise-azure-managed-redis-redis-cloud"><code>Broadcast</code></a> on Redis Enterprise-based services.</sub>
 </div>
 
 <br />
@@ -107,36 +108,7 @@ services.AddRedisNearCache("localhost:6379");
 services.AddRedisNearCacheHybridCache();               // HybridCache's own L1 is disabled; ours is the coherent one
 ```
 
-## Redis Enterprise, Azure Managed Redis, Redis Cloud
-
-```csharp
-services.AddRedisNearCache("my-cache.region.redis.azure.net:10000,ssl=true,password=<access-key>", o =>
-{
-    o.TrackingMode = TrackingMode.Broadcast;
-    o.KeyPrefixes.Add("product:");
-});
-```
-
-<div align="center">
-  <img src="docs/broadcast-diagram.svg" alt="Broadcast mode: reads go over the private multiplexer untracked; a separate RESP3 connection per master is armed with CLIENT TRACKING ON BCAST PREFIX and receives an invalidation push for every write under those prefixes, which evicts the local copy" width="820" />
-  <br />
-  <sub><strong>Broadcast mode.</strong> Every write under a prefix is pushed, whether or not this instance read the key.</sub>
-</div>
-
-The proxy in front of these Redis Enterprise-based services (databases 7.4+, the versions on which they support
-client-side caching) rejects tracking on RESP2 and rejects `REDIRECT` under RESP3, and its `CLIENT LIST` does not
-show our subscriber connection, so the default `Redirect` mode cannot arm there. `TrackingMode.Broadcast` opens
-one small RESP3 connection of its own per master (same TLS and auth as the private multiplexer, client name
-`<private client name>-bcast`) and arms it with `CLIENT TRACKING ON BCAST PREFIX <p>` for every entry of
-`KeyPrefixes`, so it receives an invalidation push for every write or delete under those prefixes, whether or
-not this instance holds the key; reads still go through the private multiplexer unchanged. If that connection
-dies, the cache goes pass-through for that endpoint and re-arms on reconnect, flushing L1, exactly like `Redirect`
-mode. Set `KeyPrefixes`: with none configured every write in the database is broadcast to this client. Invalidation
-volume scales with the write rate under the prefixes rather than with what L1 holds, and the server's per-key
-tracking table (subject to the Enterprise `tracking_table_max_keys` limit) is not used. If you register a custom
-certificate validation callback, `Broadcast`'s own connection cannot see `ConfigurationOptions.CertificateValidation`;
-supply it through `ConfigurationOptions.SslClientAuthenticationOptions` instead. `Broadcast` also works on OSS Redis 6+
-and Valkey, but `Redirect` stays the default there since it only pushes for keys this instance actually read.
+### EntraID Auth
 
 Entra ID authentication (`Microsoft.Azure.StackExchangeRedis`) works with `Broadcast`, including in-place
 re-authentication of a live connection when the token rotates. Configure `ConfigurationOptions` with the
@@ -154,19 +126,15 @@ services.AddRedisNearCache(o =>
 });
 ```
 
-RedisNearCache clones `cfg`, and the clone shares the extension's token provider: StackExchange.Redis resolves
-`User`/`Password` through `ConfigurationOptions.Defaults`, which `Clone()` copies by reference. The private
-multiplexer is created from that same provider, so the extension registers it through its `AfterConnectAsync` hook (verified
-for a clone-built multiplexer) and re-authenticates it exactly as it does any multiplexer it manages; every broadcast connection reads the current object id and token when it connects; and a live
-broadcast connection compares its current credentials against the provider on every keepalive tick (10 s, up to about 15 s if a `PING` is in flight),
-re-authenticating in place with `AUTH <objectId> <token>` when they changed — no `TrackingLost`, no L1 flush. If the server rejects the rotated credential, the connection keeps the one it has (a failed `AUTH` leaves a Redis
-connection's authentication unchanged) and stays armed; the rotation is retried as soon as the provider yields a
-different credential, and a connection the server closes at token expiry is re-armed with an L1 flush like any
-reconnect. The broadcast connection's in-place re-authentication works the same for any rotating credential supplied through a custom
-`DefaultOptionsProvider` subclass whose `User`/`Password` overrides change (ACL password rotation, for example);
-values set directly on `ConfigurationOptions.User`/`Password` are static and shadow the provider, so use the
-provider for rotation; re-authenticating the private multiplexer itself is the provider's job, which the Azure
-extension does and a hand-written provider must do through the same `AfterConnectAsync` hook.
+## Redis Enterprise, Azure Managed Redis, Redis Cloud
+
+The proxy in front of these services cannot serve the default `Redirect` mode, so they need
+`TrackingMode.Broadcast` with `KeyPrefixes` set ([registration above](#use)). Broadcast opens one small RESP3
+connection per master and receives a push for every write under those prefixes, whether or not this instance
+read the key; reads still go through the private multiplexer unchanged.
+
+Why the proxy needs this mode, what `KeyPrefixes` costs, and how TLS and credential rotation behave on that
+connection: [the documentation](https://magna-nz.github.io/redis-near-cache/#enterprise).
 
 ## Performance
 
