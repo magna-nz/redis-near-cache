@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 (2026-09-16)
 
 - Fix: `EvictLocal` now marks the key for any read already in flight, as `SetAsync`, `RemoveAsync` and an invalidation
   do. Before, it only removed the L1 entry, so a read whose reply was on the wire when `EvictLocal` ran stored that
