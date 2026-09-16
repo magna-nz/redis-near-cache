@@ -51,16 +51,6 @@ dotnet add package RedisNearCache
 
 Add `RedisNearCache.HybridCache` as well if you want it behind `HybridCache` or `IDistributedCache`.
 
-## Where it runs
-
-| Platform | Mode |
-|---|---|
-| Redis 6+ (self-hosted, Docker, Kubernetes), Valkey | `Redirect` (default) |
-| Azure Managed Redis, Redis Cloud, Redis Software (databases 7.4+) | [`Broadcast`](https://magna-nz.github.io/redis-near-cache/#enterprise), with `KeyPrefixes` set |
-| Azure Cache for Redis (Basic, Standard, Premium), node-based ElastiCache (Redis OSS, Valkey) | `Redirect` |
-| ElastiCache Serverless | Not supported — it disables `CLIENT TRACKING` |
-| Garnet | Not supported — it does not implement `CLIENT TRACKING` |
-
 ## Use
 
 Redis or Valkey reached directly (self-hosted, ElastiCache node-based, Azure Cache for Redis):
