@@ -6,6 +6,10 @@ namespace RedisNearCache;
 /// connection that the Redis server tracks, so any later write to that key (from any client, any language)
 /// causes the server to push an invalidation and the L1 entry is evicted.
 /// </summary>
+/// <remarks>
+/// Consume this interface; do not implement it. The library's implementation is the only supported one, and members
+/// may be added to it in a minor release. Wrap or decorate it by delegating to the registered instance instead.
+/// </remarks>
 public interface IRedisNearCache : IAsyncDisposable
 {
     /// <summary>
@@ -15,15 +19,28 @@ public interface IRedisNearCache : IAsyncDisposable
     ValueTask<T?> GetAsync<T>(string key, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Gets the bytes stored at <paramref name="key"/> exactly as they are in Redis, without the configured
+    /// <see cref="RedisNearCacheOptions.Serializer"/>, serving from L1 when present and tracked. Returns <c>null</c>
+    /// when the key does not exist. The array is the caller's own; changing it does not change the cached copy.
+    /// </summary>
+    ValueTask<byte[]?> GetBytesAsync(string key, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Writes <paramref name="value"/> to Redis through RedisNearCache's own connection and evicts any L1 copy.
     /// The next <see cref="GetAsync{T}"/> re-reads and re-tracks the key.
     /// </summary>
     ValueTask SetAsync<T>(string key, T value, TimeSpan? expiry = null, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Writes <paramref name="value"/> to Redis as is, without the configured <see cref="RedisNearCacheOptions.Serializer"/>,
+    /// and evicts any L1 copy, exactly as <see cref="SetAsync{T}"/> does.
+    /// </summary>
+    ValueTask SetBytesAsync(string key, ReadOnlyMemory<byte> value, TimeSpan? expiry = null, CancellationToken cancellationToken = default);
+
     /// <summary>Deletes the key in Redis and evicts any L1 copy.</summary>
     ValueTask<bool> RemoveAsync(string key, CancellationToken cancellationToken = default);
 
-    /// <summary>Evicts the L1 copy only. Redis is not touched.</summary>
+    /// <summary>Evicts the L1 copy only. Redis is not touched. A read of the key in flight across the call never stores its reply.</summary>
     void EvictLocal(string key);
 
     /// <summary>

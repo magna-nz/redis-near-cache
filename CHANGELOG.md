@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Fix: `EvictLocal` now marks the key for any read already in flight, as `SetAsync`, `RemoveAsync` and an invalidation
+  do. Before, it only removed the L1 entry, so a read whose reply was on the wire when `EvictLocal` ran stored that
+  reply straight back.
+- Feature: `IRedisNearCache.GetBytesAsync` and `SetBytesAsync` read and write the bytes as stored in Redis, without
+  the configured `Serializer`. `GetBytesAsync` returns a copy; `SetBytesAsync` copies the caller's buffer.
+- Fix: the `IDistributedCache` / `IBufferDistributedCache` adapter now uses those members. It used to go through
+  `GetAsync<byte[]>` / `SetAsync<byte[]>`, so with a custom serializer the bytes were re-encoded on the way in and out,
+  and other clients of the same keys saw the encoded form.
+- Breaking, for anyone implementing `IRedisNearCache` themselves: the two members above are new abstract members. The
+  interface is now documented as not meant to be implemented outside the library, and it may gain members in a minor
+  release.
+
 ## 0.8.0 (2026-09-16)
 
 - Fix: when neither `PTTL` nor the typed TTL can be answered, the cap is now abandoned after three misses in a row

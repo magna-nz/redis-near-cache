@@ -10,10 +10,9 @@ namespace RedisNearCache.HybridCache;
 /// server-assisted client-side caching for its reads.
 /// </summary>
 /// <remarks>
-/// Values are stored as raw <c>byte[]</c>/<see cref="ReadOnlySequence{T}"/> through
-/// <see cref="IRedisNearCache.GetAsync{T}"/> and <see cref="IRedisNearCache.SetAsync{T}"/> instantiated at
-/// <c>byte[]</c>; the default <see cref="IRedisNearCacheSerializer"/> passes <c>byte[]</c> through untouched,
-/// so no double-encoding happens.
+/// Values are stored exactly as given, through <see cref="IRedisNearCache.GetBytesAsync"/> and
+/// <see cref="IRedisNearCache.SetBytesAsync"/>. The configured <see cref="IRedisNearCacheSerializer"/> is never
+/// involved, so any serializer works and other <see cref="IDistributedCache"/> clients see the same bytes.
 ///
 /// <para>
 /// <b>Sliding expiration.</b> Redis TTLs (and RedisNearCache's <see cref="IRedisNearCache.SetAsync{T}"/>) have
@@ -50,7 +49,7 @@ public sealed class RedisNearCacheDistributedCache : IDistributedCache, IBufferD
     /// present, or <c>null</c> if the key does not exist.
     /// </summary>
     public async Task<byte[]?> GetAsync(string key, CancellationToken token = default) =>
-        await _cache.GetAsync<byte[]>(key, token).ConfigureAwait(false);
+        await _cache.GetBytesAsync(key, token).ConfigureAwait(false);
 
     /// <summary>Blocking equivalent of <see cref="SetAsync(string, byte[], DistributedCacheEntryOptions, CancellationToken)"/>. Prefer the async member.</summary>
     public void Set(string key, byte[] value, DistributedCacheEntryOptions options) =>
@@ -64,7 +63,7 @@ public sealed class RedisNearCacheDistributedCache : IDistributedCache, IBufferD
     public async Task SetAsync(string key, byte[] value, DistributedCacheEntryOptions options, CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(options);
-        await _cache.SetAsync(key, value, ResolveExpiry(options), token).ConfigureAwait(false);
+        await _cache.SetBytesAsync(key, value, ResolveExpiry(options), token).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -99,7 +98,7 @@ public sealed class RedisNearCacheDistributedCache : IDistributedCache, IBufferD
     public async ValueTask<bool> TryGetAsync(string key, IBufferWriter<byte> destination, CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(destination);
-        var value = await _cache.GetAsync<byte[]>(key, token).ConfigureAwait(false);
+        var value = await _cache.GetBytesAsync(key, token).ConfigureAwait(false);
         if (value is null)
         {
             return false;
@@ -121,12 +120,12 @@ public sealed class RedisNearCacheDistributedCache : IDistributedCache, IBufferD
     public async ValueTask SetAsync(string key, ReadOnlySequence<byte> value, DistributedCacheEntryOptions options, CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(options);
-        await _cache.SetAsync(key, value.ToArray(), ResolveExpiry(options), token).ConfigureAwait(false);
+        await _cache.SetBytesAsync(key, value.IsSingleSegment ? value.First : value.ToArray(), ResolveExpiry(options), token).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Maps <see cref="DistributedCacheEntryOptions"/> to the single <see cref="TimeSpan"/> expiry that
-    /// <see cref="IRedisNearCache.SetAsync{T}"/> accepts. <see cref="DistributedCacheEntryOptions.AbsoluteExpirationRelativeToNow"/>
+    /// <see cref="IRedisNearCache.SetBytesAsync"/> accepts. <see cref="DistributedCacheEntryOptions.AbsoluteExpirationRelativeToNow"/>
     /// wins if set; otherwise <see cref="DistributedCacheEntryOptions.AbsoluteExpiration"/> (converted to a
     /// relative duration); otherwise <see cref="DistributedCacheEntryOptions.SlidingExpiration"/>, treated as
     /// an absolute expiry equal to the sliding window (see the type-level remarks). <c>null</c> if none of the

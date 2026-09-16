@@ -297,6 +297,20 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     public async ValueTask<T?> GetAsync<T>(string key, CancellationToken cancellationToken = default)
     {
+        var bytes = await GetStoredBytesAsync(key, cancellationToken).ConfigureAwait(false);
+        return bytes is null ? default : _options.Serializer.Deserialize<T>(bytes);
+    }
+
+    // A copy: the array read may be the one held in L1.
+    public async ValueTask<byte[]?> GetBytesAsync(string key, CancellationToken cancellationToken = default) =>
+        (await GetStoredBytesAsync(key, cancellationToken).ConfigureAwait(false))?.ToArray();
+
+    /// <summary>
+    /// The read path shared by the typed and raw reads: the bytes as stored in Redis, or null when the key does not
+    /// exist. The array returned may be the instance held in L1, so callers must not hand it out or change it.
+    /// </summary>
+    private async ValueTask<byte[]?> GetStoredBytesAsync(string key, CancellationToken cancellationToken)
+    {
         ThrowIfDisposed();
         if (Volatile.Read(ref _startupSettled) == 0)
         {
@@ -330,7 +344,7 @@ internal sealed class RedisNearCache : IRedisNearCache
         if (CachingEnabled && _l1.TryGet(key, out var cached))
         {
             Statistics.Hit();
-            return _options.Serializer.Deserialize<T>(cached);
+            return cached;
         }
 
         Statistics.Miss();
@@ -446,7 +460,7 @@ internal sealed class RedisNearCache : IRedisNearCache
             byte[]? bytes = (byte[]?)value;
             if (bytes is null)
             {
-                return default;
+                return null;
             }
 
             // A read that started in pass-through has no TTL to cap by; if caching came back meanwhile, leave the entry
@@ -479,7 +493,7 @@ internal sealed class RedisNearCache : IRedisNearCache
                 }
             }
 
-            return _options.Serializer.Deserialize<T>(bytes);
+            return bytes;
         }
         finally
         {
@@ -547,7 +561,19 @@ internal sealed class RedisNearCache : IRedisNearCache
     public async ValueTask SetAsync<T>(string key, T value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        byte[] bytes = _options.Serializer.Serialize(value);
+        await WriteAsync(key, _options.Serializer.Serialize(value), expiry, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask SetBytesAsync(string key, ReadOnlyMemory<byte> value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        // Copied: a cancelled wait returns while the command may still be queued, and the caller's buffer (a pooled
+        // one, from HybridCache) may be reused by then.
+        await WriteAsync(key, value.ToArray(), expiry, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask WriteAsync(string key, byte[] bytes, TimeSpan? expiry, CancellationToken cancellationToken)
+    {
         var db = _connection.Multiplexer.GetDatabase();
         // In Redirect mode tracking is armed with NOLOOP, so the server does not echo this write back; in Broadcast
         // mode it does (the push connection never writes), and the echo is harmless: it evicts what we evict here.
@@ -587,7 +613,8 @@ internal sealed class RedisNearCache : IRedisNearCache
         }
     }
 
-    public void EvictLocal(string key) => _l1.Remove(key);
+    // Marked as well as removed: a read already on the wire would otherwise store its reply straight back.
+    public void EvictLocal(string key) => InvalidateLocal(key);
 
     public void EvictAllLocal() => FlushLocal();
 
