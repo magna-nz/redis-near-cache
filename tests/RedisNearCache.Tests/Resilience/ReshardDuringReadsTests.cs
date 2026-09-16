@@ -44,7 +44,9 @@ public class ReshardDuringReadsTests
         Assert.NotNull(from);
         Assert.NotNull(to);
 
-        var handle = await EdgeCaseSupport.BuildAsync(ClusterCacheFixture.ConnectionString);
+        // captureLogs: when the probe below cannot cache the migrated key, the library's own reason for declining
+        // to store it (a TTL read that failed, tracking lost, ...) is the only thing that says why.
+        var handle = await EdgeCaseSupport.BuildAsync(ClusterCacheFixture.ConnectionString, captureLogs: true);
         var foreign = await ForeignClient.ConnectAsync(ClusterCacheFixture.ConnectionString);
         var forwardOk = false;
         try
@@ -95,8 +97,18 @@ public class ReshardDuringReadsTests
             var probe = keys.First(k => handle.Multiplexer.GetHashSlot(k) < SlotsToMove);
             var current = (await foreign.Db.StringGetAsync(probe)).ToString();
             var (recached, report) = await TestHelpers.ReadUntilCachedDiagnosedAsync(cache, probe, current, TimeSpan.FromSeconds(30));
+            if (!recached)
+            {
+                var interesting = handle.LogLines
+                    .Where(l => l.Contains("TTL", StringComparison.OrdinalIgnoreCase) || l.Contains("PTTL", StringComparison.Ordinal)
+                                || l.Contains("tracking", StringComparison.OrdinalIgnoreCase) || l.Contains("Warning", StringComparison.Ordinal))
+                    .TakeLast(12);
+                _out.WriteLine("library log around the probe:\n" + string.Join("\n", interesting));
+            }
+
             Assert.True(recached,
-                $"a migrated key (slot {handle.Multiplexer.GetHashSlot(probe)}) was not cached again after the reshard: {report}; layout {ResilienceSupport.DescribeLayout()}");
+                $"a migrated key (slot {handle.Multiplexer.GetHashSlot(probe)}) was not cached again after the reshard: {report}; layout {ResilienceSupport.DescribeLayout()}. " +
+                $"Library log: {string.Join(" | ", handle.LogLines.Where(l => l.Contains("TTL", StringComparison.OrdinalIgnoreCase)).TakeLast(4))}");
             await foreign.Db.StringSetAsync(probe, "after-reshard");
             var evicted = await Poll.UntilAsync(() => !cache.TryGetLocal<string>(probe, out _), TimeSpan.FromSeconds(15));
             Assert.True(evicted,

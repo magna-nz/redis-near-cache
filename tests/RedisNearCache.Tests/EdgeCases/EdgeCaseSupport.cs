@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using RedisNearCache.Internal;
 using StackExchange.Redis;
 
@@ -33,12 +34,15 @@ internal static class EdgeCaseSupport
     public static async Task<EdgeCaseProvider> BuildAsync(
         string connectionString,
         Action<RedisNearCacheOptions>? configure = null,
-        bool awaitReady = true)
+        bool awaitReady = true,
+        bool captureLogs = false)
     {
         var services = new ServiceCollection();
+        var log = captureLogs ? new Sentinel.CapturingLoggerFactory() : null;
+        if (log is not null) services.AddSingleton<ILoggerFactory>(log);
         services.AddRedisNearCache(connectionString, o => configure?.Invoke(o));
         var provider = services.BuildServiceProvider();
-        var handle = Create(provider);
+        var handle = Create(provider, log);
         if (awaitReady) await handle.Cache.Ready;
         return handle;
     }
@@ -56,11 +60,12 @@ internal static class EdgeCaseSupport
         return handle;
     }
 
-    private static EdgeCaseProvider Create(ServiceProvider provider) => new(
+    private static EdgeCaseProvider Create(ServiceProvider provider, Sentinel.CapturingLoggerFactory? log = null) => new(
         provider,
         provider.GetRequiredService<IRedisNearCache>(),
         provider.GetRequiredService<RedisNearCacheConnection>(),
-        provider.GetRequiredService<ITrackingArmer>());
+        provider.GetRequiredService<ITrackingArmer>(),
+        log);
 
     /// <summary>
     /// Client ids of every connection of <paramref name="clientName"/> currently open on one server, read
@@ -102,12 +107,16 @@ internal sealed class EdgeCaseProvider(
     ServiceProvider provider,
     IRedisNearCache cache,
     RedisNearCacheConnection connection,
-    ITrackingArmer armer) : IAsyncDisposable
+    ITrackingArmer armer,
+    Sentinel.CapturingLoggerFactory? log = null) : IAsyncDisposable
 {
     public ServiceProvider Provider { get; } = provider;
     public IRedisNearCache Cache { get; } = cache;
     public RedisNearCacheConnection Connection { get; } = connection;
     public ITrackingArmer Armer { get; } = armer;
+
+    /// <summary>The library's own log lines, when the handle was built with <c>captureLogs</c>; empty otherwise.</summary>
+    public IReadOnlyCollection<string> LogLines => log?.Lines ?? [];
 
     public IConnectionMultiplexer Multiplexer => Connection.Multiplexer;
 
