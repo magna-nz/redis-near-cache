@@ -11,7 +11,7 @@
   </p>
   <p>
     <a href="https://magna-nz.github.io/redis-near-cache/#enterprise"><img src="https://img.shields.io/badge/works%20with-Azure%20Managed%20Redis%20%C2%B7%20Redis%20Cloud%20%C2%B7%20Redis%20Software-A41E11" alt="Works with Azure Managed Redis, Redis Cloud and Redis Software" /></a>
-    <a href="#entraid-auth"><img src="https://img.shields.io/badge/supports-EntraID-0078D4" alt="Supports EntraID" /></a>
+    <a href="#entraid-auth"><img src="https://img.shields.io/badge/auth-ACL%20%C2%B7%20Entra%20ID%20%C2%B7%20mTLS-0078D4" alt="Auth: ACL, Entra ID and mTLS" /></a>
   </p>
   <p><a href="https://magna-nz.github.io/redis-near-cache/">Documentation</a></p>
 </div>
@@ -112,6 +112,10 @@ services.AddRedisNearCacheHybridCache();               // HybridCache's own L1 i
 ```
 
 ### EntraID Auth
+
+Whatever you authenticate your own multiplexer with works here: a password, an ACL user (`user=`/`password=`,
+which must be allowed `CLIENT TRACKING` and `CLIENT LIST`), or a client certificate through
+`ConfigurationOptions.SslClientAuthenticationOptions`, which `Broadcast`'s own connection uses verbatim.
 
 Entra ID authentication (`Microsoft.Azure.StackExchangeRedis`) works with `Broadcast`, including in-place
 re-authentication of a live connection when the token rotates. Configure `ConfigurationOptions` with the
