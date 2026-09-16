@@ -53,6 +53,7 @@ public class ClusterMasterFailoverTests
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         Exception? failure = null;
+        var killed = false;
         try
         {
             var cache = provider.GetRequiredService<IRedisNearCache>();
@@ -135,6 +136,7 @@ public class ClusterMasterFailoverTests
                 }
             });
 
+            killed = true; // set first: a kill that fails half-way still needs the restart below
             KillNode(TargetMasterPort);
             _out.WriteLine($"[{sw.Elapsed}] killed node {TargetMasterPort} (SHUTDOWN NOSAVE, left down for the cluster to fail it over for real)");
 
@@ -229,7 +231,9 @@ public class ClusterMasterFailoverTests
             await provider.DisposeAsync();
             try
             {
-                await RestoreClusterAsync(TargetMasterPort, _out);
+                // A test that failed before the kill left 7100 running: only the pairing may need restoring then.
+                if (killed) await RestoreClusterAsync(TargetMasterPort, _out);
+                else await ClusterNodes.RestoreDefaultTopologyAsync(_out.WriteLine);
             }
             catch (Exception ex) when (failure is not null)
             {
