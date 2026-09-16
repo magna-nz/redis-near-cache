@@ -61,11 +61,6 @@ Add `RedisNearCache.HybridCache` as well if you want it behind `HybridCache` or 
 | ElastiCache Serverless | Not supported — it disables `CLIENT TRACKING` |
 | Garnet | Not supported — it does not implement `CLIENT TRACKING` |
 
-<sub>CI runs the suite on Redis 6.2, 7.0, 7.2, 7.4, 8 and Valkey 8.1 (standalone, replica, TLS, cluster, Sentinel,
-both modes) and against Redis Software in Docker for the Enterprise proxy. The managed services' restrictions are
-emulated in CI rather than tested against the real thing —
-[what is and is not tested](https://magna-nz.github.io/redis-near-cache/#testing).</sub>
-
 ## Use
 
 Redis or Valkey reached directly (self-hosted, ElastiCache node-based, Azure Cache for Redis):
@@ -112,10 +107,6 @@ services.AddRedisNearCacheHybridCache();               // HybridCache's own L1 i
 ```
 
 ### EntraID Auth
-
-Whatever you authenticate your own multiplexer with works here: a password, an ACL user (`user=`/`password=`,
-which must be allowed `CLIENT TRACKING` and `CLIENT LIST`), or a client certificate through
-`ConfigurationOptions.SslClientAuthenticationOptions`, which `Broadcast`'s own connection uses verbatim.
 
 Entra ID authentication (`Microsoft.Azure.StackExchangeRedis`) works with `Broadcast`, including in-place
 re-authentication of a live connection when the token rotates. Configure `ConfigurationOptions` with the
