@@ -49,4 +49,26 @@ public class InFlightRaceDiscardsReplyTests : IAsyncLifetime
         var after = await _cache.GetAsync<string>(key);
         Assert.Equal("v2", after);
     }
+
+    [Fact]
+    public async Task EvictLocalDuringAnInFlightReadDiscardsTheReply()
+    {
+        var key = TestHelpers.Key("evict-race");
+        await _cache.SetAsync(key, "v1");
+
+        // Nothing changes in Redis: the only signal is the caller evicting the key while its read is on the wire.
+        _options.TestHooks.AfterRedisReadBeforeStore = k =>
+        {
+            _cache.EvictLocal(k);
+            return Task.CompletedTask;
+        };
+
+        Assert.Equal("v1", await _cache.GetAsync<string>(key));
+
+        Assert.False(_cache.TryGetLocal<string>(key, out _), "a reply for a key evicted while its read was in flight must not populate L1.");
+        Assert.Equal(1, _cache.Statistics.RaceDiscards);
+
+        _options.TestHooks.AfterRedisReadBeforeStore = null;
+        Assert.True(await TestHelpers.ReadUntilCachedAsync(_cache, key, "v1"), "the key was not cached again after the discarded read.");
+    }
 }

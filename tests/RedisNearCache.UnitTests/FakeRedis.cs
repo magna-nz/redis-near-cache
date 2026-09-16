@@ -237,6 +237,10 @@ internal sealed class FakeMultiplexer
         {
             case "StringGetAsync" when args.Length > 0 && args[0] is RedisKey:
                 return Task.FromResult(StoredValue);
+            // One value for every key, as for reads: a write replaces it.
+            case "StringSetAsync" when args.Length > 1 && args[0] is RedisKey && args[1] is RedisValue written:
+                StoredValue = written;
+                return Task.FromResult(true);
             case "ExecuteAsync" when args.Length == 2 && Equals(args[0], "PTTL"):
                 Interlocked.Increment(ref _pttlCalls);
                 return PttlFailure is { } failure

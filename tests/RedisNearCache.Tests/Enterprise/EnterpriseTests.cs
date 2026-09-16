@@ -56,6 +56,46 @@ public class EnterpriseTests
         }
     }
 
+    /// <summary>
+    /// E1b: the raw-bytes members through the proxy, with a serializer that fails if used: the bytes are stored as
+    /// given, served from L1, and a foreign write evicts them.
+    /// </summary>
+    [EnterpriseFact]
+    public async Task BytesRoundTripAndForeignWriteEvicts()
+    {
+        var prefix = UniquePrefix();
+        EdgeCaseProvider? handle = null;
+        ForeignClient? foreign = null;
+        try
+        {
+            handle = await EdgeCaseSupport.BuildAsync(ConnectionString, o =>
+            {
+                o.TrackingMode = TrackingMode.Broadcast;
+                o.KeyPrefixes.Add(prefix);
+                o.Serializer = new RefusingSerializer();
+            });
+            foreign = await ForeignClient.ConnectAsync(ConnectionString);
+
+            var key = prefix + Guid.NewGuid().ToString("N");
+            var payload = RawBytes.Payload();
+            await handle.Cache.SetBytesAsync(key, payload);
+
+            Assert.Equal(payload, (byte[]?)await foreign.Db.StringGetAsync(key));
+            Assert.True(await RawBytes.ReadUntilCachedAsync(handle.Cache, key, payload, TimeSpan.FromSeconds(15)),
+                $"{key} was not cached against the Enterprise endpoint.");
+
+            await foreign.Db.StringSetAsync(key, new byte[] { 1, 2 });
+
+            Assert.True(await RawBytes.ReadUntilCachedAsync(handle.Cache, key, [1, 2], TimeSpan.FromSeconds(15)),
+                "a foreign write did not evict the cached bytes within the deadline.");
+        }
+        finally
+        {
+            if (handle is not null) await handle.DisposeAsync();
+            if (foreign is not null) await foreign.DisposeAsync();
+        }
+    }
+
     /// <summary>E2: a foreign FLUSHDB flushes L1.</summary>
     [EnterpriseFact]
     public async Task ForeignFlushDbFlushesL1()

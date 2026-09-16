@@ -15,12 +15,19 @@ public class DistributedCacheAdapterTests
         public RedisNearCacheStatistics Statistics { get; } = new();
         public Task Ready => Task.CompletedTask;
 
+        // The adapter must never go through the typed members: they apply the configured serializer.
         public ValueTask<T?> GetAsync<T>(string key, CancellationToken ct = default) =>
-            new(Store.TryGetValue(key, out var b) ? (T?)(object)b : default);
+            throw new InvalidOperationException("the adapter read through the serializer");
 
-        public ValueTask SetAsync<T>(string key, T value, TimeSpan? expiry = null, CancellationToken ct = default)
+        public ValueTask SetAsync<T>(string key, T value, TimeSpan? expiry = null, CancellationToken ct = default) =>
+            throw new InvalidOperationException("the adapter wrote through the serializer");
+
+        public ValueTask<byte[]?> GetBytesAsync(string key, CancellationToken ct = default) =>
+            new(Store.TryGetValue(key, out var b) ? b.ToArray() : null);
+
+        public ValueTask SetBytesAsync(string key, ReadOnlyMemory<byte> value, TimeSpan? expiry = null, CancellationToken ct = default)
         {
-            Store[key] = (byte[])(object)value!;
+            Store[key] = value.ToArray();
             Writes.Add((key, expiry));
             return default;
         }
@@ -118,6 +125,26 @@ public class DistributedCacheAdapterTests
         Assert.False(seq.IsSingleSegment);
         await cache.SetAsync("k", seq, new DistributedCacheEntryOptions());
         Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6 }, fake.Store["k"]);
+    }
+
+    [Fact]
+    public async Task EveryMemberUsesTheRawBytesPath()
+    {
+        // The fake's typed members throw, so any path still going through the serializer fails here.
+        var (cache, fake) = Create();
+        var options = new DistributedCacheEntryOptions();
+        await cache.SetAsync("a", [1, 2], options);
+        cache.Set("b", [3], options);
+        await cache.SetAsync("c", new ReadOnlySequence<byte>(new byte[] { 4, 5 }), options);
+        cache.Set("d", new ReadOnlySequence<byte>(new byte[] { 6 }), options);
+
+        Assert.Equal(new byte[] { 1, 2 }, await cache.GetAsync("a"));
+        Assert.Equal(new byte[] { 3 }, cache.Get("b"));
+        var writer = new ArrayBufferWriter<byte>();
+        Assert.True(await cache.TryGetAsync("c", writer));
+        Assert.True(cache.TryGet("d", writer));
+        Assert.Equal(new byte[] { 4, 5, 6 }, writer.WrittenSpan.ToArray());
+        Assert.Equal(4, fake.Writes.Count);
     }
 
     [Fact]

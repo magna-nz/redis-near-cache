@@ -23,7 +23,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar" aria-label="Sections">
-<div class="nav-group"><ul><li><a href="#introduction">Introduction</a></li><li><a href="#quickstart">Quickstart</a></li><li><a href="#how-it-works">How it works</a></li><li><a href="#configuration">Configuration</a></li><li><a href="#enterprise">Managed services</a></li><li><a href="#api-reference">API reference</a><ul class="sub-nav"><li><a href="#getasync">GetAsync</a></li><li><a href="#setasync">SetAsync</a></li><li><a href="#removeasync">RemoveAsync</a></li><li><a href="#evictlocal">EvictLocal</a></li><li><a href="#evictalllocal">EvictAllLocal</a></li><li><a href="#trygetlocal">TryGetLocal</a></li><li><a href="#statistics">Statistics</a></li><li><a href="#ready">Ready</a></li><li><a href="#iscoherent">IsCoherent</a></li><li><a href="#waitforcoherenceasync">WaitForCoherenceAsync</a></li><li><a href="#redisnearcachestatistics">RedisNearCacheStatistics</a></li><li><a href="#iredisnearcacheserializer">IRedisNearCacheSerializer</a></li><li><a href="#jsonredisnearcacheserializer">JsonRedisNearCacheSerializer</a></li><li><a href="#addrednc-configure">AddRedisNearCache(configure)</a></li><li><a href="#addrednc-connectionstring">AddRedisNearCache(connString)</a></li></ul></li><li><a href="#hybridcache">HybridCache</a><ul class="sub-nav"><li><a href="#addrednc-distributedcache">AddRedisNearCacheDistributedCache</a></li><li><a href="#addrednc-hybridcache">AddRedisNearCacheHybridCache</a></li><li><a href="#redisnearcachedistributedcache">RedisNearCacheDistributedCache</a></li></ul></li><li><a href="#reconnects-cluster">Reconnects and cluster</a></li><li><a href="#operations">Operations</a></li><li><a href="#limitations">Limitations</a></li><li><a href="#performance">Performance</a><ul class="sub-nav"><li><a href="#perf-headline">Headline</a></li><li><a href="#perf-contenders">What is compared</a></li><li><a href="#perf-load">Load test</a></li><li><a href="#perf-topologies">Cluster, TLS, Valkey, chaos</a></li><li><a href="#perf-per-call">Per-call cost</a></li></ul></li><li><a href="#testing">Testing</a></li><li><a href="#samples">Samples</a></li><li><a href="#faq">FAQ</a></li></ul></div>
+<div class="nav-group"><ul><li><a href="#introduction">Introduction</a></li><li><a href="#quickstart">Quickstart</a></li><li><a href="#how-it-works">How it works</a></li><li><a href="#configuration">Configuration</a></li><li><a href="#enterprise">Managed services</a></li><li><a href="#api-reference">API reference</a><ul class="sub-nav"><li><a href="#getasync">GetAsync</a></li><li><a href="#getbytesasync">GetBytesAsync</a></li><li><a href="#setasync">SetAsync</a></li><li><a href="#setbytesasync">SetBytesAsync</a></li><li><a href="#removeasync">RemoveAsync</a></li><li><a href="#evictlocal">EvictLocal</a></li><li><a href="#evictalllocal">EvictAllLocal</a></li><li><a href="#trygetlocal">TryGetLocal</a></li><li><a href="#statistics">Statistics</a></li><li><a href="#ready">Ready</a></li><li><a href="#iscoherent">IsCoherent</a></li><li><a href="#waitforcoherenceasync">WaitForCoherenceAsync</a></li><li><a href="#redisnearcachestatistics">RedisNearCacheStatistics</a></li><li><a href="#iredisnearcacheserializer">IRedisNearCacheSerializer</a></li><li><a href="#jsonredisnearcacheserializer">JsonRedisNearCacheSerializer</a></li><li><a href="#addrednc-configure">AddRedisNearCache(configure)</a></li><li><a href="#addrednc-connectionstring">AddRedisNearCache(connString)</a></li></ul></li><li><a href="#hybridcache">HybridCache</a><ul class="sub-nav"><li><a href="#addrednc-distributedcache">AddRedisNearCacheDistributedCache</a></li><li><a href="#addrednc-hybridcache">AddRedisNearCacheHybridCache</a></li><li><a href="#redisnearcachedistributedcache">RedisNearCacheDistributedCache</a></li></ul></li><li><a href="#reconnects-cluster">Reconnects and cluster</a></li><li><a href="#operations">Operations</a></li><li><a href="#limitations">Limitations</a></li><li><a href="#performance">Performance</a><ul class="sub-nav"><li><a href="#perf-headline">Headline</a></li><li><a href="#perf-contenders">What is compared</a></li><li><a href="#perf-load">Load test</a></li><li><a href="#perf-topologies">Cluster, TLS, Valkey, chaos</a></li><li><a href="#perf-per-call">Per-call cost</a></li></ul></li><li><a href="#testing">Testing</a></li><li><a href="#samples">Samples</a></li><li><a href="#faq">FAQ</a></li></ul></div>
 </nav>
 <div class="main">
 <section class="section" id="introduction">
@@ -380,7 +380,7 @@ services.AddRedisNearCache(options =&gt;
 </div>
 <div class="row">
 <div class="prose">
-<h3>Serializer customisation</h3><p>The default <code>JsonRedisNearCacheSerializer</code> uses <code>System.Text.Json</code>, with <code>string</code> and <code>byte[]</code> passed through untouched (no double-encoding, which matters for the <code>IDistributedCache</code> adapter). Pass your own <code>JsonSerializerOptions</code> to the constructor, or implement <code>IRedisNearCacheSerializer</code> directly for a non-JSON format.</p>
+<h3>Serializer customisation</h3><p>The default <code>JsonRedisNearCacheSerializer</code> uses <code>System.Text.Json</code>, with <code>string</code> and <code>byte[]</code> passed through untouched. The <code>IDistributedCache</code> adapter does not use the serializer at all, so a custom one does not affect it. Pass your own <code>JsonSerializerOptions</code> to the constructor, or implement <code>IRedisNearCacheSerializer</code> directly for a non-JSON format.</p>
 </div>
 <div class="rail"></div>
 </div>
@@ -462,6 +462,7 @@ services.AddRedisNearCache(o =&gt;
 <div class="eyebrow">Reference</div>
 <h2>API reference <a class="anchor" href="#api-reference" aria-label="Link to this section">#</a></h2>
 <p class="lede">Every public member of RedisNearCache.</p>
+<p><code>IRedisNearCache</code> is for consuming, not implementing: the library&#8217;s own implementation is the only supported one, and members may be added to the interface in a minor release. To wrap or decorate it, delegate to the registered instance.</p>
 
 </div>
 <div class="rail"></div>
@@ -479,6 +480,19 @@ services.AddRedisNearCache(o =&gt;
     CancellationToken cancellationToken = default);</code></pre></div></div>
 </div>
 </div>
+<div class="member" id="getbytesasync">
+<div class="row">
+<div class="prose">
+<h3>GetBytesAsync<span class="pill">method</span> <a class="anchor" href="#getbytesasync" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">ValueTask&lt;byte[]?&gt; GetBytesAsync(string key, CancellationToken cancellationToken = default)</div>
+<p>Same as <code>GetAsync&lt;T&gt;</code>, but returns the bytes exactly as they are stored in Redis, without the configured <code>Serializer</code>. The array is the caller&#8217;s own: changing it does not change the cached copy.</p>
+<div class="returns"><strong>Returns</strong> the stored bytes, or <code>null</code> when the key does not exist in Redis.</div>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">ValueTask&lt;byte[]?&gt; GetBytesAsync(
+    string key,
+    CancellationToken cancellationToken = default);</code></pre></div></div>
+</div>
+</div>
 <div class="member" id="setasync">
 <div class="row">
 <div class="prose">
@@ -490,6 +504,21 @@ services.AddRedisNearCache(o =&gt;
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">ValueTask SetAsync&lt;T&gt;(
     string key,
     T value,
+    TimeSpan? expiry = null,
+    CancellationToken cancellationToken = default);</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="setbytesasync">
+<div class="row">
+<div class="prose">
+<h3>SetBytesAsync<span class="pill">method</span> <a class="anchor" href="#setbytesasync" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">ValueTask SetBytesAsync(string key, ReadOnlyMemory&lt;byte&gt; value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)</div>
+<p>Same as <code>SetAsync&lt;T&gt;</code>, but writes <code>value</code> as is, without the configured <code>Serializer</code>. The bytes are copied before the write, so the caller may reuse its buffer as soon as the call returns.</p>
+
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">ValueTask SetBytesAsync(
+    string key,
+    ReadOnlyMemory&lt;byte&gt; value,
     TimeSpan? expiry = null,
     CancellationToken cancellationToken = default);</code></pre></div></div>
 </div>
@@ -512,7 +541,7 @@ services.AddRedisNearCache(o =&gt;
 <div class="prose">
 <h3>EvictLocal<span class="pill">method</span> <a class="anchor" href="#evictlocal" aria-label="Link to this member">#</a></h3>
 <div class="sig-inline">void EvictLocal(string key)</div>
-<p>Evicts the L1 copy only. Redis is not touched. Use this to force the next read to re-fetch from Redis without deleting the key.</p>
+<p>Evicts the L1 copy only. Redis is not touched. Use this to force the next read to re-fetch from Redis without deleting the key. A read of the key already in flight when this is called does not store its reply.</p>
 
 </div>
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">void EvictLocal(string key);</code></pre></div></div>
@@ -700,10 +729,10 @@ services.AddRedisNearCacheHybridCache();</code></pre></div></div>
 <div class="prose">
 <h3>RedisNearCacheDistributedCache<span class="pill">class</span> <a class="anchor" href="#redisnearcachedistributedcache" aria-label="Link to this member">#</a></h3>
 <div class="sig-inline">public sealed class RedisNearCacheDistributedCache : IDistributedCache, IBufferDistributedCache</div>
-<p>Adapts <code>IRedisNearCache</code> to <code>IDistributedCache</code> and <code>IBufferDistributedCache</code>. Values are stored as raw <code>byte[]</code>/<code>ReadOnlySequence&lt;byte&gt;</code> through <code>IRedisNearCache.GetAsync&lt;T&gt;</code> and <code>SetAsync&lt;T&gt;</code> instantiated at <code>byte[]</code>; the default <code>IRedisNearCacheSerializer</code> passes <code>byte[]</code> through untouched, so no double-encoding happens. Every sync member (<code>Get</code>, <code>Set</code>, <code>Remove</code>, <code>TryGet</code>) simply calls its async counterpart and blocks with <code>.GetAwaiter().GetResult()</code>; prefer the async members.</p><p><strong>Sliding expiration limitation.</strong> Redis TTLs, and RedisNearCache&#8217;s <code>SetAsync</code>, have no notion of a sliding window. <code>DistributedCacheEntryOptions.SlidingExpiration</code> is mapped to a plain absolute expiry equal to the sliding window, applied once at write time, and is never extended by a later read.</p><p><strong><code>Refresh</code>/<code>RefreshAsync</code> are no-ops</strong> for this reason: the Redis TTL set at write time is authoritative until the key expires, is overwritten, or is deleted. Callers that need a true sliding window must re-<code>Set</code> on each access themselves.</p>
+<p>Adapts <code>IRedisNearCache</code> to <code>IDistributedCache</code> and <code>IBufferDistributedCache</code>. Values are stored exactly as given, through <code>IRedisNearCache.GetBytesAsync</code> and <code>SetBytesAsync</code>. The configured <code>IRedisNearCacheSerializer</code> is never involved, so any serializer works alongside the adapter and other <code>IDistributedCache</code> clients see the same bytes. Every sync member (<code>Get</code>, <code>Set</code>, <code>Remove</code>, <code>TryGet</code>) simply calls its async counterpart and blocks with <code>.GetAwaiter().GetResult()</code>; prefer the async members.</p><p><strong>Sliding expiration limitation.</strong> Redis TTLs, and RedisNearCache&#8217;s <code>SetAsync</code>, have no notion of a sliding window. <code>DistributedCacheEntryOptions.SlidingExpiration</code> is mapped to a plain absolute expiry equal to the sliding window, applied once at write time, and is never extended by a later read.</p><p><strong><code>Refresh</code>/<code>RefreshAsync</code> are no-ops</strong> for this reason: the Redis TTL set at write time is authoritative until the key expires, is overwritten, or is deleted. Callers that need a true sliding window must re-<code>Set</code> on each access themselves.</p>
 
 </div>
-<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">expiry resolution</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">// DistributedCacheEntryOptions -&gt; TimeSpan? passed to SetAsync
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">expiry resolution</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">// DistributedCacheEntryOptions -&gt; TimeSpan? passed to SetBytesAsync
 // 1. AbsoluteExpirationRelativeToNow, if set
 // 2. AbsoluteExpiration, converted to a relative duration
 // 3. SlidingExpiration, treated as an absolute expiry
