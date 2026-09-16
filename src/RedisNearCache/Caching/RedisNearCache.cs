@@ -54,6 +54,17 @@ internal sealed class RedisNearCache : IRedisNearCache
     private int _ttlCapWarned;
 
     /// <summary>
+    /// Consecutive misses whose TTL could not be read at all. Reset by the first success. A cap that cannot be read
+    /// means the value is served but not stored, so a lasting failure would otherwise turn the cache off for those keys
+    /// silently and indefinitely; at <see cref="TtlFailuresBeforeGivingUpTheCap"/> the cap is abandoned instead, which
+    /// is the documented behaviour when a server refuses <c>PTTL</c>.
+    /// </summary>
+    private int _consecutiveTtlFailures;
+
+    /// <summary>How many misses in a row may fail to read a TTL before the cap is abandoned rather than the cache.</summary>
+    private const int TtlFailuresBeforeGivingUpTheCap = 3;
+
+    /// <summary>
     /// Set once the server has rejected CLIENT CACHING inside a transaction (EXECABORT): untracked reads are not
     /// possible there, so keys outside KeyPrefixes are read with a plain, tracked GET, as before 0.5.2. Logged once.
     /// </summary>
@@ -362,6 +373,7 @@ internal sealed class RedisNearCache : IRedisNearCache
                 try
                 {
                     ttlMilliseconds = (long)await ttlTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    Volatile.Write(ref _consecutiveTtlFailures, 0);
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
@@ -389,6 +401,7 @@ internal sealed class RedisNearCache : IRedisNearCache
                         // Null is "no expiry" here, and also the (already invalidated) key that vanished meanwhile: the
                         // in-flight check below discards that reply, so storing it uncapped is not a staleness window.
                         ttlMilliseconds = typed is { } remaining ? (long)remaining.TotalMilliseconds : -1;
+                        Volatile.Write(ref _consecutiveTtlFailures, 0);
                         _logger.LogDebug(ex, "RedisNearCache could not read PTTL for {Key} directly; the typed TTL answered instead", key);
                     }
                     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -404,6 +417,18 @@ internal sealed class RedisNearCache : IRedisNearCache
                         else
                             _logger.LogDebug(fallback, "RedisNearCache could not read the TTL of {Key}; the value is served but not cached", key);
                         ttlUnknown = true;
+
+                        // Neither command can be answered. If that keeps happening, give up the cap rather than the
+                        // cache: an entry stored for L1MaxAge is what RespectServerTtl=false does, and an invalidation
+                        // still evicts it, whereas storing nothing at all leaves this instance reading through to Redis
+                        // for as long as the condition lasts, with nothing in the statistics to show for it.
+                        if (Interlocked.Increment(ref _consecutiveTtlFailures) >= TtlFailuresBeforeGivingUpTheCap
+                            && Interlocked.Exchange(ref _ttlCapUnavailable, 1) == 0)
+                        {
+                            _logger.LogWarning(fallback,
+                                "RedisNearCache could not read a TTL on {Failures} misses in a row, so RespectServerTtl is abandoned: L1 entries are capped by L1MaxAge only from now on",
+                                TtlFailuresBeforeGivingUpTheCap);
+                        }
                     }
                 }
             }

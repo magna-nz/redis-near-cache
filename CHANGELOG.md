@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Fix: when neither `PTTL` nor the typed TTL can be answered, the cap is now abandoned after three misses in a row
+  rather than the cache. A miss with no cap is served but not stored, so a lasting failure used to leave the instance
+  reading through to Redis for those keys indefinitely, silently: no counter moved and the cache still reported itself
+  coherent. Giving up the cap is what `RespectServerTtl=false` does, invalidations still evict, and it is reported at
+  Warning. A single success resets the run, so a blip changes nothing. This is what made `ReshardDuringReadsNoStale`
+  fail in about half of CI runs after a slot moved; the reshard test now also captures the library's own log lines so a
+  recurrence names the underlying error.
+
 ## 0.7.0 (2026-09-16)
 
 - Fix: a miss whose `PTTL` failed served the value but cached nothing, and did so silently and for as long as the

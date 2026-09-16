@@ -105,6 +105,53 @@ public class TtlCapFacadeTests
     }
 
     [Fact]
+    public async Task RepeatedTtlFailuresGiveUpTheCapRatherThanTheCache()
+    {
+        var (mux, cache) = await StartAsync();
+        await using var lifetime = cache;
+
+        // Neither the raw nor the typed TTL can be answered. Serving the value uncached is right for a blip, but a
+        // lasting failure would leave this instance reading through to Redis for every key, silently: nothing in the
+        // statistics moves, and the cache still reports itself coherent. After a few misses in a row the cap is
+        // abandoned instead, which is exactly what RespectServerTtl=false does.
+        mux.PttlFailure = new RedisConnectionException(ConnectionFailureType.UnableToConnect, "No connection is available to service this operation");
+        mux.TypedTtlFailure = new RedisConnectionException(ConnectionFailureType.UnableToConnect, "No connection is available to service this operation");
+
+        for (var i = 0; i < 3; i++)
+        {
+            Assert.Equal("v1", await cache.GetAsync<string>(Key));
+            Assert.False(cache.TryGetLocal<string>(Key, out _), $"read {i + 1} must be served without being cached while the cap is unknown.");
+        }
+
+        Assert.Equal("v1", await cache.GetAsync<string>(Key));
+        Assert.True(cache.TryGetLocal<string>(Key, out _), "after repeated TTL failures the cap must be abandoned, not the cache.");
+        Assert.Equal(0, cache.Statistics.RaceDiscards);
+    }
+
+    [Fact]
+    public async Task ASuccessfulTtlResetsTheFailureRun()
+    {
+        var (mux, cache) = await StartAsync();
+        await using var lifetime = cache;
+
+        // Two failures, then an answer: the run restarts, so an occasional blip never abandons the cap.
+        mux.PttlFailure = new RedisTimeoutException("timeout", CommandStatus.Unknown);
+        mux.TypedTtlFailure = new RedisTimeoutException("timeout", CommandStatus.Unknown);
+        for (var i = 0; i < 2; i++) Assert.Equal("v1", await cache.GetAsync<string>(Key));
+
+        mux.PttlFailure = null;
+        mux.TypedTtlFailure = null;
+        Assert.Equal("v1", await cache.GetAsync<string>(Key));
+        Assert.True(cache.TryGetLocal<string>(Key, out _));
+        cache.EvictLocal(Key);
+
+        mux.PttlFailure = new RedisTimeoutException("timeout", CommandStatus.Unknown);
+        mux.TypedTtlFailure = new RedisTimeoutException("timeout", CommandStatus.Unknown);
+        Assert.Equal("v1", await cache.GetAsync<string>(Key));
+        Assert.False(cache.TryGetLocal<string>(Key, out _), "the run restarted, so this single failure must not have abandoned the cap yet.");
+    }
+
+    [Fact]
     public async Task ServerRejectingPttlDisablesTheCapInsteadOfTheCache()
     {
         var (mux, cache) = await StartAsync();
