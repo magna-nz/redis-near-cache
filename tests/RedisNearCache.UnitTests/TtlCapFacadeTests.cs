@@ -72,15 +72,36 @@ public class TtlCapFacadeTests
         var (mux, cache) = await StartAsync();
         await using var lifetime = cache;
         mux.PttlFailure = new RedisTimeoutException("timeout", CommandStatus.Unknown);
+        mux.TypedTtlFailure = new RedisTimeoutException("timeout", CommandStatus.Unknown);
         Assert.Equal("v1", await cache.GetAsync<string>(Key));
         Assert.False(cache.TryGetLocal<string>(Key, out _));
         Assert.Equal(0, cache.Statistics.RaceDiscards);
 
         // Transient: the next miss asks again and, once PTTL answers, caches.
         mux.PttlFailure = null;
+        mux.TypedTtlFailure = null;
         Assert.Equal("v1", await cache.GetAsync<string>(Key));
         Assert.True(cache.TryGetLocal<string>(Key, out _));
         Assert.Equal(2, mux.PttlCalls);
+    }
+
+    [Fact]
+    public async Task TypedTtlAnswersWhenTheRawPttlCannotBeRouted()
+    {
+        var (mux, cache) = await StartAsync();
+        await using var lifetime = cache;
+
+        // A raw Execute is not redirected the way a keyed command is, so on a resharding cluster the PTTL can fail for
+        // a key whose slot has moved while the GET beside it succeeds. Without the typed fallback that key stays
+        // uncacheable for as long as the condition lasts: served from Redis on every read, and silently so.
+        mux.StoredTtlMilliseconds = 60_000;
+        mux.PttlFailure = new RedisConnectionException(ConnectionFailureType.UnableToConnect, "No connection is available to service this operation");
+
+        Assert.Equal("v1", await cache.GetAsync<string>(Key));
+        Assert.True(cache.TryGetLocal<string>(Key, out _), "the typed TTL answered, so the value must be cached under its cap.");
+        Assert.Equal(1, mux.PttlCalls);
+        Assert.Equal(1, mux.TypedTtlCalls);
+        Assert.Equal(0, cache.Statistics.RaceDiscards);
     }
 
     [Fact]

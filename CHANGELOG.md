@@ -2,6 +2,14 @@
 
 ## 0.7.0 (2026-09-16)
 
+- Fix: a miss whose `PTTL` failed served the value but cached nothing, and did so silently and for as long as the
+  failure lasted, because `RespectServerTtl` will not store an entry without a cap. The raw `PTTL` goes out as an
+  `Execute`, which is not redirected the way a keyed command is, so on a resharding cluster it can fail for a key
+  whose slot has moved while the `GET` beside it succeeds; that key then stayed uncacheable. The miss now falls
+  back to the typed TTL once, which is routed and redirected like any other keyed command, and only when that
+  fails too is the value served uncached, reported once at Warning rather than per read. Covered by
+  `TypedTtlAnswersWhenTheRawPttlCannotBeRouted`; it is what made `ReshardDuringReadsNoStale` fail intermittently
+  in CI, where a migrated key was read 1,471 times without ever being cached.
 - Feature: Entra ID (`Microsoft.Azure.StackExchangeRedis`) token rotation is honoured in `TrackingMode.Broadcast`
   while a broadcast connection is live, not just on its next reconnect. RedisNearCache clones the caller's
   `ConfigurationOptions`, and the clone shares the extension's token provider: StackExchange.Redis resolves
