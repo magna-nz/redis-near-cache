@@ -10,7 +10,7 @@
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License" /></a>
   </p>
   <p>
-    <a href="#redis-enterprise-azure-managed-redis-redis-cloud"><img src="https://img.shields.io/badge/works%20with-Azure%20Managed%20Redis%20%C2%B7%20Redis%20Cloud%20%C2%B7%20Redis%20Software-DC382D" alt="Works with Azure Managed Redis, Redis Cloud and Redis Software" /></a>
+    <a href="https://magna-nz.github.io/redis-near-cache/#enterprise"><img src="https://img.shields.io/badge/works%20with-Azure%20Managed%20Redis%20%C2%B7%20Redis%20Cloud%20%C2%B7%20Redis%20Software-DC382D" alt="Works with Azure Managed Redis, Redis Cloud and Redis Software" /></a>
     <a href="#entraid-auth"><img src="https://img.shields.io/badge/supports-EntraID-0078D4" alt="Supports EntraID" /></a>
   </p>
   <p><a href="https://magna-nz.github.io/redis-near-cache/">Documentation</a></p>
@@ -35,7 +35,7 @@ RedisNearCache is for code that already runs on StackExchange.Redis.
   <sub><strong>Only reads that go through the cache are tracked.</strong> Writes can come from anywhere.</sub>
   <br />
   <sub>One invalidation channel or the other, decided by the server you run: <code>Redirect</code> by default,
-  <a href="#redis-enterprise-azure-managed-redis-redis-cloud"><code>Broadcast</code></a> on Redis Enterprise-based services.</sub>
+  <a href="https://magna-nz.github.io/redis-near-cache/#enterprise"><code>Broadcast</code></a> on Redis Enterprise-based services.</sub>
 </div>
 
 <br />
@@ -53,13 +53,18 @@ Add `RedisNearCache.HybridCache` as well if you want it behind `HybridCache` or 
 
 ## Where it runs
 
-| Platform | Mode | Tested |
-|---|---|---|
-| Redis 6+ (self-hosted, Docker, Kubernetes), Valkey | `Redirect` (default) | CI on Redis 6.2, 7.0, 7.2, 7.4, 8 and Valkey 8.1: standalone, replica, TLS, cluster, Sentinel. `Broadcast` also runs in the same jobs |
-| Azure Managed Redis, Redis Cloud, Redis Software (databases 7.4+) | [`Broadcast`](#redis-enterprise-azure-managed-redis-redis-cloud), with `KeyPrefixes` set; access keys or Entra ID tokens | CI against Redis Software in Docker (`enterprise-up.sh`, the same proxy those services run). Not yet run against a real Azure or Redis Cloud instance; `RNC_ENTERPRISE_REDIS` points the Enterprise suite at one |
-| Azure Cache for Redis (Basic, Standard, Premium), node-based ElastiCache (Redis OSS, Valkey) | `Redirect` | Their restrictions (disabled admin commands, hostname-announcing cluster) are emulated in CI, not tested against the real services; `RNC_EXTERNAL_REDIS` runs a check against one |
-| ElastiCache Serverless | Not supported | It disables `CLIENT TRACKING`, `CLIENT CACHING`, `CLIENT TRACKINGINFO`, `CLIENT LIST` and `CLIENT ID` |
-| Garnet | Not supported | It does not implement `CLIENT TRACKING` |
+| Platform | Mode |
+|---|---|
+| Redis 6+ (self-hosted, Docker, Kubernetes), Valkey | `Redirect` (default) |
+| Azure Managed Redis, Redis Cloud, Redis Software (databases 7.4+) | [`Broadcast`](https://magna-nz.github.io/redis-near-cache/#enterprise), with `KeyPrefixes` set |
+| Azure Cache for Redis (Basic, Standard, Premium), node-based ElastiCache (Redis OSS, Valkey) | `Redirect` |
+| ElastiCache Serverless | Not supported — it disables `CLIENT TRACKING` |
+| Garnet | Not supported — it does not implement `CLIENT TRACKING` |
+
+<sub>CI runs the suite on Redis 6.2, 7.0, 7.2, 7.4, 8 and Valkey 8.1 (standalone, replica, TLS, cluster, Sentinel,
+both modes) and against Redis Software in Docker for the Enterprise proxy. The managed services' restrictions are
+emulated in CI rather than tested against the real thing —
+[what is and is not tested](https://magna-nz.github.io/redis-near-cache/#testing).</sub>
 
 ## Use
 
@@ -69,8 +74,8 @@ Redis or Valkey reached directly (self-hosted, ElastiCache node-based, Azure Cac
 services.AddRedisNearCache("localhost:6379");
 ```
 
-Redis Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis Software), whose proxy needs the
-broadcast mode [described below](#redis-enterprise-azure-managed-redis-redis-cloud):
+Redis Enterprise-based services (Azure Managed Redis, Redis Cloud, Redis Software), whose proxy needs
+[broadcast mode](https://magna-nz.github.io/redis-near-cache/#enterprise):
 
 ```csharp
 services.AddRedisNearCache("my-cache.region.redis.azure.net:10000,ssl=true,password=<access-key>", o =>
@@ -124,16 +129,6 @@ services.AddRedisNearCache(o =>
 });
 ```
 
-## Redis Enterprise, Azure Managed Redis, Redis Cloud
-
-The proxy in front of these services cannot serve the default `Redirect` mode, so they need
-`TrackingMode.Broadcast` with `KeyPrefixes` set ([registration above](#use)). Broadcast opens one small RESP3
-connection per master and receives a push for every write under those prefixes, whether or not this instance
-read the key; reads still go through the private multiplexer unchanged.
-
-Why the proxy needs this mode, what `KeyPrefixes` costs, and how TLS and credential rotation behave on that
-connection: [the documentation](https://magna-nz.github.io/redis-near-cache/#enterprise).
-
 ## Performance
 
 20 app instances, 160 readers, and 2,000 writes/s from another service straight to Redis. Redis 7.4 on one machine,
@@ -153,16 +148,6 @@ TTL caches set to 10 s.
 
 **[Full results and methodology →](bench/RedisNearCache.Bench/README.md)** Covers server traffic, latency sweeps,
 writes through each library's own API, cluster, TLS, Valkey, chaos, and per-call costs.
-
-## How it stays correct
-
-- The private connection is armed with `CLIENT TRACKING ON REDIRECT <subscriber> NOLOOP` on every master.
-- An interactive or subscriber reconnect re-arms that node and flushes the local cache; the cache serves
-  straight from Redis until every master is armed again.
-- A read whose key was invalidated while the reply was in flight is not cached.
-- If tracking cannot be armed at all, every read goes to Redis and nothing is cached, ever, until it can.
-- In `TrackingMode.Broadcast`, a dedicated RESP3 connection per master receives a push for every write under
-  `KeyPrefixes`; the same reconnect-then-flush rule applies if that connection is lost.
 
 ## Docs
 
