@@ -75,6 +75,12 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
     /// <summary>Interval between background retries once the fast backoff ladder has been exhausted.</summary>
     internal static readonly TimeSpan SlowRetryInterval = TrackingRetry.SlowInterval;
 
+    /// <summary>While a master that lost its slots waits for their new owners to be armed: how many rounds between forced reconfigures.</summary>
+    private const int ReconfigureEveryRounds = 6;
+
+    /// <summary>While a master that lost its slots waits for their new owners to be armed: the round from which the wait is logged as a warning.</summary>
+    private const int WarnAfterRounds = 3;
+
     private static readonly IReadOnlyDictionary<EndPoint, long> NoReplicas = new Dictionary<EndPoint, long>();
 
     private readonly RedisNearCacheConnection _connection;
@@ -937,14 +943,17 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
         {
             try
             {
+                var takeoverRounds = 0;
                 while (!token.IsCancellationRequested)
                 {
                     await Task.Delay(SlowRetryInterval, token).ConfigureAwait(false);
                     if (!_lost.ContainsKey(endPoint)) return; // armed or forgotten meanwhile
                     // A disconnected cluster master looks like a master to the multiplexer forever; the shared probe
                     // asks a connected node for CLUSTER NODES, and keeps the endpoint when nothing can answer.
-                    if (!await (_probe ??= new MasterProbe(_connection.Multiplexer, _logger)).IsKnownMasterAsync(endPoint, token).ConfigureAwait(false))
+                    var probe = await (_probe ??= new MasterProbe(_connection.Multiplexer, _logger)).ProbeAsync(endPoint, token).ConfigureAwait(false);
+                    if (!probe.IsKnownMaster)
                     {
+                        if (!await TakeoverArmedAsync(endPoint, probe.ClusterNodes, ++takeoverRounds, token).ConfigureAwait(false)) continue;
                         _logger.LogInformation("RedisNearCache stopped retrying {EndPoint}: it is no longer a master of this deployment", endPoint);
                         RemoveEndpoint(endPoint);
                         return;
@@ -971,6 +980,125 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
                     RetryLater(endPoint, originalReason);
             }
         }, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// A lost endpoint no longer serves slots. Forgetting it lets the facade cache again, so first every master
+    /// that serves slots now (whoever took this endpoint's over included) must have an armed socket: until then,
+    /// writes there produce no invalidations. The multiplexer only relearns a promoted node's role at its periodic
+    /// check, which nothing bounds, so a full reconfigure is forced (on the first round, then every
+    /// <see cref="ReconfigureEveryRounds"/> rounds) and the new masters are armed at once; this then waits up to
+    /// <see cref="SlowRetryInterval"/> for those arms and otherwise leaves the endpoint lost (the facade in
+    /// pass-through) for the next round.
+    /// </summary>
+    /// <param name="retiring">The endpoint about to be forgotten.</param>
+    /// <param name="clusterNodes">The <c>CLUSTER NODES</c> view that retired it, if the probe needed one.</param>
+    /// <param name="round">1 on the first attempt for this endpoint, 2 on the next, and so on.</param>
+    /// <param name="cancellationToken">Cancellation.</param>
+    private async Task<bool> TakeoverArmedAsync(EndPoint retiring, IReadOnlyList<ClusterNodeView>? clusterNodes, int round, CancellationToken cancellationToken)
+    {
+        var probe = _probe ??= new MasterProbe(_connection.Multiplexer, _logger);
+        var resolved = new Dictionary<string, IPAddress[]>(StringComparer.OrdinalIgnoreCase);
+
+        // The multiplexer's own view may have decided the retirement (the node came back as a replica), but in a
+        // cluster only the slot map says who serves the slots now.
+        var isCluster = true;
+        if (clusterNodes is null) (isCluster, clusterNodes) = await probe.ClusterNodesAsync(retiring, cancellationToken).ConfigureAwait(false);
+        var unarmed = isCluster && clusterNodes is null
+            ? ["the cluster topology (no node answered CLUSTER NODES)"]
+            : await UnarmedMastersAsync(retiring, clusterNodes, resolved, cancellationToken).ConfigureAwait(false);
+        if (unarmed.Count == 0) return true;
+
+        if (round == 1 || round % ReconfigureEveryRounds == 0)
+        {
+            try
+            {
+                await _connection.Multiplexer.ConfigureAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "RedisNearCache could not reconfigure the private multiplexer after {EndPoint} lost its slots", retiring);
+            }
+        }
+
+        Reconcile("master retirement");
+        if (clusterNodes is not null || !isCluster)
+        {
+            var waited = System.Diagnostics.Stopwatch.StartNew();
+            while (waited.Elapsed < SlowRetryInterval)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken).ConfigureAwait(false);
+                unarmed = await UnarmedMastersAsync(retiring, clusterNodes, resolved, cancellationToken).ConfigureAwait(false);
+                if (unarmed.Count > 0) continue;
+                if (!isCluster) return true;
+
+                // The view above is up to a wait old: the retiring node may have taken its slots back meanwhile.
+                var (_, fresh) = await probe.ClusterNodesAsync(retiring, cancellationToken).ConfigureAwait(false);
+                if (fresh is null || MasterRole.FromClusterNodes(retiring, fresh))
+                {
+                    _logger.LogDebug("RedisNearCache keeps {EndPoint} lost: the cluster topology could not be re-read, or it serves slots again", retiring);
+                    return false;
+                }
+                unarmed = await UnarmedMastersAsync(retiring, fresh, resolved, cancellationToken).ConfigureAwait(false);
+                if (unarmed.Count == 0) return true;
+                clusterNodes = fresh;
+            }
+        }
+
+        _logger.Log(round >= WarnAfterRounds ? LogLevel.Warning : round == 1 ? LogLevel.Information : LogLevel.Debug,
+            "RedisNearCache keeps {EndPoint} lost although it serves no slots: not armed yet [{Unarmed}] (round {Round}); the cache stays in pass-through",
+            retiring, string.Join(", ", unarmed), round);
+        return false;
+    }
+
+    /// <summary>
+    /// What still lacks an armed socket before <paramref name="retiring"/> may be forgotten: every connected
+    /// master other than it and, in a cluster, every slot-owning master of <paramref name="clusterNodes"/>
+    /// (matched to socket endpoints as <see cref="MasterProbe"/> matches them; <paramref name="resolved"/> caches
+    /// host lookups). Empty when nothing does.
+    /// </summary>
+    private async Task<List<string>> UnarmedMastersAsync(EndPoint retiring, IReadOnlyList<ClusterNodeView>? clusterNodes, Dictionary<string, IPAddress[]> resolved, CancellationToken cancellationToken)
+    {
+        var unarmed = new List<string>();
+        foreach (var master in MasterEndPoints())
+        {
+            if (!master.Equals(retiring) && !_sockets.ContainsKey(master)) unarmed.Add(master.ToString() ?? "?");
+        }
+
+        if (clusterNodes is null) return unarmed;
+
+        var armed = _sockets.Keys.Where(ep => !ep.Equals(retiring)).ToArray();
+        foreach (var dns in armed.OfType<DnsEndPoint>())
+        {
+            if (resolved.ContainsKey(dns.Host)) continue;
+            try
+            {
+                resolved[dns.Host] = await Dns.GetHostAddressesAsync(dns.Host, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "RedisNearCache could not resolve {Host} while matching armed endpoints to slot owners", dns.Host);
+                resolved[dns.Host] = [];
+            }
+        }
+
+        foreach (var node in clusterNodes)
+        {
+            if (node.IsReplica || !node.OwnsSlots) continue;
+            if (armed.Any(ep => MasterRole.Matches(ep, node, ep is DnsEndPoint d ? resolved.GetValueOrDefault(d.Host) : null))) continue;
+            var name = node.EndPoint?.ToString() ?? "(no address)";
+            if (!unarmed.Contains(name)) unarmed.Add($"slot owner {name}");
+        }
+
+        return unarmed;
     }
 
     /// <summary>
