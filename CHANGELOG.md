@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 (2026-09-16)
 
 - Fix: when neither `PTTL` nor the typed TTL can be answered, the cap is now abandoned after three misses in a row
   rather than the cache. A miss with no cap is served but not stored, so a lasting failure used to leave the instance
@@ -9,6 +9,12 @@
   Warning. A single success resets the run, so a blip changes nothing. This is what made `ReshardDuringReadsNoStale`
   fail in about half of CI runs after a slot moved; the reshard test now also captures the library's own log lines so a
   recurrence names the underlying error.
+- Docs: the README carries one diagram covering both tracking modes instead of a separate one per mode; the
+  platform table drops its `Tested` column; the `Redis Enterprise` and `How it stays correct` sections are gone from
+  the README and every link that pointed at them now points at the documentation site, which already covered both.
+  The three `works with` badges are one badge, and `supports EntraID` became `auth: ACL · Entra ID · mTLS`, which is
+  what the library actually accepts. On the documentation site, six lines that read as machine-written were cut or
+  rewritten, including a note to the author that was being published to readers.
 
 ## 0.7.0 (2026-09-16)
 
