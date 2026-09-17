@@ -101,7 +101,18 @@ internal sealed class TrackingArmer : ITrackingArmer
         _connection = connection;
         _logger = logger;
         _reconcileInterval = reconcileInterval ?? DefaultReconcileInterval;
+        _takeover = new TakeoverGuard(() => _connection.Multiplexer, _logger, MasterEndPoints, TrackedEndPoints, Reconcile);
     }
+
+    /// <summary>Decides when an endpoint that stopped being a master may be forgotten (see <see cref="TakeoverGuard"/>).</summary>
+    private readonly TakeoverGuard _takeover;
+
+    /// <summary>
+    /// Where tracking is on now: armed masters not announced lost, and pre-armed replicas (whose tracking already
+    /// covers every read routed to them once promoted).
+    /// </summary>
+    private IReadOnlyCollection<EndPoint> TrackedEndPoints() =>
+        _redirectTargets.Keys.Where(ep => !_lost.ContainsKey(ep)).Concat(_replicaTargets.Keys).Distinct().ToArray();
 
     /// <inheritdoc />
     public event Action<TrackingArmedEvent>? Armed;
@@ -362,12 +373,14 @@ internal sealed class TrackingArmer : ITrackingArmer
         if (server.IsReplica)
         {
             // Nothing to arm on a replica. If we had armed it, or told the facade it was lost (every non-initial
-            // arm does), it was a master and has been demoted: forget it, which flushes L1 and releases the facade
-            // from pass-through. Returning without an event would leave the facade waiting for it forever.
+            // arm does), it was a master and has been demoted: forget it once whoever serves now is tracked, which
+            // flushes L1 and releases the facade from pass-through. Returning without that would leave the facade
+            // waiting for it forever; forgetting it at once would let the facade cache while the promoted node may
+            // still be untracked (a killed master restarting as a replica often beats the multiplexer to the news).
             if (_redirectTargets.ContainsKey(endPoint) || _lost.ContainsKey(endPoint))
             {
-                _logger.LogInformation("RedisNearCache found {EndPoint} is a replica now ({Reason}); forgetting it", endPoint, reason);
-                RemoveEndpoint(endPoint);
+                _logger.LogInformation("RedisNearCache found {EndPoint} is a replica now ({Reason})", endPoint, reason);
+                RetireWhenTakeoverArmed(endPoint, $"re-arm ({reason})");
             }
             else
             {
@@ -633,6 +646,9 @@ internal sealed class TrackingArmer : ITrackingArmer
                 if (promoted) continue;
 
                 _logger.LogInformation("RedisNearCache saw a {Cause} adding master {EndPoint}; arming CLIENT TRACKING", cause, endPoint);
+                // Announced here rather than on the arm's own task: reads may already be routed to the new master, and
+                // the facade must not store them before its tracking is on.
+                if (!_lost.ContainsKey(endPoint)) MarkLost(endPoint, forgetRedirect: false);
                 QueueArm(endPoint, ArmReason.TopologyChanged);
             }
 
@@ -646,8 +662,7 @@ internal sealed class TrackingArmer : ITrackingArmer
                     foreach (var endPoint in candidates)
                     {
                         if (MasterRole.FromMultiplexer(endPoint, servers) is not false) continue;
-                        _logger.LogInformation("RedisNearCache saw a {Cause} after which {EndPoint} is no longer a master of this deployment", cause, endPoint);
-                        RemoveEndpoint(endPoint);
+                        RetireWhenTakeoverArmed(endPoint, cause);
                     }
                 }
             }
@@ -657,6 +672,36 @@ internal sealed class TrackingArmer : ITrackingArmer
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "RedisNearCache failed to handle a {Cause}", cause);
+        }
+    }
+
+    /// <summary>
+    /// Starts (at most one per endpoint) a loop that forgets an armed or lost endpoint the multiplexer reports as no
+    /// longer a master, but only once <see cref="TakeoverGuard.TakeoverArmedAsync"/> finds every master serving now
+    /// tracked. A demoted node that is still armed keeps its redirect meanwhile: its tracking still covers the keys
+    /// read from it, and a promoted node is either pre-armed or announced lost by <see cref="Reconcile"/>. The loop
+    /// stops without forgetting anything if the endpoint is forgotten elsewhere or the multiplexer no longer reports
+    /// it as a non-master; an endpoint still announced lost is then handed to the retry loop.
+    /// </summary>
+    private void RetireWhenTakeoverArmed(EndPoint endPoint, string cause)
+    {
+        CancellationToken token;
+        try { token = _shutdown.Token; } catch (ObjectDisposedException) { return; }
+        _takeover.RetireWhenArmed(endPoint, cause, StillRetiring, () => RemoveEndpoint(endPoint), Abandoned, token);
+
+        bool StillRetiring()
+        {
+            if (Volatile.Read(ref _disposed) == 1) return false;
+            if (!_redirectTargets.ContainsKey(endPoint) && !_lost.ContainsKey(endPoint)) return false; // forgotten elsewhere
+            var servers = ServerViews();
+            // No view, or no longer a non-master (a master again, or a disconnected cluster node): the reconcile or the
+            // retry loop decides from here.
+            return servers.Count > 0 && MasterRole.FromMultiplexer(endPoint, servers) is false;
+        }
+
+        void Abandoned()
+        {
+            if (_lost.ContainsKey(endPoint) && Volatile.Read(ref _disposed) == 0) RetryLater(endPoint, ArmReason.Recovered);
         }
     }
 
@@ -983,7 +1028,8 @@ internal sealed class TrackingArmer : ITrackingArmer
 
     /// <summary>
     /// Starts (at most one per endpoint) a loop that re-tries the arm every <see cref="SlowRetryInterval"/>
-    /// until the endpoint is armed, it stops being a master (then <see cref="EndpointRemoved"/> is raised), it
+    /// until the endpoint is armed, it stops being a master and its takeover is tracked (then
+    /// <see cref="EndpointRemoved"/> is raised, see <see cref="TakeoverGuard"/>), it
     /// was forgotten by another path, or we are disposed. A recovery is always reported as
     /// <see cref="ArmReason.Recovered"/> so the facade flushes: reads in flight while the node was untracked must
     /// be discarded.
@@ -1000,12 +1046,18 @@ internal sealed class TrackingArmer : ITrackingArmer
         {
             try
             {
+                var takeoverRounds = 0;
                 while (!token.IsCancellationRequested)
                 {
                     await Task.Delay(SlowRetryInterval, token).ConfigureAwait(false);
                     if (!_lost.ContainsKey(endPoint)) return; // armed or forgotten meanwhile: the facade is not waiting on it
-                    if (!await IsKnownMasterAsync(endPoint, token).ConfigureAwait(false))
+                    var probe = await _takeover.Probe.ProbeAsync(endPoint, token).ConfigureAwait(false);
+                    if (!probe.IsKnownMaster)
                     {
+                        // Forgetting it lets the facade cache again: only once whoever serves its slots now is tracked,
+                        // and only one waiter per endpoint (the reconcile may already be retiring it).
+                        if (_takeover.IsRetiring(endPoint)) continue;
+                        if (!await _takeover.TakeoverArmedAsync(endPoint, probe.ClusterNodes, ++takeoverRounds, token).ConfigureAwait(false)) continue;
                         _logger.LogInformation("RedisNearCache stopped retrying {EndPoint}: it is no longer a master of this deployment", endPoint);
                         RemoveEndpoint(endPoint);
                         return;
@@ -1084,15 +1136,6 @@ internal sealed class TrackingArmer : ITrackingArmer
             return false;
         }
     }
-
-    /// <summary>
-    /// True while the endpoint is still a master of the deployment (see <see cref="MasterRole"/>). For a disconnected
-    /// cluster master this asks a connected node for <c>CLUSTER NODES</c>; when no node can answer it stays a master.
-    /// </summary>
-    private MasterProbe? _probe;
-
-    private Task<bool> IsKnownMasterAsync(EndPoint endPoint, CancellationToken cancellationToken) =>
-        (_probe ??= new MasterProbe(_connection.Multiplexer, _logger)).IsKnownMasterAsync(endPoint, cancellationToken);
 
     // --- helpers --------------------------------------------------------------------------------------
 

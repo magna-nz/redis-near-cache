@@ -128,7 +128,7 @@ internal sealed class MasterProbe
 
             if (configuration is null) continue;
             var nodes = configuration.Nodes
-                .Select(n => new ClusterNodeView(n.EndPoint, n.Hostname, n.IsReplica, n.Slots.Count > 0))
+                .Select(n => new ClusterNodeView(n.EndPoint, n.Hostname, n.IsReplica, n.Slots.Sum(r => r.To - r.From + 1)))
                 .ToList();
             return (server.EndPoint!, nodes);
         }

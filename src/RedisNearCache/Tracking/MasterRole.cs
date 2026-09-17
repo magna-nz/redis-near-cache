@@ -7,12 +7,20 @@ namespace RedisNearCache.Tracking;
 /// <summary>One server of the private multiplexer, as <c>GetServers()</c> reported it at one moment.</summary>
 internal readonly record struct ServerView(EndPoint EndPoint, bool IsConnected, bool IsReplica, ServerType ServerType);
 
-/// <summary>One node of a <c>CLUSTER NODES</c> reply, as seen by a connected node.</summary>
+/// <summary>
+/// One node of a <c>CLUSTER NODES</c> reply, as seen by a connected node. StackExchange.Redis leaves nodes flagged
+/// <c>fail</c> out of the view entirely, so a failed master that has not been replaced yet shows up only as slots
+/// that no node serves (see <see cref="MasterRole.ServesAllSlots"/>).
+/// </summary>
 /// <param name="EndPoint">The address the node reports (StackExchange.Redis always parses the IP here, never the hostname).</param>
 /// <param name="Hostname">The hostname the node announces (<c>cluster-announce-hostname</c>), if any.</param>
 /// <param name="IsReplica">Whether the node is a replica in this view.</param>
-/// <param name="OwnsSlots">Whether the node serves at least one slot in this view.</param>
-internal readonly record struct ClusterNodeView(EndPoint? EndPoint, string? Hostname, bool IsReplica, bool OwnsSlots);
+/// <param name="SlotCount">How many slots the node serves in this view.</param>
+internal readonly record struct ClusterNodeView(EndPoint? EndPoint, string? Hostname, bool IsReplica, int SlotCount)
+{
+    /// <summary>Whether the node serves at least one slot in this view.</summary>
+    public bool OwnsSlots => SlotCount > 0;
+}
 
 /// <summary>
 /// Decides whether an endpoint is still a master of the deployment, which is what keeps a lost endpoint worth
@@ -63,7 +71,9 @@ internal static class MasterRole
     /// <summary>
     /// Decides from a connected node's <c>CLUSTER NODES</c> view: the endpoint is a master while it is listed as a
     /// master that still serves slots. A node that is down but still owns its slots (no failover yet) stays a
-    /// master; one whose slots were taken over, or that the cluster no longer lists, does not.
+    /// master; one whose slots were taken over, or that the cluster no longer lists, does not - but only in a view
+    /// whose masters serve every slot. A view with unserved slots is the one a master flagged <c>fail</c> and not yet
+    /// replaced leaves behind (StackExchange.Redis omits such nodes), so the endpoint then stays a master.
     /// </summary>
     /// <param name="endPoint">The multiplexer's endpoint (an <see cref="IPEndPoint"/> or a <see cref="DnsEndPoint"/>).</param>
     /// <param name="nodes">The view, or <see langword="null"/> when no connected node could provide one.</param>
@@ -79,8 +89,19 @@ internal static class MasterRole
             if (Matches(endPoint, node, resolvedAddresses)) return true;
         }
 
-        return false;
+        return !ServesAllSlots(nodes);
     }
+
+    /// <summary>The number of hash slots in a Redis cluster.</summary>
+    public const int ClusterSlots = 16384;
+
+    /// <summary>
+    /// True when the view's masters together serve every one of the <see cref="ClusterSlots"/> slots. False while a
+    /// failed master has not been replaced yet (StackExchange.Redis omits nodes flagged <c>fail</c>), and in a cluster
+    /// that leaves slots unassigned on purpose; either way the view cannot show who took a missing node's slots over.
+    /// </summary>
+    public static bool ServesAllSlots(IEnumerable<ClusterNodeView> nodes) =>
+        nodes.Where(n => !n.IsReplica).Sum(n => (long)n.SlotCount) >= ClusterSlots;
 
     /// <summary>
     /// True when a cluster node is the multiplexer's endpoint. Never plain <see cref="EndPoint"/> equality: against

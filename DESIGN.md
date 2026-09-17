@@ -94,7 +94,7 @@ The armer raises three lifecycle events per endpoint; the facade mirrors them in
 |---|---|---|
 | `TrackingLost` | a connection of a tracked endpoint (armed, waited on, or a connected master) failed, an arm gave up, or any non-initial arm starts | add to lost set, flush |
 | `Armed` | `CLIENT TRACKING ON REDIRECT` verified, or a pre-armed replica promoted (`Promoted`: no re-arm) | flush unless Initial, then remove from lost set |
-| `EndpointRemoved` | an endpoint we armed or lost is no longer a master of the deployment | flush (always), then remove from lost set |
+| `EndpointRemoved` | an endpoint we armed or lost is no longer a master of the deployment, and every master serving now is tracked | flush (always), then remove from lost set |
 
 L1 is read and populated only while the lost set is empty (**pass-through rule**). Every `TrackingLost` is
 followed by `Armed` or `EndpointRemoved` for that endpoint; the armer mutates its own lost set and raises under
@@ -105,7 +105,21 @@ An endpoint we armed counts as tracked **whatever its current replica flag**: in
 multiplexer can flag the old master as a replica before Sentinel kills our connections there, and those failures
 must still flush. `EndpointRemoved` flushes unconditionally because entries read from a node that is no longer a
 tracked master are protected by nothing (its connections may be killed without an invalidation ever arriving).
-A re-arm that finds the node is now a replica raises `EndpointRemoved` rather than returning silently.
+A re-arm that finds the node is now a replica leaves it lost and raises `EndpointRemoved` once the takeover is
+tracked (below), rather than returning silently.
+
+**Forgetting waits for the takeover** (`TakeoverGuard`, shared by both modes). `EndpointRemoved` is what lets the
+facade cache again, so it is raised only once every connected master and, in a cluster, every slot-owning master
+of a fresh `CLUSTER NODES` view is tracked (in `Redirect`, an armed master or a pre-armed replica), in a view whose
+masters serve all 16384 slots; outside a cluster some other master must be connected. Every path that forgets a
+non-master goes through this check: the reconcile, a re-arm that finds a replica, and the retry loop. Otherwise a
+killed master that restarts as a replica, or whose slots `CLUSTER NODES` already shows moved, is forgotten while
+the multiplexer (which relearns a promoted node's role only at its periodic check) has not armed the promoted one,
+and after a kill that node is usually not pre-armed any more (its replication link went down, so the sweep disarmed
+it). While it waits, the private multiplexer is reconfigured (first round, then every sixth) and a reconcile runs; a
+lost endpoint keeps the cache in pass-through, and an armed one that was demoted while connected keeps its tracking,
+which still covers what was read from it. A master the reconcile newly finds (and, in `Redirect`, did not pre-arm) is
+announced lost on the spot, before its arm is queued, so reads routed to it are never stored before it is armed.
 
 **Still a master?** (`MasterRole`) decides between retrying (stay in pass-through) and forgetting an endpoint.
 The multiplexer never changes the role it last saw for a node it cannot reach, so a killed master would otherwise
@@ -117,13 +131,19 @@ be a master forever:
   master that is merely down with no replacement keeps the cache in pass-through; once Sentinel's promoted
   replica is connected, the dead one is forgotten). Checked on every configuration change and by the retry loop.
 - Disconnected cluster master → the retry loop reads `CLUSTER NODES` from a connected node: a master only while it
-  is listed as a master that owns slots (down but not yet failed over stays a master). Nodes are matched on port
+  is listed as a master that owns slots (down but not yet failed over stays a master). StackExchange.Redis leaves a
+  node flagged `fail` out of that view altogether, so between the cluster failing a master and promoting its
+  replica the view simply lacks it and its slots are served by nobody: a view whose masters do not serve all 16384
+  slots keeps the endpoint a master, and the takeover check above refuses such a view too. (Cost: in a cluster that
+  leaves slots unassigned on purpose, no master that stops being one - dead, or demoted by a clean failover - is
+  ever forgotten: a lost one keeps the cache in pass-through for good, and the wait is logged as a warning every few
+  seconds.) Nodes are matched on port
   plus IP, announced hostname, or the resolved addresses of a `DnsEndPoint` — never `EndPoint` equality, because
   against `cluster-preferred-endpoint-type hostname` the multiplexer holds `DnsEndPoint(localhost:7201)` while
   `CLUSTER NODES` yields `127.0.0.1:7201`. No readable view → stays a master.
 
 A graceful cluster failover (`CLUSTER FAILOVER`) keeps our connections: the old master is flagged replica at the
-next topology check and removed (flush). The promoted one, if it was pre-armed while still a replica, is reported
+next topology check and removed (flush) once the promoted one is tracked. The promoted one, if it was pre-armed while still a replica, is reported
 as `Promoted` (no re-arm, so the reads it served since the failover stay tracked, and no pass-through gap; L1 is
 flushed once for the entries read from the demoted master); otherwise it is armed with `TopologyChanged` (flush).
 
@@ -154,10 +174,12 @@ lost endpoint is retired by the same `MasterProbe` check as in `Redirect` (multi
 then `CLUSTER NODES` from a connected node), so a killed cluster master is forgotten once its slots have moved rather
 than holding the cache in pass-through. Forgetting it is what lets the facade cache again, so the retry loop does it
 only once every master that serves slots now (the promoted replica included) has an armed broadcast connection; until
-then the endpoint stays lost, logged as a warning from the third round. While it waits, a reconcile runs and the private
-multiplexer is reconfigured (on the first round, then every sixth), because StackExchange.Redis otherwise learns a promoted node's role only at its
-periodic check, and nothing bounds how long that takes. (The reconcile still forgets a lost endpoint the multiplexer
-already reports as a replica, e.g. a killed master that restarted and rejoined, without this check.) The private multiplexer's `ConnectionFailed` for a master is treated as loss of
+then the endpoint stays lost, logged as a warning from the third round. This is the same `TakeoverGuard` check as in
+`Redirect` (see "Forgetting waits for the takeover"), with an armed broadcast connection as "tracked". An endpoint the multiplexer itself reports as no longer a master (e.g. a killed master that restarted and
+rejoined as a replica, or a master demoted by a manual failover while connected) is retired by the
+reconcile under the same check, because the multiplexer can learn the demotion in the same reconfigure that reveals the
+promoted node; if that endpoint is still armed it keeps its broadcast connection until then, since a replica still
+pushes invalidations for the writes it replicates. The private multiplexer's `ConnectionFailed` for a master is treated as loss of
 that node's broadcast connection too (one spare flush if the node was fine, no stale window if it was not), and its
 `ConnectionRestored` and `ConfigurationChanged` trigger a reconcile. The tracking handshake on a new socket has a
 deadline (`SyncTimeout`), so a peer that accepts the TCP connection and then goes quiet cannot hold `Ready` open. `CLIENT TRACKINGINFO` is used to verify the arm where the server has it (6.2+)
