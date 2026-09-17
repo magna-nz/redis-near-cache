@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.0 (2026-09-17)
+
+- Fix (both tracking modes): a master that stopped being one is now forgotten, which lets the cache serve from L1
+  again, only once every master serving now is tracked. Before, the reconcile forgot a master that was demoted while
+  connected (`CLUSTER FAILOVER`, Sentinel) or that restarted as a replica straight away. In `TrackingMode.Redirect`,
+  the retry loop and a re-arm that found a replica did the same. Meanwhile the promoted master could still be
+  untracked, so writes to it produced no invalidations and values read in that window could go stale. In `Redirect`,
+  a pre-armed replica counts as tracked, and a demoted master that is still connected keeps its tracking while it waits.
+- Fix: a newly found master is marked lost before its arm is queued, so a read routed to it is never stored before
+  its tracking is on.
+- Fix (cluster): StackExchange.Redis leaves nodes flagged `fail` out of its `CLUSTER NODES` view, so between a master
+  failing and its replica's promotion the view looked as if that master had lost its slots. A view whose masters do
+  not serve all 16384 slots now keeps the endpoint a master. **Behaviour change:** in a cluster that leaves slots
+  unassigned on purpose, a master that stops being one is never forgotten; the wait is logged at Warning.
+- Tests: new cluster integration tests for a demotion while connected (Broadcast) and a kill with a fast restart
+  (Redirect).
+
 ## 1.0.1 (2026-09-16)
 
 - Fix (`TrackingMode.Broadcast`, cluster): after a master failed over, the killed master was forgotten as soon as its
