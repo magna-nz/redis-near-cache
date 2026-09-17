@@ -99,16 +99,7 @@ public class ClusterMasterDemotionTests
             });
 
             var failoverAt = sw.Elapsed;
-            var failover = ResilienceSupport.ClusterFailover(PromotedPort);
-            Assert.True(failover.ExitCode == 0 && failover.StdOut.Contains("OK", StringComparison.OrdinalIgnoreCase),
-                $"CLUSTER FAILOVER on {PromotedPort} failed: {failover.StdOut} {failover.StdErr}");
-
-            var flipped = await Poll.UntilAsync(() =>
-            {
-                var nodes = ResilienceSupport.ClusterNodes(7101);
-                return ResilienceSupport.NodeOnPort(nodes, PromotedPort) is { IsMaster: true }
-                       && ResilienceSupport.NodeOnPort(nodes, DemotedPort) is { IsMaster: false };
-            }, TimeSpan.FromSeconds(30), TimeSpan.FromMilliseconds(100));
+            var flipped = await ResilienceSupport.FailoverUntilPromotedAsync(PromotedPort, DemotedPort, TimeSpan.FromSeconds(40), _out.WriteLine);
             Assert.True(flipped, "the cluster never promoted the replica: " + ResilienceSupport.DescribeLayout());
             _out.WriteLine($"[{sw.Elapsed}] cluster flipped: {ResilienceSupport.DescribeLayout()}");
 

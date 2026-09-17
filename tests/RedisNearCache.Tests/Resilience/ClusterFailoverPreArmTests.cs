@@ -30,8 +30,9 @@ public class ClusterFailoverPreArmTests
     [Fact]
     public async Task PromotedReplicaWasPreArmedSoNoReadIsUntrackedAndNoFlushIsNeeded()
     {
-        Assert.True(ResilienceSupport.IsDefaultLayout(),
-            "the cluster did not start from the default layout: " + ResilienceSupport.DescribeLayout());
+        // Earlier cluster tests fail back and re-pair replicas; start from the full default layout (7100's replica is
+        // 7103), not just the default slot owners, which a masters-only fail-back can leave with an empty 7103 master.
+        await ClusterNodes.RestoreDefaultTopologyAsync(_out.WriteLine);
 
         var before = ResilienceSupport.ClusterNodes();
         var oldMaster = ResilienceSupport.NodeOnPort(before, OldMasterPort);
@@ -86,18 +87,7 @@ public class ClusterFailoverPreArmTests
             var rearmsBefore = cache.Statistics.Rearms;
             var invalidationsBefore = cache.Statistics.Invalidations;
 
-            var failover = ResilienceSupport.ClusterFailover(newMasterPort);
-            Assert.True(failover.ExitCode == 0 && failover.StdOut.Contains("OK", StringComparison.OrdinalIgnoreCase),
-                $"CLUSTER FAILOVER on {newMasterPort} failed: {failover.StdOut} {failover.StdErr}");
-
-            var flipped = await Poll.UntilAsync(
-                () =>
-                {
-                    var nodes = ResilienceSupport.ClusterNodes(7101);
-                    return ResilienceSupport.NodeOnPort(nodes, newMasterPort) is { IsMaster: true }
-                           && ResilienceSupport.NodeOnPort(nodes, OldMasterPort) is { IsMaster: false };
-                },
-                TimeSpan.FromSeconds(30), TimeSpan.FromMilliseconds(200));
+            var flipped = await ResilienceSupport.FailoverUntilPromotedAsync(newMasterPort, OldMasterPort, TimeSpan.FromSeconds(40), _out.WriteLine);
             Assert.True(flipped, "the cluster never promoted the replica: " + ResilienceSupport.DescribeLayout());
             _out.WriteLine($"layout after failover: {ResilienceSupport.DescribeLayout()}");
 

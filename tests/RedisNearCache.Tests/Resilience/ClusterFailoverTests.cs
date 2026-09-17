@@ -42,8 +42,9 @@ public class ClusterFailoverTests
     [Fact]
     public async Task ClusterFailoverPromotesReplica()
     {
-        Assert.True(ResilienceSupport.IsDefaultLayout(),
-            "the cluster did not start from the default layout: " + ResilienceSupport.DescribeLayout());
+        // Earlier cluster tests fail back and re-pair replicas; start from the full default layout (7100's replica is
+        // 7103), not just the default slot owners, which a masters-only fail-back can leave with an empty 7103 master.
+        await ClusterNodes.RestoreDefaultTopologyAsync(_out.WriteLine);
 
         var before = ResilienceSupport.ClusterNodes();
         var oldMaster = ResilienceSupport.NodeOnPort(before, OldMasterPort);
@@ -76,19 +77,8 @@ public class ClusterFailoverTests
 
             handle.Armer.EndpointRemoved += ep => { lock (removed) removed.Add(ep); };
 
-            var failover = ResilienceSupport.ClusterFailover(newMasterPort);
-            Assert.True(failover.ExitCode == 0 && failover.StdOut.Contains("OK", StringComparison.OrdinalIgnoreCase),
-                $"CLUSTER FAILOVER on {newMasterPort} failed: {failover.StdOut} {failover.StdErr}");
-
             // The cluster's own view flips first.
-            var flipped = await Poll.UntilAsync(
-                () =>
-                {
-                    var nodes = ResilienceSupport.ClusterNodes(7101);
-                    return ResilienceSupport.NodeOnPort(nodes, newMasterPort) is { IsMaster: true }
-                           && ResilienceSupport.NodeOnPort(nodes, OldMasterPort) is { IsMaster: false };
-                },
-                TimeSpan.FromSeconds(30), TimeSpan.FromMilliseconds(200));
+            var flipped = await ResilienceSupport.FailoverUntilPromotedAsync(newMasterPort, OldMasterPort, TimeSpan.FromSeconds(40), _out.WriteLine);
             Assert.True(flipped, "the cluster never promoted the replica: " + ResilienceSupport.DescribeLayout());
             _out.WriteLine($"layout after failover: {ResilienceSupport.DescribeLayout()}");
 
@@ -161,12 +151,8 @@ public class ClusterFailoverTests
             if (truth is not null) await truth.DisposeAsync();
             await handle.DisposeAsync();
 
-            var restored = await ResilienceSupport.RestoreDefaultMastersAsync();
-            _out.WriteLine($"layout after fail-back: {ResilienceSupport.DescribeLayout()}");
-            Assert.True(restored, "could not fail the cluster back to masters 7100-7102: " + ResilienceSupport.DescribeLayout());
-            Assert.True(
-                await Poll.UntilAsync(ResilienceSupport.IsDefaultLayout, TimeSpan.FromSeconds(60), TimeSpan.FromMilliseconds(250)),
-                "the cluster did not return to the default slot layout: " + ResilienceSupport.DescribeLayout());
+            // Masters and replica pairing both, so the next cluster test finds the layout it assumes.
+            await ClusterNodes.RestoreDefaultTopologyAsync(_out.WriteLine);
         }
     }
 
