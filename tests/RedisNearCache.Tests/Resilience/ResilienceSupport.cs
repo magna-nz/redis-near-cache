@@ -350,6 +350,35 @@ internal static class ResilienceSupport
     }
 
     /// <summary>
+    /// <c>CLUSTER FAILOVER</c> on <paramref name="replicaPort"/>, re-sent until the cluster (as 7101 sees it) lists it as
+    /// a master and <paramref name="formerMasterPort"/> as not one. Needed because a test often fails a shard over
+    /// right after the previous test failed the same shard back: Redis 6.2 then answers OK and silently drops the
+    /// failover (its masters will not vote for that shard again within 2 x cluster-node-timeout, 6 s here), which
+    /// was reproduced by hand on a 6.2 cluster; a resend once that window has passed promotes at once.
+    /// </summary>
+    public static async Task<bool> FailoverUntilPromotedAsync(int replicaPort, int formerMasterPort, TimeSpan timeout, Action<string>? log = null)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        var resendAfter = TimeSpan.FromSeconds(7);
+        while (true)
+        {
+            var failover = ClusterFailover(replicaPort);
+            log?.Invoke($"CLUSTER FAILOVER on {replicaPort}: {failover.StdOut.Trim()} {failover.StdErr.Trim()}");
+
+            var remaining = deadline - DateTime.UtcNow;
+            var promoted = await Poll.UntilAsync(
+                () =>
+                {
+                    var nodes = ClusterNodes(7101);
+                    return NodeOnPort(nodes, replicaPort) is { IsMaster: true } && NodeOnPort(nodes, formerMasterPort) is { IsMaster: false };
+                },
+                remaining < resendAfter ? remaining : resendAfter, TimeSpan.FromMilliseconds(100)).ConfigureAwait(false);
+            if (promoted) return true;
+            if (DateTime.UtcNow >= deadline) return false;
+        }
+    }
+
+    /// <summary>
     /// Fails the cluster back until 7100-7102 are the masters again, which every other cluster test assumes.
     /// Called from a <c>finally</c>, so it retries rather than throwing: a plain <c>CLUSTER FAILOVER</c> first
     /// (coordinated, no data loss), then <c>FORCE</c>, and only as a last resort <c>TAKEOVER</c>.
