@@ -122,10 +122,14 @@ public class ReplicaPreArmTests
         rig.Replica.IsReplica = false;
         rig.Mux.RaiseConfigurationChanged(rig.Replica);
 
-        // Reconcile runs synchronously off the raised event, so the outcome is checked immediately.
+        // Reconcile promotes synchronously off the raised event; forgetting the old master waits for that, in the background.
         Assert.Contains($"armed {rig.Replica.EndPoint} {ArmReason.Promoted}", rig.Events);
-        Assert.Contains($"removed {rig.Master.EndPoint}", rig.Events);
-        Assert.Equal(flushesBefore + 2, rig.Cache.Statistics.Flushes); // the promotion's flush and the old master's removal
+        Assert.True(await UntilAsync(() => rig.Events.Contains($"removed {rig.Master.EndPoint}"), 3000), "the old master was never forgotten: " + rig.Describe());
+        // The rig's handler records "removed" before the facade's flushes, on the retirement's background thread: poll.
+        Assert.True(await UntilAsync(() => rig.Cache.Statistics.Flushes == flushesBefore + 2, 3000), // the promotion's flush and the old master's removal
+            $"expected 2 flushes, saw {rig.Cache.Statistics.Flushes - flushesBefore}: " + rig.Describe());
+        await Task.Delay(50);
+        Assert.Equal(flushesBefore + 2, rig.Cache.Statistics.Flushes);
         Assert.Equal(0, rig.Cache.Statistics.Rearms);
         Assert.Single(rig.Armer.RedirectTargets);
         Assert.True(rig.Armer.RedirectTargets.ContainsKey(rig.Replica.EndPoint));
@@ -220,9 +224,14 @@ public class ReplicaPreArmTests
         rig.Master.IsReplica = true;
         rig.Mux.RaiseConfigurationChanged(rig.Replica);
         Assert.Contains($"armed {rig.Replica.EndPoint} {ArmReason.Promoted}", rig.Events);
+        Assert.True(await UntilAsync(() => rig.Events.Contains($"removed {rig.Master.EndPoint}"), 3000), "the old master was never forgotten: " + rig.Describe());
         Assert.Equal(preArmId, rig.Armer.RedirectTargets[rig.Replica.EndPoint]);
         Assert.Equal(0, rig.Cache.Statistics.Rearms);
-        Assert.Equal(flushesBefore + 2, rig.Cache.Statistics.Flushes); // the promotion's flush and the old master's removal
+        // The rig's handler records "removed" before the facade's flushes, on the retirement's background thread: poll.
+        Assert.True(await UntilAsync(() => rig.Cache.Statistics.Flushes == flushesBefore + 2, 3000), // the promotion's flush and the old master's removal
+            $"expected 2 flushes, saw {rig.Cache.Statistics.Flushes - flushesBefore}: " + rig.Describe());
+        await Task.Delay(50);
+        Assert.Equal(flushesBefore + 2, rig.Cache.Statistics.Flushes);
     }
 
     /// <summary>A pre-armed replica whose replication link is down is disarmed by the sweep (a full resync would flush L1 for nothing).</summary>

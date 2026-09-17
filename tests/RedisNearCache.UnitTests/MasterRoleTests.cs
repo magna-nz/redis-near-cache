@@ -90,8 +90,8 @@ public class MasterRoleTests
     {
         var nodes = new[]
         {
-            new ClusterNodeView(Node7100, null, IsReplica: false, OwnsSlots: true),    // master,fail? - no failover yet
-            new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7103), null, IsReplica: true, OwnsSlots: false),
+            new ClusterNodeView(Node7100, null, IsReplica: false, SlotCount: MasterRole.ClusterSlots),    // master,fail? - no failover yet
+            new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7103), null, IsReplica: true, SlotCount: 0),
         };
         Assert.True(MasterRole.FromClusterNodes(Node7100, nodes));
     }
@@ -101,8 +101,8 @@ public class MasterRoleTests
     {
         var nodes = new[]
         {
-            new ClusterNodeView(Node7100, null, IsReplica: false, OwnsSlots: false),   // master,fail, slots moved away
-            new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7103), null, IsReplica: false, OwnsSlots: true),
+            new ClusterNodeView(Node7100, null, IsReplica: false, SlotCount: 0),   // slots moved away
+            new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7103), null, IsReplica: false, SlotCount: MasterRole.ClusterSlots),
         };
         Assert.False(MasterRole.FromClusterNodes(Node7100, nodes));
     }
@@ -110,7 +110,27 @@ public class MasterRoleTests
     [Fact]
     public void ClusterNodeTheClusterForgotIsNoLongerAMaster()
     {
-        var nodes = new[] { new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7101), null, IsReplica: false, OwnsSlots: true) };
+        var nodes = new[] { new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7101), null, IsReplica: false, SlotCount: MasterRole.ClusterSlots) };
+        Assert.False(MasterRole.FromClusterNodes(Node7100, nodes));
+    }
+
+    [Fact]
+    public void FailedMasterMissingFromAViewWithUnservedSlotsStaysAMaster()
+    {
+        // StackExchange.Redis drops a node flagged fail from the view. Until its replica is promoted, its slots are
+        // served by nobody, and the view cannot say whether 7100 was replaced.
+        var nodes = new[]
+        {
+            new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7101), null, IsReplica: false, SlotCount: 5462),
+            new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7102), null, IsReplica: false, SlotCount: 5461),
+            new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7103), null, IsReplica: true, SlotCount: 0),
+        };
+        Assert.False(MasterRole.ServesAllSlots(nodes));
+        Assert.True(MasterRole.FromClusterNodes(Node7100, nodes));
+
+        // Once the replica serves them, 7100 is gone.
+        nodes[2] = nodes[2] with { IsReplica = false, SlotCount = 5461 };
+        Assert.True(MasterRole.ServesAllSlots(nodes));
         Assert.False(MasterRole.FromClusterNodes(Node7100, nodes));
     }
 
@@ -129,8 +149,8 @@ public class MasterRoleTests
         var dns = new DnsEndPoint("localhost", 7201);
         var nodes = new[]
         {
-            new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7200), "localhost", IsReplica: false, OwnsSlots: true),
-            new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7201), "localhost", IsReplica: false, OwnsSlots: true),
+            new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7200), "localhost", IsReplica: false, SlotCount: 8192),
+            new ClusterNodeView(new IPEndPoint(IPAddress.Loopback, 7201), "localhost", IsReplica: false, SlotCount: 8192),
         };
         Assert.False(dns.Equals(nodes[1].EndPoint));
         Assert.True(MasterRole.FromClusterNodes(dns, nodes));
@@ -141,7 +161,7 @@ public class MasterRoleTests
     public void DnsEndPointMatchesThroughResolvedAddressesWhenNoHostnameIsAnnounced()
     {
         var dns = new DnsEndPoint("redis-node-1.internal", 7100);
-        var nodes = new[] { new ClusterNodeView(new IPEndPoint(IPAddress.Parse("10.0.0.5"), 7100), null, IsReplica: false, OwnsSlots: true) };
+        var nodes = new[] { new ClusterNodeView(new IPEndPoint(IPAddress.Parse("10.0.0.5"), 7100), null, IsReplica: false, SlotCount: MasterRole.ClusterSlots) };
         Assert.False(MasterRole.FromClusterNodes(dns, nodes));
         Assert.True(MasterRole.FromClusterNodes(dns, nodes, [IPAddress.Parse("10.0.0.5")]));
     }
@@ -150,8 +170,8 @@ public class MasterRoleTests
     public void MatchingNormalizesIpv4MappedAddressesAndRequiresThePort()
     {
         var mapped = new IPEndPoint(IPAddress.Loopback.MapToIPv6(), 7100);
-        Assert.True(MasterRole.Matches(mapped, new ClusterNodeView(Node7100, null, false, true)));
-        Assert.False(MasterRole.Matches(new IPEndPoint(IPAddress.Loopback, 7101), new ClusterNodeView(Node7100, null, false, true)));
-        Assert.False(MasterRole.Matches(Node7100, new ClusterNodeView(null, null, false, true)));
+        Assert.True(MasterRole.Matches(mapped, new ClusterNodeView(Node7100, null, false, 1)));
+        Assert.False(MasterRole.Matches(new IPEndPoint(IPAddress.Loopback, 7101), new ClusterNodeView(Node7100, null, false, 1)));
+        Assert.False(MasterRole.Matches(Node7100, new ClusterNodeView(null, null, false, 1)));
     }
 }
