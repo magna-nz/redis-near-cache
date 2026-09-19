@@ -272,6 +272,7 @@ internal sealed class TrackingArmer : ITrackingArmer
         _lost.Clear();
         foreach (var gate in _gates.Values) gate.Dispose();
         _gates.Clear();
+        _arming.Clear();
         _shutdown.Dispose();
     }
 
@@ -431,6 +432,18 @@ internal sealed class TrackingArmer : ITrackingArmer
         {
             _logger.LogDebug("RedisNearCache found no subscriber connection for client {ClientName} on {EndPoint} yet", _connection.ClientName, endPoint);
             return false;
+        }
+
+        // The point of no return: OFF makes the server forget every key it tracks for us on this node. Two things must
+        // hold before it goes out, decided under the lock every lifecycle transition takes. A pre-arm of this node
+        // ends with our OFF, so it is forgotten now: if this arm then fails, a reconcile must not find the entry and
+        // report the node as Promoted (armed, no re-arm needed) with its tracking off. And the endpoint is announced
+        // lost: a promotion that slipped in since this arm took the gate (the reconcile checks _arming outside the
+        // lock) has the facade caching from the node again.
+        lock (_lifecycle)
+        {
+            _replicaTargets.TryRemove(endPoint, out _);
+            if (reason != ArmReason.Initial && !_lost.ContainsKey(endPoint)) MarkLost(endPoint, forgetRedirect: false);
         }
 
         await server.ExecuteAsync("CLIENT", "TRACKING", "OFF").WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -644,14 +657,15 @@ internal sealed class TrackingArmer : ITrackingArmer
     /// </summary>
     private void OnConfigurationChanged(object? sender, EndPointEventArgs e) => Reconcile("configuration change");
 
+    /// <summary><see cref="Reconcile(string, bool)"/> for anything that is news: a configuration change, a retirement round.</summary>
+    private void Reconcile(string cause) => Reconcile(cause, periodic: false);
+
     /// <summary>
     /// Brings the armer in line with the multiplexer's current view of the deployment. Runs on every
     /// <c>ConfigurationChanged</c> and on the reconcile loop's timer, because StackExchange.Redis raises the event
     /// only for a reconfiguration it can blame on an endpoint; a periodic topology check that quietly relearns a
     /// promoted node's role raises nothing. Idempotent, and cheap when nothing changed.
     /// </summary>
-    private void Reconcile(string cause) => Reconcile(cause, periodic: false);
-
     /// <param name="cause">What prompted the reconcile, for the log.</param>
     /// <param name="periodic">
     /// True for the timer's sweep, which is no news about any endpoint: a lost master the retry loop owns is left

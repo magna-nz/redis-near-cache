@@ -151,12 +151,17 @@ loop (every 5 s) runs until one of the two happens.
 **Overlapping arms of one endpoint.** A node restart restores both connections and each `ConnectionRestored` queues
 an arm; a gate per endpoint keeps them from interleaving on the wire. One `Armed` answers every loss announced
 before it, so by the time the second arm gets the gate the facade is caching from that node again, and the arm opens
-with `CLIENT TRACKING OFF`. An arm therefore announces the loss again once it holds the gate if the endpoint is no
-longer lost (so an arm on its own still costs one flush, not two): no `OFF` is ever sent to a node the facade is
-caching from. The reconcile does not add to the queue: it skips a master that has an arm queued or running (before
-the promotion check too, so a pre-armed replica is not recorded as `Promoted` under a running arm), and the timer's
-sweep also leaves a lost master to the retry loop that owns it. A `ConfigurationChanged` is news and still arms a
-lost master at once.
+with `CLIENT TRACKING OFF`. An arm therefore announces the loss again if the endpoint is no longer lost, twice: once
+it holds the gate (a queued arm means some event said tracking there is unreliable), and, under the lifecycle lock,
+immediately before every `OFF`, where it also forgets any pre-arm of that node. The pre-arm ends with the `OFF`, and an
+arm that then fails must not leave an entry a later reconcile would report as `Promoted`, armed with no re-arm, on a
+node whose tracking is off. An arm on its own still costs one flush, not two. The reconcile rarely adds to the queue:
+it skips a master that has an arm queued or running (before the promotion check too; the window before a queued arm
+registers can still let a second one through, which the re-announcement makes harmless), and the timer's sweep also
+leaves a lost master to the retry loop that owns it. A `ConfigurationChanged` is news and still arms a lost master at
+once. One window is left: `EndpointRemoved` for a node can land while an arm of that node is between its
+re-announcement and its `Armed`, which only matters if the node is in fact still serving reads (the multiplexer's role
+view and the probe's disagreeing); it lasts until that arm ends, at most the backoff ladder.
 
 An endpoint we armed counts as tracked **whatever its current replica flag**: in a graceful Sentinel failover the
 multiplexer can flag the old master as a replica before Sentinel kills our connections there, and those failures

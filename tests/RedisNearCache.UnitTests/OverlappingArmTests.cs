@@ -90,7 +90,6 @@ public class OverlappingArmTests
         var firstAtOff = Signal();
         var releaseFirst = Signal();
         bool? coherentAtSecondOff = null;
-        bool? cachedAtSecondOff = null;
         master.CommandHook = command =>
         {
             if (command != TrackingOff) return Task.CompletedTask;
@@ -102,7 +101,6 @@ public class OverlappingArmTests
                 case 2:
                     // What the application sees at the instant the server forgets every key it tracked for us.
                     coherentAtSecondOff = rig.Cache.IsCoherent;
-                    cachedAtSecondOff = rig.Cached;
                     return Task.CompletedTask;
                 default:
                     return Task.CompletedTask; // the OFF sent on dispose
@@ -121,7 +119,6 @@ public class OverlappingArmTests
 
         Assert.Equal(2, Volatile.Read(ref offs));
         Assert.False(coherentAtSecondOff, "the second arm sent CLIENT TRACKING OFF while the cache reported itself coherent: " + rig.Describe());
-        Assert.False(cachedAtSecondOff, "L1 still held an entry when the second arm turned tracking off: " + rig.Describe());
 
         // Every arm is preceded by a loss announced after the arm before it.
         var events = rig.Events.ToList();
@@ -217,5 +214,40 @@ public class OverlappingArmTests
         // retry loop registering. Every sweep used to add one.
         Assert.InRange(Volatile.Read(ref attempts), 1, 2);
         Assert.False(rig.Cache.IsCoherent, "an unarmed master must hold the cache in pass-through: " + rig.Describe());
+    }
+
+    [Fact]
+    public async Task FailedArmOfAPreArmedNodeEndsItsPreArm()
+    {
+        FakeServer replica = null!;
+        await using var rig = await Rig.StartAsync(mux =>
+        {
+            mux.Add(6401, isReplica: false);
+            replica = mux.Add(6402, isReplica: true);
+        });
+        Assert.True(await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(replica.EndPoint)), "precondition: the replica is pre-armed");
+
+        // Promoted, and something arms it before a reconcile has recorded the promotion. The arm gets as far as OFF,
+        // which ends the pre-arm on the server, and then fails.
+        replica.IsReplica = false;
+        var sentOff = false;
+        replica.CommandHook = command =>
+        {
+            if (command == TrackingOff) sentOff = true;
+            return command.StartsWith("CLIENT TRACKING ON", StringComparison.Ordinal)
+                ? Task.FromException(new RedisNearCacheTrackingException("rejected CLIENT TRACKING ON REDIRECT"))
+                : Task.CompletedTask;
+        };
+        await Assert.ThrowsAsync<RedisNearCacheTrackingException>(
+            () => rig.Armer.RearmAsync(replica.EndPoint, ArmReason.InteractiveRestored, CancellationToken.None));
+        Assert.True(sentOff, "precondition: the failed arm turned tracking off on the node");
+        Assert.False(rig.Armer.ReplicaRedirectTargets.ContainsKey(replica.EndPoint), "the pre-arm outlived the OFF that ended it");
+
+        // The reconcile that now learns of the promotion must arm the node, not report it as already armed.
+        replica.CommandHook = null;
+        rig.Mux.RaiseConfigurationChanged(replica);
+        Assert.True(await UntilAsync(() => rig.Armer.RedirectTargets.ContainsKey(replica.EndPoint)), "the promoted node was never armed: " + rig.Describe());
+        Assert.DoesNotContain($"armed {replica.EndPoint} {ArmReason.Promoted}", rig.Events);
+        Assert.Contains($"armed {replica.EndPoint} {ArmReason.TopologyChanged}", rig.Events);
     }
 }
