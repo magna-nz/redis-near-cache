@@ -23,7 +23,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar" aria-label="Sections">
-<div class="nav-group"><ul><li><a href="#introduction">Introduction</a></li><li><a href="#quickstart">Quickstart</a></li><li><a href="#how-it-works">How it works</a></li><li><a href="#configuration">Configuration</a></li><li><a href="#enterprise">Managed services</a></li><li><a href="#api-reference">API reference</a><ul class="sub-nav"><li><a href="#getasync">GetAsync</a></li><li><a href="#getbytesasync">GetBytesAsync</a></li><li><a href="#setasync">SetAsync</a></li><li><a href="#setbytesasync">SetBytesAsync</a></li><li><a href="#removeasync">RemoveAsync</a></li><li><a href="#evictlocal">EvictLocal</a></li><li><a href="#evictalllocal">EvictAllLocal</a></li><li><a href="#trygetlocal">TryGetLocal</a></li><li><a href="#statistics">Statistics</a></li><li><a href="#ready">Ready</a></li><li><a href="#iscoherent">IsCoherent</a></li><li><a href="#waitforcoherenceasync">WaitForCoherenceAsync</a></li><li><a href="#redisnearcachestatistics">RedisNearCacheStatistics</a></li><li><a href="#iredisnearcacheserializer">IRedisNearCacheSerializer</a></li><li><a href="#jsonredisnearcacheserializer">JsonRedisNearCacheSerializer</a></li><li><a href="#addrednc-configure">AddRedisNearCache(configure)</a></li><li><a href="#addrednc-connectionstring">AddRedisNearCache(connString)</a></li></ul></li><li><a href="#hybridcache">HybridCache</a><ul class="sub-nav"><li><a href="#addrednc-distributedcache">AddRedisNearCacheDistributedCache</a></li><li><a href="#addrednc-hybridcache">AddRedisNearCacheHybridCache</a></li><li><a href="#redisnearcachedistributedcache">RedisNearCacheDistributedCache</a></li></ul></li><li><a href="#reconnects-cluster">Reconnects and cluster</a></li><li><a href="#operations">Operations</a></li><li><a href="#limitations">Limitations</a></li><li><a href="#performance">Performance</a><ul class="sub-nav"><li><a href="#perf-headline">Headline</a></li><li><a href="#perf-contenders">What is compared</a></li><li><a href="#perf-load">Load test</a></li><li><a href="#perf-topologies">Cluster, TLS, Valkey, chaos</a></li><li><a href="#perf-per-call">Per-call cost</a></li></ul></li><li><a href="#testing">Testing</a></li><li><a href="#samples">Samples</a></li><li><a href="#faq">FAQ</a></li></ul></div>
+<div class="nav-group"><ul><li><a href="#introduction">Introduction</a></li><li><a href="#quickstart">Quickstart</a></li><li><a href="#how-it-works">How it works</a></li><li><a href="#configuration">Configuration</a></li><li><a href="#enterprise">Managed services</a></li><li><a href="#api-reference">API reference</a><ul class="sub-nav"><li><a href="#getasync">GetAsync</a></li><li><a href="#getbytesasync">GetBytesAsync</a></li><li><a href="#setasync">SetAsync</a></li><li><a href="#setasync-when">SetAsync (conditional)</a></li><li><a href="#setbytesasync">SetBytesAsync</a></li><li><a href="#setbytesasync-when">SetBytesAsync (conditional)</a></li><li><a href="#removeasync">RemoveAsync</a></li><li><a href="#evictlocal">EvictLocal</a></li><li><a href="#evictalllocal">EvictAllLocal</a></li><li><a href="#trygetlocal">TryGetLocal</a></li><li><a href="#statistics">Statistics</a></li><li><a href="#ready">Ready</a></li><li><a href="#iscoherent">IsCoherent</a></li><li><a href="#waitforcoherenceasync">WaitForCoherenceAsync</a></li><li><a href="#redisnearcachestatistics">RedisNearCacheStatistics</a></li><li><a href="#iredisnearcacheserializer">IRedisNearCacheSerializer</a></li><li><a href="#jsonredisnearcacheserializer">JsonRedisNearCacheSerializer</a></li><li><a href="#addrednc-configure">AddRedisNearCache(configure)</a></li><li><a href="#addrednc-connectionstring">AddRedisNearCache(connString)</a></li></ul></li><li><a href="#hybridcache">HybridCache</a><ul class="sub-nav"><li><a href="#addrednc-distributedcache">AddRedisNearCacheDistributedCache</a></li><li><a href="#addrednc-hybridcache">AddRedisNearCacheHybridCache</a></li><li><a href="#redisnearcachedistributedcache">RedisNearCacheDistributedCache</a></li></ul></li><li><a href="#reconnects-cluster">Reconnects and cluster</a></li><li><a href="#operations">Operations</a></li><li><a href="#limitations">Limitations</a></li><li><a href="#performance">Performance</a><ul class="sub-nav"><li><a href="#perf-headline">Headline</a></li><li><a href="#perf-contenders">What is compared</a></li><li><a href="#perf-load">Load test</a></li><li><a href="#perf-topologies">Cluster, TLS, Valkey, chaos</a></li><li><a href="#perf-per-call">Per-call cost</a></li></ul></li><li><a href="#testing">Testing</a></li><li><a href="#samples">Samples</a></li><li><a href="#faq">FAQ</a></li></ul></div>
 </nav>
 <div class="main">
 <section class="section" id="introduction">
@@ -506,7 +506,7 @@ services.AddRedisNearCache(o =&gt;
 <div class="prose">
 <h3>SetAsync&lt;T&gt;<span class="pill">method</span> <a class="anchor" href="#setasync" aria-label="Link to this member">#</a></h3>
 <div class="sig-inline">ValueTask SetAsync&lt;T&gt;(string key, T value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)</div>
-<p>Writes <code>value</code> to Redis through RedisNearCache&#8217;s own connection (armed with <code>NOLOOP</code> so the write does not invalidate itself) and evicts any L1 copy. The next <code>GetAsync&lt;T&gt;</code> re-reads and re-tracks the key. <code>SetAsync</code> does not populate L1 itself; write-through population of L1 is out of scope for v1. A null <code>expiry</code> issues a plain <code>SET</code>, which clears any TTL the key already had in Redis.</p>
+<p>Writes <code>value</code> to Redis through RedisNearCache&#8217;s own connection (armed with <code>NOLOOP</code> so the write does not invalidate itself) and evicts any L1 copy. The next <code>GetAsync&lt;T&gt;</code> re-reads and re-tracks the key. <code>SetAsync</code> does not populate L1 itself; write-through population of L1 is out of scope for v1. A null <code>expiry</code> issues a plain <code>SET</code>, which clears any TTL the key already had in Redis; see <a href="#setasync-when"><code>SetAsync</code> (conditional)</a> to keep it instead.</p>
 
 </div>
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">ValueTask SetAsync&lt;T&gt;(
@@ -516,12 +516,34 @@ services.AddRedisNearCache(o =&gt;
     CancellationToken cancellationToken = default);</code></pre></div></div>
 </div>
 </div>
+<div class="member" id="setasync-when">
+<div class="row">
+<div class="prose">
+<h3>SetAsync&lt;T&gt; (conditional)<span class="pill">method</span> <a class="anchor" href="#setasync-when" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">ValueTask&lt;bool&gt; SetAsync&lt;T&gt;(string key, T value, When when, TimeSpan? expiry = null, bool keepTtl = false, CancellationToken cancellationToken = default)</div>
+<p>A conditional write: <code>When.NotExists</code> writes only if the key is absent (<code>SET NX</code>), <code>When.Exists</code> only if it is present (<code>SET XX</code>), <code>When.Always</code> unconditionally (<code>When</code> is <code>StackExchange.Redis.When</code>). <code>keepTtl</code> keeps the key&#8217;s existing TTL (<code>KEEPTTL</code>) instead of losing it to a plain <code>SET</code>; it cannot be combined with an <code>expiry</code>. The L1 copy is evicted whatever the outcome, exactly as the unconditional <a href="#setasync"><code>SetAsync&lt;T&gt;</code></a> does: a write that turned out not to happen costs one local eviction, never a stale read. <code>when</code> comes before <code>expiry</code> on purpose &#8212; after it, an existing call such as <code>SetAsync(key, value, expiry, default)</code> would be ambiguous between this overload and the <code>CancellationToken</code> one.</p>
+<div class="returns"><strong>Returns</strong> <code>true</code> if Redis performed the write, <code>false</code> if the condition was not met and the key is unchanged.</div>
+<div class="note"><p>Shipped as a default interface method: an <code>IRedisNearCache</code> implementation that predates this member still compiles. Its inherited default supports only an unconditional write without <code>keepTtl</code> (delegating to the old <code>SetAsync</code> overload); anything else throws <code>NotSupportedException</code>. The library&#8217;s own cache overrides it and supports all of it.</p></div>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">ValueTask&lt;bool&gt; SetAsync&lt;T&gt;(
+    string key,
+    T value,
+    When when,
+    TimeSpan? expiry = null,
+    bool keepTtl = false,
+    CancellationToken cancellationToken = default);</code></pre></div>
+<div class="codeblock"><div class="cb-head"><span class="cb-title">create only if absent</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">var created = await cache.SetAsync("user:42", user, When.NotExists, TimeSpan.FromMinutes(30));
+
+// Refresh a value while keeping its existing TTL.
+await cache.SetAsync("user:42", user, When.Exists, keepTtl: true);</code></pre></div></div>
+</div>
+</div>
 <div class="member" id="setbytesasync">
 <div class="row">
 <div class="prose">
 <h3>SetBytesAsync<span class="pill">method</span> <a class="anchor" href="#setbytesasync" aria-label="Link to this member">#</a></h3>
 <div class="sig-inline">ValueTask SetBytesAsync(string key, ReadOnlyMemory&lt;byte&gt; value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)</div>
-<p>Same as <code>SetAsync&lt;T&gt;</code>, but writes <code>value</code> as is, without the configured <code>Serializer</code>. The bytes are copied before the write, so the caller may reuse its buffer as soon as the call returns. A null <code>expiry</code> issues a plain <code>SET</code>, which clears any TTL the key already had in Redis.</p>
+<p>Same as <code>SetAsync&lt;T&gt;</code>, but writes <code>value</code> as is, without the configured <code>Serializer</code>. The bytes are copied before the write, so the caller may reuse its buffer as soon as the call returns. A null <code>expiry</code> issues a plain <code>SET</code>, which clears any TTL the key already had in Redis; see <a href="#setbytesasync-when"><code>SetBytesAsync</code> (conditional)</a> to keep it instead.</p>
 
 </div>
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">ValueTask SetBytesAsync(
@@ -529,6 +551,25 @@ services.AddRedisNearCache(o =&gt;
     ReadOnlyMemory&lt;byte&gt; value,
     TimeSpan? expiry = null,
     CancellationToken cancellationToken = default);</code></pre></div></div>
+</div>
+</div>
+<div class="member" id="setbytesasync-when">
+<div class="row">
+<div class="prose">
+<h3>SetBytesAsync (conditional)<span class="pill">method</span> <a class="anchor" href="#setbytesasync-when" aria-label="Link to this member">#</a></h3>
+<div class="sig-inline">ValueTask&lt;bool&gt; SetBytesAsync(string key, ReadOnlyMemory&lt;byte&gt; value, When when, TimeSpan? expiry = null, bool keepTtl = false, CancellationToken cancellationToken = default)</div>
+<p>The raw-bytes form of <a href="#setasync-when"><code>SetAsync&lt;T&gt;</code> (conditional)</a>: the same conditions, <code>keepTtl</code> rule, return value and L1 eviction, without the configured <code>Serializer</code>.</p>
+<div class="returns"><strong>Returns</strong> <code>true</code> if Redis performed the write, <code>false</code> if the condition was not met and the key is unchanged.</div>
+<div class="note"><p>Shipped as a default interface method with the same fallback as <a href="#setasync-when"><code>SetAsync&lt;T&gt;</code> (conditional)</a>: an implementation that predates it still compiles, and its inherited default throws <code>NotSupportedException</code> for anything but an unconditional write without <code>keepTtl</code>.</p></div>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">signature</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">ValueTask&lt;bool&gt; SetBytesAsync(
+    string key,
+    ReadOnlyMemory&lt;byte&gt; value,
+    When when,
+    TimeSpan? expiry = null,
+    bool keepTtl = false,
+    CancellationToken cancellationToken = default);</code></pre></div>
+<div class="codeblock"><div class="cb-head"><span class="cb-title">create only if absent</span><span class="cb-lang">csharp</span></div><pre><code class="language-csharp">var created = await cache.SetBytesAsync("upload:42", bytes, When.NotExists);</code></pre></div></div>
 </div>
 </div>
 <div class="member" id="removeasync">

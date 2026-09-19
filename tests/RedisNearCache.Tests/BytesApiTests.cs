@@ -7,7 +7,7 @@ using Xunit;
 namespace RedisNearCache.Tests;
 
 /// <summary>
-/// <see cref="IRedisNearCache.GetBytesAsync"/> and <see cref="IRedisNearCache.SetBytesAsync"/> against real Redis, with a
+/// <see cref="IRedisNearCache.GetBytesAsync"/> and <see cref="IRedisNearCache.SetBytesAsync(string, ReadOnlyMemory{byte}, TimeSpan?, CancellationToken)"/> against real Redis, with a
 /// serializer that fails if it is ever used, in both tracking modes.
 /// </summary>
 public abstract class BytesApiTestsBase : IAsyncLifetime

@@ -1,3 +1,5 @@
+using StackExchange.Redis;
+
 namespace RedisNearCache;
 
 /// <summary>
@@ -28,16 +30,68 @@ public interface IRedisNearCache : IAsyncDisposable
     /// <summary>
     /// Writes <paramref name="value"/> to Redis through RedisNearCache's own connection and evicts any L1 copy.
     /// The next <see cref="GetAsync{T}"/> re-reads and re-tracks the key. A null <paramref name="expiry"/> issues a
-    /// plain <c>SET</c>, which clears whatever TTL the key already had; pass one to keep or replace it.
+    /// plain <c>SET</c>, which clears whatever TTL the key already had; pass one to replace it, or use the
+    /// overload taking <c>keepTtl</c> to keep it.
     /// </summary>
     ValueTask SetAsync<T>(string key, T value, TimeSpan? expiry = null, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Writes <paramref name="value"/> to Redis as is, without the configured <see cref="RedisNearCacheOptions.Serializer"/>,
-    /// and evicts any L1 copy, exactly as <see cref="SetAsync{T}"/> does. A null <paramref name="expiry"/> issues a
+    /// and evicts any L1 copy, exactly as <see cref="SetAsync{T}(string, T, TimeSpan?, CancellationToken)"/> does. A null <paramref name="expiry"/> issues a
     /// plain <c>SET</c> here too, clearing any TTL the key already had.
     /// </summary>
     ValueTask SetBytesAsync(string key, ReadOnlyMemory<byte> value, TimeSpan? expiry = null, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// A conditional write: <see cref="When.NotExists"/> writes only if the key is absent (<c>SET NX</c>),
+    /// <see cref="When.Exists"/> only if it is present (<c>SET XX</c>), <see cref="When.Always"/> unconditionally.
+    /// Returns <c>true</c> if Redis performed the write, <c>false</c> if the condition was not met and the key is
+    /// unchanged. With <paramref name="keepTtl"/> the key keeps the TTL it already has (<c>KEEPTTL</c>) instead of
+    /// losing it to a plain <c>SET</c>; it cannot be combined with an <paramref name="expiry"/>.
+    /// </summary>
+    /// <remarks>
+    /// The L1 copy is evicted whatever the outcome, exactly as <see cref="SetAsync{T}(string, T, TimeSpan?, CancellationToken)"/>
+    /// does: the outcome is only known once the reply is back, and this connection's own writes are not echoed as
+    /// invalidations. A write that turned out not to happen therefore costs one local eviction, never a stale read.
+    /// <para>
+    /// <paramref name="when"/> comes before <paramref name="expiry"/> on purpose. After it, an existing call such as
+    /// <c>SetAsync(key, value, expiry, default)</c> would be ambiguous between this overload and the
+    /// <see cref="CancellationToken"/> one. What is left ambiguous is a bare <c>default</c> as the third argument
+    /// (<c>SetAsync(key, value, default)</c>): write <c>expiry: null</c>, or leave it out.
+    /// </para>
+    /// <para>
+    /// <see cref="When"/> is <c>StackExchange.Redis.When</c>, and it is the third argument, after the value. A call
+    /// that leaves the value out, <c>SetAsync(key, When.NotExists)</c>, still compiles: it is the unconditional
+    /// overload with the enum itself as the value.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentException"><paramref name="keepTtl"/> is set together with an <paramref name="expiry"/>.</exception>
+    /// <exception cref="NotSupportedException">
+    /// From this default implementation only, for anything but an unconditional write without <paramref name="keepTtl"/>:
+    /// an implementation that predates this member cannot express the condition. The library's own cache supports all of it.
+    /// </exception>
+    async ValueTask<bool> SetAsync<T>(string key, T value, When when, TimeSpan? expiry = null, bool keepTtl = false, CancellationToken cancellationToken = default)
+    {
+        Internal.ConditionalWrite.ThrowIfInvalid(expiry, keepTtl);
+        Internal.ConditionalWrite.ThrowIfNotExpressible(when, keepTtl);
+        await SetAsync(key, value, expiry, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
+    /// <summary>
+    /// The raw-bytes form of <see cref="SetAsync{T}(string, T, When, TimeSpan?, bool, CancellationToken)"/>: the same
+    /// conditions, <paramref name="keepTtl"/> rule, return value and L1 eviction, without the configured
+    /// <see cref="RedisNearCacheOptions.Serializer"/>.
+    /// </summary>
+    /// <exception cref="ArgumentException"><paramref name="keepTtl"/> is set together with an <paramref name="expiry"/>.</exception>
+    /// <exception cref="NotSupportedException">As for <see cref="SetAsync{T}(string, T, When, TimeSpan?, bool, CancellationToken)"/>.</exception>
+    async ValueTask<bool> SetBytesAsync(string key, ReadOnlyMemory<byte> value, When when, TimeSpan? expiry = null, bool keepTtl = false, CancellationToken cancellationToken = default)
+    {
+        Internal.ConditionalWrite.ThrowIfInvalid(expiry, keepTtl);
+        Internal.ConditionalWrite.ThrowIfNotExpressible(when, keepTtl);
+        await SetBytesAsync(key, value, expiry, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
 
     /// <summary>Deletes the key in Redis and evicts any L1 copy.</summary>
     ValueTask<bool> RemoveAsync(string key, CancellationToken cancellationToken = default);

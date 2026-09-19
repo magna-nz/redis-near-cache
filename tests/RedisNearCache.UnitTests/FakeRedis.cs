@@ -231,14 +231,43 @@ internal sealed class FakeMultiplexer
     public int TypedTtlCalls => Volatile.Read(ref _typedTtlCalls);
     private int _typedTtlCalls;
 
+    /// <summary>
+    /// The <c>expiry</c>, <c>keepTtl</c> and <c>when</c> arguments of the most recent <c>StringSetAsync</c> call
+    /// that used the six-argument overload the facade calls (<c>StringSetAsync(key, value, expiry, keepTtl, when,
+    /// flags)</c>); unset before any such call.
+    /// </summary>
+    public TimeSpan? LastSetExpiry { get; private set; }
+    public bool LastSetKeepTtl { get; private set; }
+    public When LastSetWhen { get; private set; }
+
+    /// <summary>How many <c>StringSetAsync</c> calls have reached the fake, regardless of outcome.</summary>
+    public int StringSetCalls => Volatile.Read(ref _stringSetCalls);
+    private int _stringSetCalls;
+
     private object? HandleDatabase(MethodInfo method, object?[] args)
     {
         switch (method.Name)
         {
             case "StringGetAsync" when args.Length > 0 && args[0] is RedisKey:
                 return Task.FromResult(StoredValue);
-            // One value for every key, as for reads: a write replaces it.
+            // One value for every key, as for reads: a write replaces it. The facade always calls the six-argument
+            // overload StringSetAsync(key, value, expiry, keepTtl, when, flags), matched here by position/type so
+            // any other shape (defensively kept for whatever else might call this fake) falls through to the
+            // simple always-succeeds behaviour below instead of throwing.
             case "StringSetAsync" when args.Length > 1 && args[0] is RedisKey && args[1] is RedisValue written:
+                Interlocked.Increment(ref _stringSetCalls);
+                if (args.Length >= 6 && args[3] is bool keepTtl && args[4] is When when)
+                {
+                    LastSetExpiry = args[2] as TimeSpan?;
+                    LastSetKeepTtl = keepTtl;
+                    LastSetWhen = when;
+                    var exists = !StoredValue.IsNull;
+                    if ((when == When.NotExists && exists) || (when == When.Exists && !exists))
+                    {
+                        // The condition was not met: Redis leaves the key exactly as it was and reports no write.
+                        return Task.FromResult(false);
+                    }
+                }
                 StoredValue = written;
                 return Task.FromResult(true);
             case "ExecuteAsync" when args.Length == 2 && Equals(args[0], "PTTL"):

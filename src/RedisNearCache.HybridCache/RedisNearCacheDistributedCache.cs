@@ -12,11 +12,11 @@ namespace RedisNearCache.HybridCache;
 /// </summary>
 /// <remarks>
 /// Values are stored exactly as given, through <see cref="IRedisNearCache.GetBytesAsync"/> and
-/// <see cref="IRedisNearCache.SetBytesAsync"/>. The configured <see cref="IRedisNearCacheSerializer"/> is never
+/// <see cref="IRedisNearCache.SetBytesAsync(string, ReadOnlyMemory{byte}, TimeSpan?, CancellationToken)"/>. The configured <see cref="IRedisNearCacheSerializer"/> is never
 /// involved, so any serializer works and other <see cref="IDistributedCache"/> clients see the same bytes.
 ///
 /// <para>
-/// <b>Sliding expiration.</b> Redis TTLs (and RedisNearCache's <see cref="IRedisNearCache.SetAsync{T}"/>) have
+/// <b>Sliding expiration.</b> Redis TTLs (and RedisNearCache's <see cref="IRedisNearCache.SetAsync{T}(string, T, TimeSpan?, CancellationToken)"/>) have
 /// no notion of a sliding window. <see cref="DistributedCacheEntryOptions.SlidingExpiration"/> is therefore
 /// mapped to a plain absolute expiry equal to the sliding window, applied once at write time. It is never
 /// extended by a later read: <see cref="Refresh"/> and <see cref="RefreshAsync"/> are no-ops, and the Redis
@@ -137,7 +137,7 @@ public sealed class RedisNearCacheDistributedCache : IDistributedCache, IBufferD
 
     /// <summary>
     /// Maps <see cref="DistributedCacheEntryOptions"/> to the single <see cref="TimeSpan"/> expiry that
-    /// <see cref="IRedisNearCache.SetBytesAsync"/> accepts. <see cref="DistributedCacheEntryOptions.AbsoluteExpirationRelativeToNow"/>
+    /// <see cref="IRedisNearCache.SetBytesAsync(string, ReadOnlyMemory{byte}, TimeSpan?, CancellationToken)"/> accepts. <see cref="DistributedCacheEntryOptions.AbsoluteExpirationRelativeToNow"/>
     /// wins if set; otherwise <see cref="DistributedCacheEntryOptions.AbsoluteExpiration"/> (converted to a
     /// relative duration); otherwise <see cref="DistributedCacheEntryOptions.SlidingExpiration"/>, treated as
     /// an absolute expiry equal to the sliding window (see the type-level remarks). <c>null</c> if none of the
