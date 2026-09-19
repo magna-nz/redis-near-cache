@@ -1,7 +1,11 @@
 using System.Buffers;
 using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using RedisNearCache.HybridCache;
+using RedisNearCache.Tracking;
 using Xunit;
+using Facade = RedisNearCache.Caching.RedisNearCache;
 
 namespace RedisNearCache.UnitTests;
 
@@ -166,5 +170,107 @@ public class DistributedCacheAdapterTests
             Next = next;
             return next;
         }
+    }
+
+    [Fact]
+    public async Task BufferTryGetFallsBackForAForeignImplementation()
+    {
+        // The fake is not the library's concrete cache, so the adapter must take the GetBytesAsync path.
+        var (cache, fake) = Create();
+        await cache.SetAsync("k", [4, 5, 6], new DistributedCacheEntryOptions());
+        var writer = new ArrayBufferWriter<byte>();
+        Assert.True(await cache.TryGetAsync("k", writer));
+        Assert.Equal(new byte[] { 4, 5, 6 }, writer.WrittenSpan.ToArray());
+        Assert.False(await cache.TryGetAsync("absent", new ArrayBufferWriter<byte>()));
+        Assert.Single(fake.Writes);
+    }
+}
+
+/// <summary>
+/// The adapter's zero-copy read over the library's own cache: <c>TryWriteStoredBytesAsync</c> copies the stored
+/// bytes straight into the writer, so the array L1 holds must never escape through it.
+/// </summary>
+public class DistributedCacheAdapterOverConcreteCacheTests
+{
+    private const string Key = "k";
+
+    private static async Task<(Facade cache, RedisNearCacheDistributedCache adapter)> StartAsync()
+    {
+        var mux = new FakeMultiplexer("rnc-unit-" + Guid.NewGuid().ToString("N"));
+        mux.Add(7000, isReplica: false);
+        var connection = FakeRedis.Connection(mux);
+        var armer = new TrackingArmer(connection, NullLogger<TrackingArmer>.Instance, Timeout.InfiniteTimeSpan);
+        var cache = new Facade(connection, armer, new SilentListener(), Options.Create(new RedisNearCacheOptions()), NullLogger<Facade>.Instance);
+        await cache.Ready;
+        return (cache, new RedisNearCacheDistributedCache(cache));
+    }
+
+    [Fact]
+    public async Task WritesTheStoredBytesAndCountsHitsAsBefore()
+    {
+        var (cache, adapter) = await StartAsync();
+        await using var lifetime = cache;
+        byte[] payload = [0, 1, 2, 250, 255];
+        await cache.SetBytesAsync(Key, payload);
+
+        var first = new ArrayBufferWriter<byte>();
+        Assert.True(await adapter.TryGetAsync(Key, first));
+        Assert.Equal(payload, first.WrittenSpan.ToArray());
+        Assert.Equal(1, cache.Statistics.Misses);
+        Assert.Equal(0, cache.Statistics.Hits);
+
+        var second = new ArrayBufferWriter<byte>();
+        Assert.True(await adapter.TryGetAsync(Key, second));
+        Assert.Equal(payload, second.WrittenSpan.ToArray());
+        Assert.Equal(1, cache.Statistics.Hits);
+    }
+
+    [Fact]
+    public async Task TheArrayHeldInL1IsNeverHandedToTheWriter()
+    {
+        var (cache, adapter) = await StartAsync();
+        await using var lifetime = cache;
+        byte[] payload = [1, 2, 3];
+        await cache.SetBytesAsync(Key, payload);
+        await adapter.TryGetAsync(Key, new ArrayBufferWriter<byte>()); // populates L1
+
+        var writer = new ExposedBufferWriter();
+        Assert.True(await adapter.TryGetAsync(Key, writer));
+        Assert.Equal(payload, writer.Written());
+
+        // Scribbling over the buffer the adapter wrote into must not reach the cached entry.
+        writer.Buffer[0] = 99;
+        Assert.Equal(payload, await cache.GetBytesAsync(Key));
+        Assert.True(cache.TryGetLocal<byte[]>(Key, out var local));
+        Assert.Equal(payload, local);
+    }
+
+    [Fact]
+    public async Task AMissingKeyWritesNothing()
+    {
+        var mux = new FakeMultiplexer("rnc-unit-" + Guid.NewGuid().ToString("N"));
+        mux.Add(7000, isReplica: false);
+        mux.StoredValue = StackExchange.Redis.RedisValue.Null;
+        var connection = FakeRedis.Connection(mux);
+        var armer = new TrackingArmer(connection, NullLogger<TrackingArmer>.Instance, Timeout.InfiniteTimeSpan);
+        var cache = new Facade(connection, armer, new SilentListener(), Options.Create(new RedisNearCacheOptions()), NullLogger<Facade>.Instance);
+        await using var lifetime = cache;
+        await cache.Ready;
+
+        var writer = new ArrayBufferWriter<byte>();
+        Assert.False(await new RedisNearCacheDistributedCache(cache).TryGetAsync(Key, writer));
+        Assert.Equal(0, writer.WrittenCount);
+    }
+
+    /// <summary><see cref="ArrayBufferWriter{T}"/> only exposes its contents read-only; this one lets the test scribble on them.</summary>
+    private sealed class ExposedBufferWriter : IBufferWriter<byte>
+    {
+        public readonly byte[] Buffer = new byte[256];
+        private int _written;
+
+        public void Advance(int count) => _written += count;
+        public Memory<byte> GetMemory(int sizeHint = 0) => Buffer.AsMemory(_written);
+        public Span<byte> GetSpan(int sizeHint = 0) => Buffer.AsSpan(_written);
+        public byte[] Written() => Buffer[.._written];
     }
 }

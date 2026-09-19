@@ -42,6 +42,74 @@ public class L1ConfigurationTests
     }
 
     [Fact]
+    public async Task L1SizeLimitBytesBoundsL1ByValueLength()
+    {
+        const int budget = 400;
+        const int valueLength = 100;
+        var handle = await EdgeCaseSupport.BuildAsync(StandaloneCacheFixture.ConnectionString, o => o.L1SizeLimitBytes = budget);
+        try
+        {
+            var cache = handle.Cache;
+            var value = new string('x', valueLength);
+            var keys = Enumerable.Range(0, 20).Select(i => TestHelpers.Key($"size-bytes-{i}")).ToArray();
+            foreach (var key in keys) await cache.SetAsync(key, value);
+            foreach (var key in keys) Assert.Equal(value, await cache.GetAsync<string>(key));
+
+            // MemoryCache compacts on a thread-pool thread, so the budget is met eventually, not on the last Set.
+            long HeldBytes() => keys.Count(k => cache.TryGetLocal<string>(k, out _)) * (long)valueLength;
+            var withinBudget = await Poll.UntilAsync(() => HeldBytes() <= budget, TimeSpan.FromSeconds(5));
+            Assert.True(withinBudget, $"expected at most {budget} bytes held locally; found {HeldBytes()}.");
+
+            // Whether a key survived eviction or not, the value read must be right.
+            foreach (var key in keys) Assert.Equal(value, await cache.GetAsync<string>(key));
+
+            // "Within budget" must not mean "caches nothing": values that fit are still held locally.
+            var someResident = await Poll.UntilAsync(
+                async () =>
+                {
+                    foreach (var key in keys) await cache.GetAsync<string>(key);
+                    return keys.Any(k => cache.TryGetLocal<string>(k, out _));
+                },
+                TimeSpan.FromSeconds(5));
+            Assert.True(someResident, "a byte budget four values wide held none of them locally.");
+        }
+        finally
+        {
+            await handle.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task AValueBiggerThanTheByteBudgetIsServedButNeverCached()
+    {
+        const int budget = 400;
+        var handle = await EdgeCaseSupport.BuildAsync(StandaloneCacheFixture.ConnectionString, o => o.L1SizeLimitBytes = budget);
+        try
+        {
+            var cache = handle.Cache;
+            var key = TestHelpers.Key("size-bytes-oversized");
+            var oversized = new string('y', budget * 3);
+            await cache.SetAsync(key, oversized);
+
+            // Every read goes to Redis: there is no budget it could ever fit in, so it is never stored.
+            for (var i = 0; i < 3; i++)
+            {
+                Assert.Equal(oversized, await cache.GetAsync<string>(key));
+                Assert.False(cache.TryGetLocal<string>(key, out _), $"read {i + 1}: a value larger than the whole byte budget must never enter L1.");
+            }
+
+            // A value that does fit still caches, so the oversized one did not poison the budget.
+            var small = TestHelpers.Key("size-bytes-small");
+            await cache.SetAsync(small, "v1");
+            Assert.True(await TestHelpers.ReadUntilCachedAsync(cache, small, "v1"), "a value within the budget must still be cached.");
+        }
+        finally
+        {
+            await handle.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task L1MaxAgeInfiniteKeepsEntries()
     {
         var handle = await EdgeCaseSupport.BuildAsync(StandaloneCacheFixture.ConnectionString, o => o.L1MaxAge = Timeout.InfiniteTimeSpan);

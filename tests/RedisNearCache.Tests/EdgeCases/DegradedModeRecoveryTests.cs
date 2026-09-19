@@ -98,12 +98,12 @@ public class DegradedModeRecoveryTests
     }
 
     /// <summary>
-    /// KNOWN DEFECT. The other half: after the background loop arms the node the cache should serve from L1
-    /// again. It does not. <c>RedisNearCache.GetAsync</c> re-sets the degraded flag on EVERY call once
-    /// <see cref="IRedisNearCache.Ready"/> has faulted (src/RedisNearCache/Caching/RedisNearCache.cs:149-156),
-    /// because a faulted Task stays faulted forever, so <c>OnArmed</c>'s <c>_degraded = false</c>
-    /// (RedisNearCache.cs:103) is undone by the next read and caching never resumes.
-    /// Observed: rearms=1 (the recovery arm happened) but hits stay 0 for the whole 20 s window.
+    /// Regression test for the other half: once the background loop arms the node, the cache must resume
+    /// serving from L1. <c>RedisNearCache.GetAsync</c> settles the degraded flag from
+    /// <see cref="IRedisNearCache.Ready"/> exactly once, via an <c>Interlocked.Exchange</c> guard
+    /// (src/RedisNearCache/Caching/RedisNearCache.cs), rather than re-deriving it from <c>Ready</c> on every
+    /// call — <c>Ready</c> stays faulted forever once startup fails, but the cache does not. That is what
+    /// lets <c>OnArmed</c>'s <c>_degraded = false</c> stick after the recovery arm, so caching resumes.
     /// </summary>
     [Fact]
     public async Task DegradedModeRecoversWhenTrackingBecomesPossible()
@@ -140,8 +140,8 @@ public class DegradedModeRecoveryTests
                 TimeSpan.FromMilliseconds(250));
 
             Assert.True(recovered,
-                "the cache never started caching again after CLIENT TRACKING was permitted; the degraded flag is " +
-                $"re-set on every read while Ready stays faulted. stats={cache.Statistics}");
+                "the cache never started caching again after CLIENT TRACKING was permitted. " +
+                $"stats={cache.Statistics}");
 
             // And tracking really is armed: an external write evicts.
             Assert.True(cache.TryGetLocal<string>(key, out _), "key was not cached after recovery.");

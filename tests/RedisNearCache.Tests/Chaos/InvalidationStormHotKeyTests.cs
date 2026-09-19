@@ -11,37 +11,21 @@ namespace RedisNearCache.Tests.Chaos;
 /// candidate for the in-flight race: the reply is already on the wire when the next write lands.
 /// </summary>
 /// <remarks>
-/// KNOWN DEFECT — this test fails most of the time (4 of 5 attempts while it was written), always with the
-/// same signature: L1 is left holding some value from the middle of the storm, Redis holds the last one, and
-/// no further invalidation ever arrives because the server stopped tracking the key at that write.
+/// Regression test for a race between an invalidation and a concurrent read of the same key: without the
+/// fix below, L1 could be left holding a value from the middle of the storm, with Redis holding the last
+/// one and no further invalidation ever arriving, because tracking is one-shot and the invalidation that
+/// should have caught the stale store had already consumed it.
 ///
-/// The cause is that <c>OnKeyInvalidated</c> (src/RedisNearCache/Caching/RedisNearCache.cs:69-74) evicts L1
-/// and marks the in-flight tracker as two separate, unsynchronised steps, in that order:
+/// <c>OnKeyInvalidated</c> (src/RedisNearCache/Caching/RedisNearCache.cs) marks the in-flight tracker
+/// FIRST, then evicts L1, per the ordering rule documented immediately above it:
 ///
-///     _l1.Remove(key);                  // line 71
-///     _inflight.MarkInvalidated(key);   // line 72
+///     _inflight.MarkInvalidated(key);
+///     _l1.Remove(key);
 ///
-/// A reader running concurrently in GetAsync (same file, lines 163-179 plus the finally at 186) can slot in
-/// between them:
-///
-///   1. invalidation thread   line 71   _l1.Remove(key)            -> L1 is empty, nothing to remove
-///   2. invalidation thread   PRE-EMPTED between line 71 and 72
-///   3. reader                line 165  WasInvalidated(key, token) -> false, the mark has not happened yet
-///   4. reader                line 171  _l1.Set(key, staleBytes)
-///   5. reader                line 174  WasInvalidated(key, token) -> still false
-///   6. reader                line 186  _inflight.End(key, token)  -> the key's Entry is removed outright
-///                                      (InFlightTracker.cs:57-73)
-///   7. invalidation thread   line 72   MarkInvalidated(key)       -> TryGetValue finds no Entry
-///                                      (InFlightTracker.cs:79-81) and returns; the mark is dropped
-///
-/// L1 now holds a value the server superseded, the server is no longer tracking the key (tracking is
-/// one-shot, and the invalidation it just sent consumed it), so nothing will ever evict the entry. It is
-/// served as a hit until L1MaxAge expires it — five minutes by default.
-///
-/// Steps 3 and 5 are what makes the ordering matter: both of the reader's checks are unavoidably before
-/// step 7. Marking first and evicting second closes the window, because then the mark precedes the Remove,
-/// the Remove precedes the Set (that is what leaves the value behind at all), and so the re-check at line
-/// 174 is guaranteed to see it.
+/// A reader running concurrently in <c>GetAsync</c> re-checks <c>WasInvalidated</c> after storing into L1
+/// and before ending its in-flight entry. Mark-then-evict closes the interleaving that evict-then-mark left
+/// open: the mark now precedes the Remove, the Remove precedes the Set that would otherwise leave a stale
+/// value behind, so the reader's re-check is guaranteed to see the mark once it has been set.
 /// </remarks>
 public class InvalidationStormHotKeyTests : IClassFixture<StandaloneCacheFixture>, IAsyncLifetime
 {
@@ -122,11 +106,8 @@ public class InvalidationStormHotKeyTests : IClassFixture<StandaloneCacheFixture
         {
             Assert.True(
                 local == last,
-                $"KNOWN DEFECT: L1 held '{local}' after the storm settled but Redis holds '{last}'. The " +
-                $"invalidation that should have evicted '{local}' was counted (invalidations={invalidations}) " +
-                "but dropped by InFlightTracker.MarkInvalidated because the reader had already ended its " +
-                "in-flight entry. See the remarks on this class: RedisNearCache.cs:71-72 evicts L1 before " +
-                "marking the tracker, and the two steps are not atomic with respect to a concurrent GetAsync.");
+                $"L1 held '{local}' after the storm settled but Redis holds '{last}' " +
+                $"(invalidations={invalidations}). See the remarks on this class for the race this guards against.");
         }
 
         Assert.True(invalidations >= 1, "the storm produced no invalidations at all, so the test proved nothing.");

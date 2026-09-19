@@ -1,5 +1,6 @@
 using System.Buffers;
 using Microsoft.Extensions.Caching.Distributed;
+using Facade = RedisNearCache.Caching.RedisNearCache;
 
 namespace RedisNearCache.HybridCache;
 
@@ -95,9 +96,20 @@ public sealed class RedisNearCacheDistributedCache : IDistributedCache, IBufferD
     /// member <c>HybridCache</c> prefers over <see cref="GetAsync"/> because it avoids an intermediate
     /// <c>byte[]</c> allocation for the caller.
     /// </summary>
+    /// <remarks>
+    /// Against the library's own cache the stored bytes go straight into <paramref name="destination"/>: one copy,
+    /// out of L1 and into the writer. Any other <see cref="IRedisNearCache"/> implementation is read through
+    /// <see cref="IRedisNearCache.GetBytesAsync"/>, whose contract is to hand back an array of the caller's own,
+    /// and that array is then copied into the writer. Hits and misses are counted the same way either way.
+    /// </remarks>
     public async ValueTask<bool> TryGetAsync(string key, IBufferWriter<byte> destination, CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(destination);
+        if (_cache is Facade facade)
+        {
+            return await facade.TryWriteStoredBytesAsync(key, destination, token).ConfigureAwait(false);
+        }
+
         var value = await _cache.GetBytesAsync(key, token).ConfigureAwait(false);
         if (value is null)
         {

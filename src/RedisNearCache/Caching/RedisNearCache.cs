@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -21,6 +22,7 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     private readonly L1Cache _l1;
     private readonly InFlightTracker _inflight;
+    private readonly RedisNearCacheMetrics _metrics;
     private volatile bool _degraded;
     private int _startupSettled;
 
@@ -91,6 +93,10 @@ internal sealed class RedisNearCache : IRedisNearCache
 
         _l1 = new L1Cache(_options);
         _inflight = new InFlightTracker();
+        // The statistics object does not own L1, so it is pointed at it here and detached again on dispose.
+        Statistics.AttachL1(() => _l1.Count);
+        // Observable instruments only: they read what is counted anyway, so no metric costs the read path anything.
+        _metrics = new RedisNearCacheMetrics(Statistics, _connection.ClientName, () => IsCoherent);
 
         _listener.KeyInvalidated += OnKeyInvalidated;
         _listener.FlushAll += OnFlushAll;
@@ -306,12 +312,32 @@ internal sealed class RedisNearCache : IRedisNearCache
         (await GetStoredBytesAsync(key, cancellationToken).ConfigureAwait(false))?.ToArray();
 
     /// <summary>
+    /// The read behind <c>IBufferDistributedCache.TryGetAsync</c>: the same path as <see cref="GetBytesAsync"/>, but
+    /// copying the stored bytes straight into <paramref name="destination"/> instead of into an intermediate array
+    /// the caller would then copy again. The L1-held array is never handed out, only read from.
+    /// </summary>
+    internal async ValueTask<bool> TryWriteStoredBytesAsync(string key, IBufferWriter<byte> destination, CancellationToken cancellationToken)
+    {
+        var bytes = await GetStoredBytesAsync(key, cancellationToken).ConfigureAwait(false);
+        if (bytes is null)
+        {
+            return false;
+        }
+
+        destination.Write(bytes);
+        return true;
+    }
+
+    /// <summary>
     /// The read path shared by the typed and raw reads: the bytes as stored in Redis, or null when the key does not
     /// exist. The array returned may be the instance held in L1, so callers must not hand it out or change it.
     /// </summary>
     private async ValueTask<byte[]?> GetStoredBytesAsync(string key, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        // Before L1 and before Redis: a caller that cancelled already must not be handed a locally cached value
+        // either, or cancellation would be observed only on a miss.
+        cancellationToken.ThrowIfCancellationRequested();
         if (Volatile.Read(ref _startupSettled) == 0)
         {
             if (!Ready.IsCompleted)
@@ -614,9 +640,22 @@ internal sealed class RedisNearCache : IRedisNearCache
     }
 
     // Marked as well as removed: a read already on the wire would otherwise store its reply straight back.
-    public void EvictLocal(string key) => InvalidateLocal(key);
+    // A no-op once disposed, matching TryGetLocal: there is no L1 left to evict from, and reaching the disposed
+    // MemoryCache would throw. Only these two public entry points are guarded - the invalidation handlers and the
+    // write path call InvalidateLocal/FlushLocal directly and run only while the cache is alive.
+    public void EvictLocal(string key)
+    {
+        if (Volatile.Read(ref _disposed) == 1) return;
+        try { InvalidateLocal(key); }
+        catch (ObjectDisposedException) { /* a dispose won the race after the check above: same no-op */ }
+    }
 
-    public void EvictAllLocal() => FlushLocal();
+    public void EvictAllLocal()
+    {
+        if (Volatile.Read(ref _disposed) == 1) return;
+        try { FlushLocal(); }
+        catch (ObjectDisposedException) { /* a dispose won the race after the check above: same no-op */ }
+    }
 
     public bool TryGetLocal<T>(string key, out T? value)
     {
@@ -643,11 +682,23 @@ internal sealed class RedisNearCache : IRedisNearCache
         _armer.TrackingLost -= OnTrackingLost;
         _armer.EndpointRemoved -= OnEndpointRemoved;
 
-        // Disposing the armer cancels any arm in flight, so a startup racing this dispose finishes promptly.
-        await _armer.DisposeAsync().ConfigureAwait(false);
-        try { await Ready.ConfigureAwait(false); } catch { /* faulted or cancelled startup is fine here */ }
-        await _listener.DisposeAsync().ConfigureAwait(false);
-        _l1.Dispose();
+        try
+        {
+            // Disposing the armer cancels any arm in flight, so a startup racing this dispose finishes promptly.
+            await _armer.DisposeAsync().ConfigureAwait(false);
+            try { await Ready.ConfigureAwait(false); } catch { /* faulted or cancelled startup is fine here */ }
+            await _listener.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            // Even if the armer or listener threw: an undisposed Meter stays registered for the life of the process
+            // and its callbacks would keep this cache, its L1 and its multiplexer reachable.
+            // Stop publishing before L1 goes, so no collection cycle can reach a disposed store.
+            _metrics.Dispose();
+            Statistics.DetachL1();
+            _l1.Dispose();
+        }
+
         await _connection.DisposeAsync().ConfigureAwait(false);
         // Waiters can never be satisfied now; wake them so they observe the disposal.
         lock (_coherenceLock) _coherence.TrySetResult();

@@ -189,7 +189,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: nupkg
-          path: artifacts/*.nupkg
+          # The symbol packages ride along: `dotnet nuget push x.nupkg` also pushes the x.snupkg beside it.
+          path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
 
   publish:
     name: publish to NuGet

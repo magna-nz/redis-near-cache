@@ -16,5 +16,8 @@
          here to match the pinned Microsoft.Extensions.*.Abstractions version (10.0.12) rather than
          touching the shared props file. -->
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <!-- Needed only for the host-level ValidateOnStart test (Host.CreateApplicationBuilder / IHost.StartAsync);
+         already centrally pinned in Directory.Packages.props. -->
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
   </ItemGroup>
 </Project>

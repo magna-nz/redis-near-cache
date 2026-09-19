@@ -13,12 +13,10 @@ namespace RedisNearCache.Tests.Chaos;
 /// <remarks>
 /// The prefix half of this test has never failed: no <c>b:</c> key has ever reached L1.
 ///
-/// KNOWN DEFECT in the other half: the final staleness check on the opted-in <c>a:</c> keys fails
-/// intermittently (observed: <c>a:...:0</c> holding <c>'4979'</c> while Redis held <c>'12577'</c>). That is
-/// the same defect as <see cref="StressNoStaleAfterQuiescenceTests"/> and
-/// <see cref="InvalidationStormHotKeyTests"/> — RedisNearCache.cs:71-72 evicting L1 before marking the
-/// in-flight tracker — and has nothing to do with prefixes; opting in simply means these keys are eligible
-/// for L1 and therefore eligible to go stale.
+/// The other half is a regression test for the same race as <see cref="StressNoStaleAfterQuiescenceTests"/>
+/// and <see cref="InvalidationStormHotKeyTests"/> — a stale value surviving in L1 because
+/// <c>OnKeyInvalidated</c> evicted L1 before marking the in-flight tracker — and has nothing to do with
+/// prefixes; opting in simply means these keys are eligible for L1 and therefore eligible to go stale.
 /// </remarks>
 public class PrefixOptInStressTests : IAsyncLifetime
 {
@@ -93,7 +91,7 @@ public class PrefixOptInStressTests : IAsyncLifetime
         var stale = await ChaosSupport.FindStaleAsync(_cache, _foreign, aKeys);
         _out.WriteLine($"reads={outcome.Reads} writes={outcome.Writes} stats={_cache.Statistics}");
         Assert.True(stale.Count == 0,
-            "KNOWN DEFECT: an opted-in (a:) key was left stale in L1: " + string.Join(" | ", stale) +
+            "an opted-in (a:) key was left stale in L1: " + string.Join(" | ", stale) +
             ". Same cause as StressNoStaleAfterQuiescence; see the remarks on this class.");
     }
 }

@@ -94,6 +94,18 @@ services.AddRedisNearCache(o =>
 });
 ```
 
+## Metrics and health checks
+
+`IRedisNearCache.Statistics` and a `System.Diagnostics.Metrics` meter (`RedisNearCacheStatistics.MeterName`) expose the
+same counters, plus L1 entry count and coherence as gauges, tagged with each instance's Redis client name. A health
+check reports `Degraded` (not `Unhealthy`) while the cache is in pass-through, since reads still succeed straight
+from Redis.
+
+```csharp
+services.AddOpenTelemetry().WithMetrics(m => m.AddMeter(RedisNearCacheStatistics.MeterName));
+services.AddHealthChecks().AddCheck<RedisNearCacheHealthCheck>("redis-near-cache");
+```
+
 ## How it stays correct
 
 - The private connection is armed with `CLIENT TRACKING ON REDIRECT <subscriber> NOLOOP` on every master.

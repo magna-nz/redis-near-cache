@@ -80,7 +80,7 @@ var user = await cache.GetAsync<User>("user:42");      // miss: one GET, tracked
 var again = await cache.GetAsync<User>("user:42");     // hit: no network call
 
 await cache.SetAsync("user:42", user with { Name = "Ada" });   // writes through, evicts the local copy
-Console.WriteLine(cache.Statistics);                   // hits=1 misses=1 invalidations=0 flushes=0 rearms=0 raceDiscards=0
+Console.WriteLine(cache.Statistics);                   // hits=1 misses=1 invalidations=0 flushes=0 rearms=0 raceDiscards=0 l1Entries=0
 ```
 
 Then, from anywhere:
@@ -112,6 +112,18 @@ services.AddRedisNearCache(o =>
     o.TrackingMode = TrackingMode.Broadcast;
     o.KeyPrefixes.Add("product:");
 });
+```
+
+### Metrics and health checks
+
+`IRedisNearCache.Statistics` and a `System.Diagnostics.Metrics` meter (`RedisNearCacheStatistics.MeterName`) expose the
+same counters, plus L1 entry count and coherence as gauges, tagged with each instance's Redis client name. A health
+check reports `Degraded` (not `Unhealthy`) while the cache is in pass-through, since reads still succeed straight
+from Redis.
+
+```csharp
+services.AddOpenTelemetry().WithMetrics(m => m.AddMeter(RedisNearCacheStatistics.MeterName));
+services.AddHealthChecks().AddCheck<RedisNearCacheHealthCheck>("redis-near-cache");
 ```
 
 ## Performance

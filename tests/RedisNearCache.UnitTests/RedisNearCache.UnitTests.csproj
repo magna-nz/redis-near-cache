@@ -11,5 +11,9 @@
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <!-- The DI/validation tests need the concrete ServiceCollection/BuildServiceProvider, which the src project
+         does not pull in (it only references Microsoft.Extensions.DependencyInjection.Abstractions). Already
+         centrally pinned in Directory.Packages.props, so no version is needed here. -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
   </ItemGroup>
 </Project>

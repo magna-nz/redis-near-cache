@@ -8,19 +8,12 @@ namespace RedisNearCache.Tests.Chaos;
 /// rewrites them, can L1 be left holding a value that Redis no longer has once everything has settled?
 /// </summary>
 /// <remarks>
-/// KNOWN DEFECT — it can. This test fails intermittently, and always with the same shape: one key of the
-/// twenty is left holding a value from early in the run (observed: <c>L1='29'</c> while Redis held
-/// <c>'1822'</c>), which is then served as a hit for the next five minutes.
-///
-/// Same root cause as <see cref="InvalidationStormHotKeyTests"/>, which documents the interleaving in full
-/// and which <see cref="InvalidationOrderingWindowTests.EvictBeforeMarkLosesTheInvalidation"/> reproduces
-/// deterministically: <c>OnKeyInvalidated</c> (src/RedisNearCache/Caching/RedisNearCache.cs:71-72) evicts L1
-/// before it marks the in-flight tracker, so a reader that stores between those two statements keeps a value
-/// the server has already superseded and stopped tracking.
-///
-/// How often it fails depends on how contended the machine is, because the defect needs the invalidation
-/// callback to be pre-empted between two adjacent statements. On an idle machine six consecutive attempts
-/// all passed; with another build running concurrently it failed roughly one attempt in four.
+/// Regression test for the same race documented in full on <see cref="InvalidationStormHotKeyTests"/>, and
+/// modeled deterministically by
+/// <see cref="InvalidationOrderingWindowTests.EvictBeforeMarkLosesTheInvalidation"/>: without the ordering
+/// fix in <c>OnKeyInvalidated</c> (src/RedisNearCache/Caching/RedisNearCache.cs), which marks the in-flight
+/// tracker before it evicts L1, a reader that stores between those two steps could keep a value the server
+/// had already superseded and stopped tracking, served as a hit until <c>L1MaxAge</c> expires it.
 /// </remarks>
 public class StressNoStaleAfterQuiescenceTests : IClassFixture<StandaloneCacheFixture>, IAsyncLifetime
 {
@@ -90,8 +83,7 @@ public class StressNoStaleAfterQuiescenceTests : IClassFixture<StandaloneCacheFi
         var stale = await ChaosSupport.FindStaleAsync(_fx.Cache, _foreign, keys);
         _out.WriteLine($"reads={outcome.Reads} writes={outcome.Writes} (of which redis-cli={cliWrites}) stats={_fx.Cache.Statistics}");
         Assert.True(stale.Count == 0,
-            "KNOWN DEFECT: L1 served a stale value after quiescence: " + string.Join(" | ", stale) +
-            ". The invalidation was received and counted but dropped, because RedisNearCache.cs:71-72 evicts " +
-            "L1 before marking the in-flight tracker. See the remarks on this class.");
+            "L1 served a stale value after quiescence: " + string.Join(" | ", stale) +
+            ". See the remarks on this class for the race this guards against.");
     }
 }
