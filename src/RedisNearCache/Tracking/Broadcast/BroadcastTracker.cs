@@ -130,7 +130,7 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
         _logger = logger;
         _configuration = RedisNearCacheConnection.BuildConfiguration(options);
         _clientName = $"{connection.ClientName}-bcast";
-        _prefixes = NormalisePrefixes(options.KeyPrefixes, out _droppedPrefixes);
+        _prefixes = NormalisePrefixes(options.EffectiveKeyPrefixes(), out _droppedPrefixes);
         _takeover = new TakeoverGuard(() => _connection.Multiplexer, _logger, MasterEndPoints, () => _sockets.Keys.ToArray(), Reconcile);
     }
 

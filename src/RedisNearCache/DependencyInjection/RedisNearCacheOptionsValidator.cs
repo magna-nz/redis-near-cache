@@ -11,9 +11,17 @@ internal sealed class RedisNearCacheOptionsValidator : IValidateOptions<RedisNea
     /// <inheritdoc/>
     public ValidateOptionsResult Validate(string? name, RedisNearCacheOptions options)
     {
-        // Named options are not RedisNearCache's: AddRedisNearCache only ever configures the default instance.
+        // Only the default instance, which is what AddRedisNearCache configures. A name given to
+        // AddKeyedRedisNearCache has a validator of its own (NamedRedisNearCacheOptionsValidator); any other named
+        // RedisNearCacheOptions an application keeps is none of this library's business.
         if (name is not null && name != Options.DefaultName) return ValidateOptionsResult.Skip;
 
+        return ValidateRules(options);
+    }
+
+    /// <summary>The rules themselves, shared with <see cref="NamedRedisNearCacheOptionsValidator"/>.</summary>
+    internal static ValidateOptionsResult ValidateRules(RedisNearCacheOptions options)
+    {
         ArgumentNullException.ThrowIfNull(options);
 
         var failures = new List<string>();
@@ -57,4 +65,26 @@ internal sealed class RedisNearCacheOptionsValidator : IValidateOptions<RedisNea
 
         return failures.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(failures);
     }
+}
+
+/// <summary>
+/// Validates the <see cref="RedisNearCacheOptions"/> registered under one name through <c>AddKeyedRedisNearCache</c>,
+/// by the same rules as the default ones, and skips every other name.
+/// </summary>
+/// <remarks>
+/// A type of its own on purpose. <c>AddRedisNearCache</c> adds the default validator with <c>TryAddEnumerable</c>,
+/// which skips the add when a descriptor with the same service type AND implementation type is already present. Had
+/// this been the same class, a named registration made first would have cost the default instance its validation,
+/// silently.
+/// </remarks>
+internal sealed class NamedRedisNearCacheOptionsValidator(string name) : IValidateOptions<RedisNearCacheOptions>
+{
+    /// <summary>The options name this instance validates.</summary>
+    internal string Name => name;
+
+    /// <inheritdoc/>
+    public ValidateOptionsResult Validate(string? optionsName, RedisNearCacheOptions options) =>
+        (optionsName ?? Options.DefaultName) != name
+            ? ValidateOptionsResult.Skip
+            : RedisNearCacheOptionsValidator.ValidateRules(options);
 }

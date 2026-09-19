@@ -17,6 +17,7 @@ internal sealed class RedisNearCache : IRedisNearCache
     private readonly ITrackingArmer _armer;
     private readonly IInvalidationListener _listener;
     private readonly string[] _keyPrefixes;
+    private readonly string? _keyNamespace;
     private readonly RedisNearCacheOptions _options;
     private readonly ILogger<RedisNearCache> _logger;
 
@@ -54,6 +55,7 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     /// <summary>Set once the first TTL read failed on both the raw and the typed command, so the warning is said once.</summary>
     private int _ttlCapWarned;
+    private int _namespacedKeyWarned;
 
     /// <summary>
     /// Consecutive misses whose TTL could not be read at all. Reset by the first success. A cap that cannot be read
@@ -88,7 +90,8 @@ internal sealed class RedisNearCache : IRedisNearCache
         _listener = listener;
         _options = options.Value;
         // Read once: the broadcast tracker arms the server with this same set at start, and the two must agree.
-        _keyPrefixes = _options.KeyPrefixes.ToArray();
+        _keyPrefixes = _options.EffectiveKeyPrefixes();
+        _keyNamespace = string.IsNullOrEmpty(_options.KeyNamespace) ? null : _options.KeyNamespace;
         _logger = logger;
 
         _l1 = new L1Cache(_options);
@@ -96,7 +99,7 @@ internal sealed class RedisNearCache : IRedisNearCache
         // The statistics object does not own L1, so it is pointed at it here and detached again on dispose.
         Statistics.AttachL1(() => _l1.Count);
         // Observable instruments only: they read what is counted anyway, so no metric costs the read path anything.
-        _metrics = new RedisNearCacheMetrics(Statistics, _connection.ClientName, () => IsCoherent);
+        _metrics = new RedisNearCacheMetrics(Statistics, _connection.ClientName, () => IsCoherent, _options.InstanceName);
 
         _listener.KeyInvalidated += OnKeyInvalidated;
         _listener.FlushAll += OnFlushAll;
@@ -282,6 +285,33 @@ internal sealed class RedisNearCache : IRedisNearCache
         if (Volatile.Read(ref _disposed) == 1) throw new ObjectDisposedException(nameof(RedisNearCache));
     }
 
+    /// <summary>
+    /// The key as Redis, L1 and the in-flight tracker know it. Applied once, where a caller's key comes in; everything
+    /// below that works on full keys, which is also what the server's invalidations carry, so that path never has to
+    /// translate anything. Without a namespace the key is passed through untouched - not even checked, so nothing
+    /// changes for a cache that has none. With one a null key must be refused: it would otherwise quietly become the
+    /// namespace itself.
+    /// </summary>
+    private string FullKey(string key)
+    {
+        if (_keyNamespace is null) return key;
+        ArgumentNullException.ThrowIfNull(key);
+
+        // The mistake to expect from someone adopting KeyNamespace: still passing full keys. It fails quietly - the
+        // key becomes "ns:ns:..." - so say so, once. A key may legitimately begin with the same text, hence a
+        // warning and nothing more.
+        if (Volatile.Read(ref _namespacedKeyWarned) == 0
+            && key.StartsWith(_keyNamespace, StringComparison.Ordinal)
+            && Interlocked.Exchange(ref _namespacedKeyWarned, 1) == 0)
+        {
+            _logger.LogWarning(
+                "RedisNearCache was given the key {Key}, which already begins with its KeyNamespace {KeyNamespace}; the namespace is added to every key, so this one is read and written as {FullKey}. Pass keys without the namespace. This is reported once",
+                key, _keyNamespace, _keyNamespace + key);
+        }
+
+        return _keyNamespace + key;
+    }
+
     private bool MatchesPrefixes(string key)
     {
         var prefixes = _keyPrefixes;
@@ -353,6 +383,7 @@ internal sealed class RedisNearCache : IRedisNearCache
         // Before L1 and before Redis: a caller that cancelled already must not be handed a locally cached value
         // either, or cancellation would be observed only on a miss.
         cancellationToken.ThrowIfCancellationRequested();
+        key = FullKey(key);
         if (Volatile.Read(ref _startupSettled) == 0)
         {
             if (!Ready.IsCompleted)
@@ -630,6 +661,7 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     private async ValueTask<bool> WriteAsync(string key, byte[] bytes, TimeSpan? expiry, When when, bool keepTtl, CancellationToken cancellationToken)
     {
+        key = FullKey(key);
         var db = _connection.Multiplexer.GetDatabase();
         // In Redirect mode tracking is armed with NOLOOP, so the server does not echo this write back; in Broadcast
         // mode it does (the push connection never writes), and the echo is harmless: it evicts what we evict here.
@@ -659,6 +691,7 @@ internal sealed class RedisNearCache : IRedisNearCache
     public async ValueTask<bool> RemoveAsync(string key, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        key = FullKey(key);
         var db = _connection.Multiplexer.GetDatabase();
         InvalidateLocal(key);
         try
@@ -678,7 +711,7 @@ internal sealed class RedisNearCache : IRedisNearCache
     public void EvictLocal(string key)
     {
         if (Volatile.Read(ref _disposed) == 1) return;
-        try { InvalidateLocal(key); }
+        try { InvalidateLocal(FullKey(key)); }
         catch (ObjectDisposedException) { /* a dispose won the race after the check above: same no-op */ }
     }
 
@@ -691,7 +724,7 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     public bool TryGetLocal<T>(string key, out T? value)
     {
-        if (CachingEnabled && Volatile.Read(ref _disposed) == 0 && _l1.TryGet(key, out var bytes))
+        if (CachingEnabled && Volatile.Read(ref _disposed) == 0 && _l1.TryGet(FullKey(key), out var bytes))
         {
             value = _options.Serializer.Deserialize<T>(bytes);
             return true;

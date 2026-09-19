@@ -246,6 +246,24 @@ internal sealed class FakeMultiplexer
     private int _stringSetCalls;
 
     /// <summary>
+    /// The key the most recent <c>StringSetAsync</c> carried, and a per-key count of them. Only one stored value is
+    /// modelled (see <see cref="StoredValue"/>), so a test that cares which key a write went to - a namespaced cache
+    /// has to send <c>namespace + key</c> - asserts on these rather than on the value.
+    /// </summary>
+    public string? LastSetKey { get; private set; }
+    private readonly ConcurrentDictionary<string, int> _stringSetCallsByKey = new(StringComparer.Ordinal);
+
+    /// <summary>How many <c>StringSetAsync</c> calls the fake has answered for one key.</summary>
+    public int StringSetCallsFor(string key) => _stringSetCallsByKey.TryGetValue(key, out var calls) ? calls : 0;
+
+    /// <summary>The key the most recent single-key <c>KeyDeleteAsync</c> carried; null before any.</summary>
+    public string? LastDeletedKey { get; private set; }
+
+    /// <summary>How many single-key <c>KeyDeleteAsync</c> calls have reached the fake.</summary>
+    public int KeyDeleteCalls => Volatile.Read(ref _keyDeleteCalls);
+    private int _keyDeleteCalls;
+
+    /// <summary>
     /// How many <c>StringGetAsync</c> calls have reached the fake, in total and per key. The multi-key read asserts
     /// on these: a key served from L1 must produce no GET at all, and a key named twice in one call must produce
     /// exactly one.
@@ -269,8 +287,10 @@ internal sealed class FakeMultiplexer
             // overload StringSetAsync(key, value, expiry, keepTtl, when, flags), matched here by position/type so
             // any other shape (defensively kept for whatever else might call this fake) falls through to the
             // simple always-succeeds behaviour below instead of throwing.
-            case "StringSetAsync" when args.Length > 1 && args[0] is RedisKey && args[1] is RedisValue written:
+            case "StringSetAsync" when args.Length > 1 && args[0] is RedisKey writtenKey && args[1] is RedisValue written:
                 Interlocked.Increment(ref _stringSetCalls);
+                LastSetKey = writtenKey.ToString();
+                _stringSetCallsByKey.AddOrUpdate(LastSetKey, 1, static (_, calls) => calls + 1);
                 if (args.Length >= 6 && args[3] is bool keepTtl && args[4] is When when)
                 {
                     LastSetExpiry = args[2] as TimeSpan?;
@@ -285,6 +305,14 @@ internal sealed class FakeMultiplexer
                 }
                 StoredValue = written;
                 return Task.FromResult(true);
+            // The delete behind RedisNearCache.RemoveAsync. One stored value for every key, as for reads and writes,
+            // so the delete clears it and reports whether there was one - which is what Redis's DEL returns.
+            case "KeyDeleteAsync" when args.Length > 0 && args[0] is RedisKey deletedKey:
+                Interlocked.Increment(ref _keyDeleteCalls);
+                LastDeletedKey = deletedKey.ToString();
+                var existed = !StoredValue.IsNull;
+                StoredValue = RedisValue.Null;
+                return Task.FromResult(existed);
             case "ExecuteAsync" when args.Length == 2 && Equals(args[0], "PTTL"):
                 Interlocked.Increment(ref _pttlCalls);
                 return PttlFailure is { } failure
