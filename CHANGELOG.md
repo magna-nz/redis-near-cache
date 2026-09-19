@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.4.0 (2026-09-20)
+
+- Feature: `RedisNearCacheOptions.KeyNamespace` (`string?`, default `null`), a prefix put in front of every key
+  given to the cache, so several applications, tenants or cache instances can share one Redis database: with
+  `"app1:"`, `GetAsync("user:42")` reads the Redis key `app1:user:42`. The caller's key becomes `namespace + key`
+  once, at the cache's edge (the shared read, the shared write, `RemoveAsync`, `EvictLocal` and `TryGetLocal`); L1,
+  the in-flight tracker and Redis all work on the full key from there, which is also what the server's
+  invalidations carry, so the invalidation path translates nothing and costs nothing extra. Callers keep using
+  their own keys everywhere, including as the keys of the dictionary `GetManyAsync`/`GetManyBytesAsync` return.
+  Anything that writes to Redis directly (another service, `redis-cli`) must use the full key for its write to
+  invalidate the local copy. When adopting it, stop passing full keys: a key that already begins with the namespace
+  gets it a second time (`app1:app1:user:42`), which the cache reports once as a warning and otherwise does as
+  asked. Log messages name the full key. On a cluster keep `{`...`}` out of the namespace, where it would be a hash
+  tag putting every key in one slot. `KeyPrefixes` are relative to the namespace (`"user:"` under `"app1:"` means Redis
+  keys starting `app1:user:`), and in `TrackingMode.Broadcast` a namespace with no `KeyPrefixes` arms the server
+  with `BCAST PREFIX <namespace>` instead of the whole keyspace, which removes the main cost of Broadcast mode
+  with empty prefixes. With a namespace set, a null key throws `ArgumentNullException`. `null` or empty (the
+  default) changes nothing: keys go to Redis exactly as given, byte for byte today's behaviour.
+- Feature: named instances. `AddKeyedRedisNearCache(name, configure)` and the connection-string overload
+  `AddKeyedRedisNearCache(name, connectionString, configure = null)` register a second (third, ...)
+  `IRedisNearCache` as a keyed service, alongside the default one from `AddRedisNearCache` or instead of it: its
+  own options, its own private connections to Redis, its own L1 and statistics. Resolve it with
+  `[FromKeyedServices(name)] IRedisNearCache` or `GetRequiredKeyedService<IRedisNearCache>(name)`. `name` is both
+  the service key and the options name, so `IOptionsMonitor<RedisNearCacheOptions>.Get(name)` returns this
+  instance's options; those options are validated like the default ones, at host start under `IHost`, and options
+  kept under a name that was not registered this way are left alone. Calling this twice with one name registers
+  one instance. Metrics of a named instance carry an extra tag, `rnc.instance = <name>`, stable across restarts
+  unlike `rnc.client_name`; the default instance's metric series are unchanged. `AddRedisNearCacheDistributedCacheFor(name)`
+  and `AddRedisNearCacheHybridCacheFor(name, configure = null)` (in `RedisNearCache.HybridCache`) back the
+  application's single `IDistributedCache`/`HybridCache` with a named instance instead of the default one, on the
+  same first-registration-wins terms as the unnamed forms. Every named instance opens its own connections (one
+  multiplexer plus its subscriber, or its own Broadcast sockets). One thing to know about keyed services in
+  general: code that walks the `IServiceCollection` reading `ImplementationType`/`ImplementationFactory` from
+  every descriptor (some older scanning or decorator libraries) throws on a keyed one.
+- Packaging: `dotnet pack` now runs the .NET SDK's package validation (`EnablePackageValidation`,
+  `PackageValidationBaselineVersion` set to `1.3.0` in both `src/RedisNearCache/RedisNearCache.csproj` and
+  `src/RedisNearCache.HybridCache/RedisNearCache.HybridCache.csproj`) against the published baseline, so a change
+  that removes or alters public API an earlier 1.x had fails the build. Two things follow for contributors: the
+  baseline package is downloaded at restore, so a first restore needs nuget.org; and when the version is bumped for
+  a release the baseline stays at the last version actually published (raise it only after the new one is out).
+- Compatibility: nothing changes for an application that uses neither feature. `IRedisNearCache` is unchanged;
+  the existing `AddRedisNearCache*` methods and their registrations are unchanged (the keyed path above is
+  separate code); without a `KeyNamespace` keys are not touched or even inspected; and the default instance's
+  metrics keep exactly their existing tags.
+
 ## 1.3.0 (2026-09-19)
 
 - Fix: under a sustained storm of writes to the same hot keys, L1 could stop storing anything at all, silently and for

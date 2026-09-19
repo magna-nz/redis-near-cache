@@ -24,6 +24,12 @@ internal sealed class RedisNearCacheMetrics : IDisposable
     /// <summary>The tag every measurement carries, naming the cache instance by its Redis client name.</summary>
     public const string ClientNameTag = "rnc.client_name";
 
+    /// <summary>
+    /// A second tag, carried only by an instance registered under a name (<c>AddKeyedRedisNearCache</c>): the client
+    /// name changes with every process, the registration name does not. The default instance's series are unchanged.
+    /// </summary>
+    public const string InstanceTag = "rnc.instance";
+
     // Without the "+<commit sha>" a SourceLink build appends: it would only be noise in the instrumentation scope.
     private static readonly string? MeterVersion =
         typeof(RedisNearCacheMetrics).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0];
@@ -31,9 +37,11 @@ internal sealed class RedisNearCacheMetrics : IDisposable
     private readonly Meter _meter;
     private readonly KeyValuePair<string, object?>[] _tags;
 
-    public RedisNearCacheMetrics(RedisNearCacheStatistics statistics, string clientName, Func<bool> isCoherent)
+    public RedisNearCacheMetrics(RedisNearCacheStatistics statistics, string clientName, Func<bool> isCoherent, string? instanceName = null)
     {
-        _tags = [new KeyValuePair<string, object?>(ClientNameTag, clientName)];
+        _tags = instanceName is null
+            ? [new KeyValuePair<string, object?>(ClientNameTag, clientName)]
+            : [new KeyValuePair<string, object?>(ClientNameTag, clientName), new KeyValuePair<string, object?>(InstanceTag, instanceName)];
         _meter = new Meter(MeterName, MeterVersion);
 
         _meter.CreateObservableCounter("redisnearcache.hits", () => Observe(() => statistics.Hits),

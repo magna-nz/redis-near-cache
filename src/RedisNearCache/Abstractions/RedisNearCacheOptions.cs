@@ -23,8 +23,25 @@ public sealed class RedisNearCacheOptions
     /// transaction could not run, such a read falls back to a plain GET and is tracked like any other. Empty
     /// (default) means every key read through RedisNearCache is cached and tracked. In <see cref="TrackingMode.Broadcast"/>
     /// these are also the <c>BCAST PREFIX</c> arguments. Read once when the cache is created; later changes are ignored.
+    /// When <see cref="KeyNamespace"/> is set these are relative to it, like every other key given to the cache:
+    /// <c>"user:"</c> under the namespace <c>"app1:"</c> means the Redis keys starting <c>app1:user:</c>.
     /// </summary>
     public IList<string> KeyPrefixes { get; } = new List<string>();
+
+    /// <summary>
+    /// A prefix put in front of every key given to the cache, so several applications, tenants or cache instances can
+    /// share one Redis database without their keys meeting: with <c>"app1:"</c>, <c>GetAsync("user:42")</c> reads the
+    /// Redis key <c>app1:user:42</c>. Callers keep using their own keys everywhere, including in the result of
+    /// <see cref="IRedisNearCache.GetManyAsync{T}"/>; anything that writes to Redis directly must use the full key for
+    /// the write to invalidate the local copy. <see cref="KeyPrefixes"/> are relative to it, and in
+    /// <see cref="TrackingMode.Broadcast"/> a namespace with no <see cref="KeyPrefixes"/> arms the server with the
+    /// namespace itself instead of the whole keyspace. When adopting it, stop passing full keys: a key that already
+    /// begins with the namespace gets it a second time (logged once as a warning). Log messages name the full key, as
+    /// Redis sees it. On a cluster keep <c>{</c>...<c>}</c> out of the namespace: it would be a hash tag, and every key
+    /// would land in one slot. <c>null</c> or empty (the default)
+    /// changes nothing: keys go to Redis exactly as given. Read once when the cache is created.
+    /// </summary>
+    public string? KeyNamespace { get; set; }
 
     /// <summary>
     /// How invalidations reach this instance. <see cref="TrackingMode.Redirect"/> (default) for Redis and Valkey
@@ -69,6 +86,21 @@ public sealed class RedisNearCacheOptions
 
     /// <summary>Prefix for the Redis client name RedisNearCache sets on its connections. A unique suffix is appended.</summary>
     public string ClientNamePrefix { get; set; } = "rnc";
+
+    /// <summary>The name this instance was registered under with <c>AddKeyedRedisNearCache</c>; null for the default one.</summary>
+    internal string? InstanceName { get; set; }
+
+    /// <summary>
+    /// <see cref="KeyPrefixes"/> as Redis sees them: with <see cref="KeyNamespace"/> in front, or the namespace alone
+    /// when there are none. The cache's own filter and the Broadcast tracker's <c>BCAST PREFIX</c> list both come from
+    /// here, because the two must agree. Without a namespace this is <see cref="KeyPrefixes"/> unchanged.
+    /// </summary>
+    internal string[] EffectiveKeyPrefixes()
+    {
+        var keyNamespace = KeyNamespace;
+        if (string.IsNullOrEmpty(keyNamespace)) return KeyPrefixes.ToArray();
+        return KeyPrefixes.Count == 0 ? [keyNamespace] : KeyPrefixes.Select(prefix => keyNamespace + prefix).ToArray();
+    }
 
     /// <summary>Hooks used by the integration tests to inject timing. Not for production use.</summary>
     internal RedisNearCacheTestHooks TestHooks { get; } = new();

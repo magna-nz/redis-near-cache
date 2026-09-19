@@ -5,6 +5,10 @@
     <PackageId>RedisNearCache</PackageId>
     <Description>Client-side caching on top of StackExchange.Redis. Keeps the values you read in memory and drops them the moment Redis says they changed.</Description>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- dotnet pack compares the public API with the published baseline and fails on a breaking change, so a
+         consumer of an earlier 1.x can always take a later one. Raise the baseline only to a released version. -->
+    <EnablePackageValidation>true</EnablePackageValidation>
+    <PackageValidationBaselineVersion>1.3.0</PackageValidationBaselineVersion>
     <IsAotCompatible Condition="'$(TargetFramework)' == 'net10.0'">false</IsAotCompatible>
   </PropertyGroup>
   <ItemGroup>

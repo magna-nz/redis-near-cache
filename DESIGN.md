@@ -57,7 +57,28 @@ user writes ──► user's own multiplexer / any client ──► Redis ──
 | Integration and chaos tests | `tests/RedisNearCache.Tests/` | docker containers |
 | Benchmarks | `bench/` | — |
 
+**Named instances.** `AddKeyedRedisNearCache(name, ...)`, in the same `DependencyInjection/` folder, registers a
+second (third, ...) `IRedisNearCache` as a keyed service: its own connection, armer, listener and cache, entirely
+separate code from `AddRedisNearCache`, keyed throughout on `name`. Its options come from
+`IOptionsMonitor<RedisNearCacheOptions>.Get(name)`; `RedisNearCacheOptionsValidator.ForName(name)` validates only
+that name and skips every other named `RedisNearCacheOptions` an application keeps (the default instance's
+validator likewise validates only `Options.DefaultName`). Its `Meter` carries an extra `rnc.instance` tag holding
+`name`, stable across restarts unlike `rnc.client_name`. None of this touches the default instance's registration,
+options or metrics: an application that never calls `AddKeyedRedisNearCache` sees no difference at all.
+
+**Package validation.** Both `src/RedisNearCache/RedisNearCache.csproj` and
+`src/RedisNearCache.HybridCache/RedisNearCache.HybridCache.csproj` now set `EnablePackageValidation` and
+`PackageValidationBaselineVersion` (`1.3.0`; restored from nuget.org, and only ever raised to a version already published), so `dotnet pack` fails if the build removed or altered public API an
+earlier 1.x had.
+
 ## Read path (facade)
+
+**Key namespaces.** `RedisNearCacheOptions.KeyNamespace` is applied once, at the five points a caller's key enters
+the facade: the shared read, the shared write, `RemoveAsync`, `EvictLocal` and `TryGetLocal` (peek). From there on,
+L1, the in-flight tracker and Redis all work on the full key, which is also what the server's invalidations carry,
+so the invalidation path never translates anything back. `KeyPrefixes` are relative to the namespace;
+`RedisNearCacheOptions.EffectiveKeyPrefixes()` computes the namespaced set once, in the one place both the
+facade's own filter and the Broadcast tracker's `BCAST PREFIX` list read it from, because the two must agree.
 
 ```
 GetAsync<T>(key):
