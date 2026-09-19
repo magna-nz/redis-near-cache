@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 (2026-09-19)
+
+- Fix: under a sustained storm of writes to the same hot keys, L1 could stop storing anything at all, silently and for
+  good, while `IsCoherent` stayed `true` and `Statistics` showed no flush, no re-arm and no race discard to explain it
+  (only `Misses` climbing and `L1Entries` falling to zero). All earlier versions are affected, on `GetAsync` as much as
+  anywhere. It cost performance only - the cache became a pass-through to Redis and never
+  served a stale value - and any whole-cache flush (a reconnect, a re-arm, `FLUSHDB`, `EvictAllLocal`) cleared it.
+  The cause is in `MemoryCache`'s size accounting (Microsoft.Extensions.Caching.Memory 9.0 through at least 10.0.12;
+  dotnet/runtime#129186, a regression from #103931, fixed for 11.0 by #129215, with the 10.0 backport #129510 still
+  open): a `Set`
+  that finds an entry already there subtracts its size as a replacement, and if that entry is removed at the same
+  moment - by an invalidation, the expiry scan, or a lookup that trips over an expired entry - its size is
+  subtracted twice. The total only drifts down; once it is below zero the capacity check, done unsigned, refuses every `Set`. `L1Cache` now takes a lock for the key around its
+  store and its remove, and removes the key before storing it, so `MemoryCache.Set` never finds an entry to replace
+  and the double-count cannot happen. L1 hits stay lock-free; a miss and an invalidation each take one lock, contended
+  only on a key several threads are storing or invalidating at once. Measured with stores, removes and expiries
+  racing over ~50 million operations: the total ends at exactly zero, where it ended at -9 before (and at -2 with the
+  lock alone, which is why the remove comes first). The workaround is independent of the package version a consuming
+  application resolves, and can go once the package floor is a build that contains the upstream fix.
 
 - Feature: conditional writes, `SetAsync<T>(key, value, When when, TimeSpan? expiry = null, bool keepTtl = false, CancellationToken cancellationToken = default)`
   and the raw-bytes `SetBytesAsync` equivalent. `When.NotExists`/`When.Exists` map to `SET NX`/`SET XX`,
@@ -18,6 +36,21 @@
   version: a bare `default` as the third argument, `SetAsync(key, value, default)` or
   `SetBytesAsync(key, value, default)`; write `expiry: null` or leave the argument out. Already-compiled callers
   are unaffected. `When` is `StackExchange.Redis.When`.
+- Feature: multi-key reads, `GetManyAsync<T>(IEnumerable<string> keys, CancellationToken cancellationToken = default)`
+  returning `ValueTask<IReadOnlyDictionary<string, T?>>`, and the raw-bytes `GetManyBytesAsync` equivalent returning
+  `IReadOnlyDictionary<string, byte[]?>`. One entry per distinct key, compared ordinally; a key that does not exist
+  in Redis is present with `null`/`default`, exactly as `GetAsync<T>` returns for it, so a value type should be read
+  as its nullable form (`GetManyAsync<int?>`) to tell a missing key from a stored zero. Duplicates in `keys` are
+  read once, and `Statistics` counts one hit or miss per distinct key. Deliberately not an `MGET`: every key goes
+  through the same single-key read as `GetAsync<T>`/`GetBytesAsync`, all started together so the misses share a
+  round trip per Redis node, keeping each key's own in-flight race check, TTL cap, `KeyPrefixes` handling and
+  cluster slot routing, which an `MGET` across slots would refuse. Reads are issued at most 256 at a time, so a
+  very large key list cannot queue tens of thousands of commands at once and time out its own tail. If any read
+  fails, the call throws the first failure (in key order) after every read already started has finished; keys read
+  successfully by then stay cached. `keys` null throws `ArgumentNullException`; a null element throws
+  `ArgumentException`, before any read starts. Shipped as default interface methods built only on
+  `GetAsync<T>`/`GetBytesAsync`, so an existing `IRedisNearCache` implementation or decorator still compiles and
+  gets a correct multi-key read for free, through its own `GetAsync<T>`.
 
 ## 1.2.0 (2026-09-19)
 

@@ -48,6 +48,7 @@ await cache.Ready;                                     // subscription up, track
 
 var user = await cache.GetAsync<User>("user:42");      // miss: one GET, tracked, stored locally
 var again = await cache.GetAsync<User>("user:42");     // hit: no network call
+var users = await cache.GetManyAsync<User>(["user:1", "user:2", "user:3"]);   // misses share a round trip (256 keys at a time), hits are served locally
 
 await cache.SetAsync("user:42", user with { Name = "Ada" });   // writes through, evicts the local copy
 var created = await cache.SetAsync("user:42", user, When.NotExists);   // StackExchange.Redis.When: write only if absent; false if it exists
