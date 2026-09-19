@@ -96,6 +96,20 @@ services.AddRedisNearCache(o =>
 });
 ```
 
+## Key namespaces and named instances
+
+`RedisNearCacheOptions.KeyNamespace` prefixes every key given to the cache, so several applications or tenants can
+share one Redis database: with `"app1:"`, `GetAsync("user:42")` reads the Redis key `app1:user:42`.
+Pass keys without the namespace from then on; a key that already carries it gets it twice (warned about once).
+`AddKeyedRedisNearCache` registers a second (third, ...) `IRedisNearCache`, with its own options, connections, L1
+and statistics, resolved by name instead of the default one:
+
+```csharp
+services.AddKeyedRedisNearCache("sessions", connectionString, o => { o.KeyNamespace = "sessions:"; o.L1SizeLimit = 50_000; });
+
+public sealed class Basket([FromKeyedServices("sessions")] IRedisNearCache cache) { /* ... */ }
+```
+
 ## Metrics and health checks
 
 `IRedisNearCache.Statistics` and a `System.Diagnostics.Metrics` meter (`RedisNearCacheStatistics.MeterName`) expose the

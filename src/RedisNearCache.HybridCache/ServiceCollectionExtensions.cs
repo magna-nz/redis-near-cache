@@ -105,4 +105,44 @@ public static class ServiceCollectionExtensions
 
         return services;
     }
+
+    /// <summary>
+    /// <see cref="AddRedisNearCacheDistributedCache"/> for a cache registered under a name with
+    /// <c>AddKeyedRedisNearCache</c>: the application's one <see cref="IDistributedCache"/> /
+    /// <see cref="IBufferDistributedCache"/> is backed by that named instance instead of the default one.
+    /// </summary>
+    /// <remarks>
+    /// A separate method rather than an overload taking the name, so that no existing call (in particular one passing
+    /// <c>null</c>) can bind differently. Like the unnamed form this only adds what is not there yet: whichever of the
+    /// two is called first decides which cache backs <see cref="IDistributedCache"/>.
+    /// </remarks>
+    public static IServiceCollection AddRedisNearCacheDistributedCacheFor(this IServiceCollection services, string name)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentException.ThrowIfNullOrEmpty(name);
+
+        services.TryAddSingleton(sp => new RedisNearCacheDistributedCache(sp.GetRequiredKeyedService<IRedisNearCache>(name)));
+        services.TryAddSingleton<IDistributedCache>(sp => sp.GetRequiredService<RedisNearCacheDistributedCache>());
+        services.TryAddSingleton<IBufferDistributedCache>(sp => sp.GetRequiredService<RedisNearCacheDistributedCache>());
+        return services;
+    }
+
+    /// <summary>
+    /// <see cref="AddRedisNearCacheHybridCache"/> over a cache registered under a name with
+    /// <c>AddKeyedRedisNearCache</c>. Everything said there applies, including <c>HybridCache</c>'s own local cache
+    /// being disabled by default so the tracked L1 is the only local tier.
+    /// </summary>
+    public static IServiceCollection AddRedisNearCacheHybridCacheFor(
+        this IServiceCollection services,
+        string name,
+        Action<HybridCacheOptions>? configure = null)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentException.ThrowIfNullOrEmpty(name);
+
+        services.AddRedisNearCacheDistributedCacheFor(name);
+        // Registering the distributed cache first is what makes the call below a no-op for that part; the rest of it
+        // (HybridCache itself, with its local cache disabled) is exactly what the unnamed form sets up.
+        return services.AddRedisNearCacheHybridCache(configure);
+    }
 }
