@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+- Feature: a `System.Diagnostics.Metrics` `Meter` named `RedisNearCache` (`RedisNearCacheStatistics.MeterName`),
+  one per cache instance and disposed with it. All instruments are observable, read from `Statistics` (or L1)
+  only when something collects, so nothing is added to the read path: counters `redisnearcache.hits`,
+  `.misses`, `.invalidations`, `.flushes`, `.rearms`, `.race_discards`, and gauges `redisnearcache.l1.entries`
+  and `redisnearcache.coherent`. Every measurement is tagged `rnc.client_name` so several instances in one
+  process stay distinct. No new package dependency; wire it up with
+  `.WithMetrics(m => m.AddMeter(RedisNearCacheStatistics.MeterName))`, or watch it with `dotnet-counters`.
+- Feature: `RedisNearCacheStatistics.L1Entries`, the current L1 entry count, also appended to `ToString()` as
+  `l1Entries=N`.
+- Feature: `RedisNearCacheOptions.L1SizeLimitBytes` (`long?`, default `null`). When set, L1 is bounded by the
+  total bytes of the cached values instead of by entry count and `L1SizeLimit` is ignored; a value larger than
+  the limit is never cached, but is still returned to the caller. `null` keeps the existing entry-count bound.
+- Feature: `RedisNearCacheHealthCheck` (namespace `RedisNearCache`, in the core package) implements
+  `IHealthCheck`: `Healthy` while `IsCoherent`, `Degraded` (not `Unhealthy`, since reads still succeed as
+  pass-through) otherwise, with the statistics counters in the result's `Data`. Needs one new dependency,
+  `Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions`. Register it with
+  `services.AddHealthChecks().AddCheck<RedisNearCacheHealthCheck>("redis-near-cache")`; there is deliberately
+  no `IHealthChecksBuilder` extension method, since that would need the full HealthChecks package.
+- Feature: `AddRedisNearCache` now registers a validator for `RedisNearCacheOptions` with `ValidateOnStart`,
+  checking that `Configuration` or `ConnectionString` is set, `L1SizeLimit > 0`, `L1SizeLimitBytes` is `null` or
+  `> 0`, `L1MaxAge` is positive or `Timeout.InfiniteTimeSpan`, `ClientNamePrefix` is non-empty and without
+  whitespace, `Serializer` is not null, and `KeyPrefixes` has no null or empty entry. **Behaviour change:** a
+  misconfigured registration used to throw `InvalidOperationException` the first time `IRedisNearCache` was
+  resolved; it now throws `OptionsValidationException`, at host startup under `IHost` rather than on first
+  resolve.
+- Fix: `IBufferDistributedCache.TryGetAsync` on `RedisNearCacheDistributedCache` now copies the stored bytes
+  straight into the caller's `IBufferWriter<byte>`, one copy instead of two. No API change.
+- Fix: `GetAsync`/`GetBytesAsync` now observe an already-cancelled token even when the key is already in L1.
+- Fix: `EvictLocal`/`EvictAllLocal` are now no-ops after the cache is disposed; they used to reach the disposed
+  `MemoryCache`.
+- Packaging: symbol packages (`.snupkg`) are now published alongside the NuGet packages.
+- Docs: `Ready`'s doc comment and the Limitations list said a faulted start left the cache in pass-through
+  permanently. The armer keeps retrying every 5 s in the background regardless of whether `Ready` faulted; when
+  it succeeds the cache leaves pass-through and serves from L1 again. `Ready` itself stays faulted; use
+  `IsCoherent`/`WaitForCoherenceAsync` to observe recovery.
+- Docs: noted that a null `expiry` on `SetAsync`/`SetBytesAsync` issues a plain `SET`, which clears any TTL the
+  key already had.
+- Docs: corrected the `L1SizeLimit` description: `MemoryCache` compacts in the background by priority then
+  least-recently-used, so while L1 is full a new entry may not be stored until compaction has run (the read
+  still returns the value); this is not strict LRU eviction on every write.
+- Docs: added an ACL permissions reference (Operations) listing the commands, and the channel and key
+  permissions, a restricted user needs in each tracking mode.
+- Docs: added Limitations entries for mTLS on the `Broadcast` connection (`ConfigurationOptions.CertificateSelection`/
+  `CertificateValidation` are events the broadcast socket cannot read; supply client certificates through
+  `SslClientAuthenticationOptions`), for Dragonfly, KeyDB, AWS MemoryDB and Google Cloud Memorystore
+  being untested, and for Redis 6.0/6.1 being untested (CI starts at 6.2).
+
 ## 1.1.0 (2026-09-17)
 
 - Fix (both tracking modes): a master that stopped being one is now forgotten, which lets the cache serve from L1

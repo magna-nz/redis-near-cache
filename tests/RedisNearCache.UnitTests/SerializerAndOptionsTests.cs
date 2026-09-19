@@ -90,6 +90,7 @@ public class SerializerAndOptionsTests
         var o = new RedisNearCacheOptions();
         Assert.Empty(o.KeyPrefixes);
         Assert.Equal(10_000, o.L1SizeLimit);
+        Assert.Null(o.L1SizeLimitBytes);
         Assert.Equal(TimeSpan.FromMinutes(5), o.L1MaxAge);
         Assert.Same(JsonRedisNearCacheSerializer.Instance, o.Serializer);
         Assert.Equal("rnc", o.ClientNamePrefix);
@@ -102,6 +103,7 @@ public class SerializerAndOptionsTests
         s.Hit(); s.Hit(); s.Miss(); s.Invalidation(); s.Flush(); s.Rearm(); s.RaceDiscard();
         Assert.Equal(2, s.Hits);
         Assert.Equal(1, s.Misses);
-        Assert.Equal("hits=2 misses=1 invalidations=1 flushes=1 rearms=1 raceDiscards=1", s.ToString());
+        // l1Entries is appended last and reads 0 with no L1 attached; the prefix is unchanged on purpose.
+        Assert.Equal("hits=2 misses=1 invalidations=1 flushes=1 rearms=1 raceDiscards=1 l1Entries=0", s.ToString());
     }
 }

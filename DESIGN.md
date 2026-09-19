@@ -220,6 +220,27 @@ Re-authenticating the private multiplexer is the provider's own job (the Azure e
 `AUTH` leaves a Redis connection's authentication unchanged) and stays armed, the rejected pair is not retried until the
 provider yields another, and a connection the server closes at expiry is an ordinary socket death.
 
+## Observability
+
+Statistics, metrics and the health check all read existing state; none of them add cost to the read or
+invalidation path.
+
+- **Metrics are observable instruments, not counters updated on the hot path.** A `System.Diagnostics.Metrics`
+  `Meter` named `RedisNearCache` (`RedisNearCacheStatistics.MeterName`) exposes the same counters as
+  `Statistics` plus L1 entry count and coherence as gauges, but every instrument is read from `Statistics` or
+  `L1Cache` only when something collects (an OpenTelemetry exporter, `dotnet-counters`). `GetAsync`, `SetAsync`
+  and the invalidation handlers touch nothing metrics-related.
+- **One `Meter` per cache instance, tagged `rnc.client_name`.** The cache already owns a unique client name
+  per instance (`{ClientNamePrefix}-{guid}`); reusing it as a tag, rather than sharing one process-wide
+  `Meter`, is what keeps several `IRedisNearCache` instances in one process (two providers, or tests) distinct
+  in an exported series without extra configuration. The `Meter` is disposed with the cache, same lifetime as
+  everything else it owns.
+- **The health check reports `Degraded`, not `Unhealthy`, when not coherent.** Pass-through is a real state,
+  not a failure one: reads still succeed, served straight from Redis, exactly as `IsCoherent` documents.
+  `Unhealthy` would tell an orchestrator to stop routing traffic or restart the instance, which would not fix
+  anything here and would drop the very traffic pass-through is designed to keep serving; `Degraded` reports
+  the condition without recommending an action that makes it worse.
+
 ## Not in v1
 
 `OPTIN` tracking, Garnet, write-through population of L1 (`SetAsync` evicts and lets the next read re-track).

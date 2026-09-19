@@ -58,7 +58,7 @@ HTTP 200
 HTTP 200
 
 === GET /stats ===
-{"hits":1,"misses":1,"invalidations":0,"flushes":0,"rearms":0,"raceDiscards":0}
+{"hits":1,"misses":1,"invalidations":0,"flushes":0,"rearms":0,"raceDiscards":0,"l1Entries":1}
 HTTP 200
 
 === external write ===
@@ -70,7 +70,7 @@ OK
 HTTP 200
 
 === GET /stats (final) ===
-{"hits":1,"misses":2,"invalidations":1,"flushes":0,"rearms":0,"raceDiscards":0}
+{"hits":1,"misses":2,"invalidations":1,"flushes":0,"rearms":0,"raceDiscards":0,"l1Entries":1}
 HTTP 200
 ```
 
@@ -123,7 +123,7 @@ info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
       MISS config:feature-flags = <null>  (cumulative hits=0 misses=1)
       ... (17 more MISS ticks while the key does not exist yet) ...
 info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
-      Statistics: hits=0 misses=11 invalidations=0 flushes=0 rearms=0 raceDiscards=0
+      Statistics: hits=0 misses=11 invalidations=0 flushes=0 rearms=0 raceDiscards=0 l1Entries=0
       ... (docker exec redis-near-cache-redis redis-cli SET config:feature-flags '{"beta":true}' run here) ...
 info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
       MISS config:feature-flags = {"beta":true}  (cumulative hits=0 misses=19)
@@ -134,7 +134,7 @@ info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
 info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
       hit  config:feature-flags = {"beta":true}  (cumulative hits=3 misses=19)
 info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
-      Statistics: hits=3 misses=19 invalidations=1 flushes=0 rearms=0 raceDiscards=0
+      Statistics: hits=3 misses=19 invalidations=1 flushes=0 rearms=0 raceDiscards=0 l1Entries=1
 info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]
       hit  config:feature-flags = {"beta":true}  (cumulative hits=4 misses=19)
 info: RedisNearCache.Samples.Worker.ConfigPollingWorker[0]

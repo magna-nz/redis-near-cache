@@ -48,4 +48,24 @@ public class CancellationTests : IClassFixture<StandaloneCacheFixture>
 
         Assert.False(_fx.Cache.TryGetLocal<string>(key, out _), "a pre-cancelled GetAsync must not populate L1.");
     }
+
+    [Fact]
+    public async Task PreCancelledGetThrowsEvenWhenTheKeyIsCachedLocally()
+    {
+        var key = TestHelpers.Key("cancelled-get-hit");
+        await _fx.Cache.SetAsync(key, "v1");
+        Assert.True(await TestHelpers.ReadUntilCachedAsync(_fx.Cache, key, "v1"),
+            "the key must be in L1 before this test means anything.");
+
+        // The token is checked before L1 is consulted, so an L1 hit is no excuse for ignoring it: otherwise
+        // cancellation would be observable only on a miss, which is exactly the non-deterministic case.
+        var hitsBefore = _fx.Cache.Statistics.Hits;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _fx.Cache.GetAsync<string>(key, new CancellationToken(true)).AsTask());
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _fx.Cache.GetBytesAsync(key, new CancellationToken(true)).AsTask());
+
+        Assert.Equal(hitsBefore, _fx.Cache.Statistics.Hits);
+        Assert.True(_fx.Cache.TryGetLocal<string>(key, out _), "a refused read must leave the entry it did not serve alone.");
+    }
 }

@@ -16,8 +16,12 @@ public static class ServiceCollectionExtensions
     /// Adds <see cref="IRedisNearCache"/> as a singleton, together with the private
     /// <see cref="RedisNearCacheConnection"/>, <see cref="ITrackingArmer"/> and <see cref="IInvalidationListener"/>
     /// it depends on. <paramref name="configure"/> must set either
-    /// <see cref="RedisNearCacheOptions.Configuration"/> or <see cref="RedisNearCacheOptions.ConnectionString"/>;
-    /// otherwise resolving <see cref="IRedisNearCache"/> throws <see cref="InvalidOperationException"/>.
+    /// <see cref="RedisNearCacheOptions.Configuration"/> or <see cref="RedisNearCacheOptions.ConnectionString"/>,
+    /// and the other <see cref="RedisNearCacheOptions"/> values must be individually valid; otherwise
+    /// <c>IOptions&lt;RedisNearCacheOptions&gt;.Value</c> throws <c>OptionsValidationException</c> - at host
+    /// start under <c>IHost</c> (whose generic host eagerly validates options registered with
+    /// <c>ValidateOnStart</c>), or otherwise the first time <see cref="IRedisNearCache"/> (or the options) is
+    /// resolved.
     /// </summary>
     public static IServiceCollection AddRedisNearCache(this IServiceCollection services, Action<RedisNearCacheOptions> configure)
     {
@@ -26,6 +30,8 @@ public static class ServiceCollectionExtensions
 
         services.AddOptions();
         services.Configure(configure);
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<IValidateOptions<RedisNearCacheOptions>, RedisNearCacheOptionsValidator>());
+        services.AddOptions<RedisNearCacheOptions>().ValidateOnStart();
 
         services.TryAddSingleton(sp =>
         {

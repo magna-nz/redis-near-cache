@@ -33,8 +33,21 @@ public sealed class RedisNearCacheOptions
     /// </summary>
     public TrackingMode TrackingMode { get; set; } = TrackingMode.Redirect;
 
-    /// <summary>Maximum number of entries held in L1. Least-recently-used entries are evicted beyond this.</summary>
+    /// <summary>
+    /// Maximum number of entries held in L1. Least-recently-used entries are evicted beyond this.
+    /// Ignored when <see cref="L1SizeLimitBytes"/> is set.
+    /// </summary>
     public long L1SizeLimit { get; set; } = 10_000;
+
+    /// <summary>
+    /// Bounds L1 by the total size in bytes of the cached values rather than by the number of entries; when set,
+    /// <see cref="L1SizeLimit"/> is ignored. Each entry costs the length of its value (a zero-length value costs 1),
+    /// and a single value larger than the limit is never cached at all - the read still returns it to the caller,
+    /// it just comes from Redis every time. Only the values are counted: the keys, and MemoryCache's own per-entry
+    /// overhead, are not, so the process holds somewhat more than this. <c>null</c> (the default) keeps the
+    /// entry-count behaviour of <see cref="L1SizeLimit"/>.
+    /// </summary>
+    public long? L1SizeLimitBytes { get; set; }
 
     /// <summary>
     /// Safety net: an L1 entry is dropped after this age even if no invalidation arrived.
