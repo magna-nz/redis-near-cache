@@ -148,6 +148,16 @@ followed by `Armed` or `EndpointRemoved` for that endpoint; the armer mutates it
 one lock so the facade sees events in the same order as the armer's state, and the per-endpoint background retry
 loop (every 5 s) runs until one of the two happens.
 
+**Overlapping arms of one endpoint.** A node restart restores both connections and each `ConnectionRestored` queues
+an arm; a gate per endpoint keeps them from interleaving on the wire. One `Armed` answers every loss announced
+before it, so by the time the second arm gets the gate the facade is caching from that node again, and the arm opens
+with `CLIENT TRACKING OFF`. An arm therefore announces the loss again once it holds the gate if the endpoint is no
+longer lost (so an arm on its own still costs one flush, not two): no `OFF` is ever sent to a node the facade is
+caching from. The reconcile does not add to the queue: it skips a master that has an arm queued or running (before
+the promotion check too, so a pre-armed replica is not recorded as `Promoted` under a running arm), and the timer's
+sweep also leaves a lost master to the retry loop that owns it. A `ConfigurationChanged` is news and still arms a
+lost master at once.
+
 An endpoint we armed counts as tracked **whatever its current replica flag**: in a graceful Sentinel failover the
 multiplexer can flag the old master as a replica before Sentinel kills our connections there, and those failures
 must still flush. `EndpointRemoved` flushes unconditionally because entries read from a node that is no longer a
