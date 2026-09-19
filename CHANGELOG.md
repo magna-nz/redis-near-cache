@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Feature: conditional writes, `SetAsync<T>(key, value, When when, TimeSpan? expiry = null, bool keepTtl = false, CancellationToken cancellationToken = default)`
+  and the raw-bytes `SetBytesAsync` equivalent. `When.NotExists`/`When.Exists` map to `SET NX`/`SET XX`,
+  `When.Always` is the existing unconditional write; both return `true` if Redis performed the write, `false` if
+  the condition was not met and the key is unchanged. `keepTtl: true` keeps the key's existing TTL (`KEEPTTL`)
+  instead of clearing it, and cannot be combined with an `expiry` (`ArgumentException`, paramName `keepTtl`,
+  thrown before any Redis call). The L1 copy is evicted before and after the write regardless of the outcome,
+  exactly like the existing unconditional `SetAsync`/`SetBytesAsync`: a write that turns out not to have happened
+  costs one local eviction, never a stale read. Shipped as default interface methods, so an existing
+  `IRedisNearCache` implementation still compiles; its inherited default supports only an unconditional write
+  without `keepTtl` (by delegating to the old overload) and throws `NotSupportedException` for anything else.
+  `when` comes before `expiry` on purpose: after it, an existing call such as `SetAsync(key, value, expiry,
+  default)` would be ambiguous between the new overload and the `CancellationToken` one. **Source-compatibility
+  note:** one call shape does become ambiguous (CS0121) and needs a one-word edit when recompiling against this
+  version: a bare `default` as the third argument, `SetAsync(key, value, default)` or
+  `SetBytesAsync(key, value, default)`; write `expiry: null` or leave the argument out. Already-compiled callers
+  are unaffected. `When` is `StackExchange.Redis.When`.
+
 ## 1.2.0 (2026-09-19)
 
 - Feature: a `System.Diagnostics.Metrics` `Meter` named `RedisNearCache` (`RedisNearCacheStatistics.MeterName`),

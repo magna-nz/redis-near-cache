@@ -23,7 +23,7 @@ internal sealed class StressOutcome
 /// The read side shared by the stress tests: N reader tasks hammering <see cref="IRedisNearCache.GetAsync{T}"/>
 /// over a pool of keys while one writer task rewrites random keys with monotonically increasing values for a
 /// fixed window. The writer is what varies between tests (a foreign client, the cache's own
-/// <see cref="IRedisNearCache.SetAsync{T}"/>), so it is passed in.
+/// <see cref="IRedisNearCache.SetAsync{T}(string, T, TimeSpan?, CancellationToken)"/>), so it is passed in.
 /// </summary>
 internal static class StressHarness
 {

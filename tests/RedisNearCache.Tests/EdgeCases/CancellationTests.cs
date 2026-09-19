@@ -3,7 +3,7 @@ using Xunit;
 namespace RedisNearCache.Tests.EdgeCases;
 
 /// <summary>
-/// Cancellation must never leave the near cache incoherent. <see cref="IRedisNearCache.SetAsync{T}"/> evicts
+/// Cancellation must never leave the near cache incoherent. <see cref="IRedisNearCache.SetAsync{T}(string, T, TimeSpan?, CancellationToken)"/> evicts
 /// L1 unconditionally before and after the write (see the ordering note above
 /// <c>RedisNearCache.InvalidateLocal</c>), so a write cancelled before it could even reach Redis still leaves
 /// no stale L1 entry behind. <see cref="IRedisNearCache.GetAsync{T}"/> must observe a pre-cancelled token

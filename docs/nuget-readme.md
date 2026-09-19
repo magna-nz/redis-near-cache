@@ -50,6 +50,7 @@ var user = await cache.GetAsync<User>("user:42");      // miss: one GET, tracked
 var again = await cache.GetAsync<User>("user:42");     // hit: no network call
 
 await cache.SetAsync("user:42", user with { Name = "Ada" });   // writes through, evicts the local copy
+var created = await cache.SetAsync("user:42", user, When.NotExists);   // StackExchange.Redis.When: write only if absent; false if it exists
 ```
 
 Then, from anywhere:

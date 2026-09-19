@@ -587,7 +587,14 @@ internal sealed class RedisNearCache : IRedisNearCache
     public async ValueTask SetAsync<T>(string key, T value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        await WriteAsync(key, _options.Serializer.Serialize(value), expiry, cancellationToken).ConfigureAwait(false);
+        await WriteAsync(key, _options.Serializer.Serialize(value), expiry, When.Always, keepTtl: false, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<bool> SetAsync<T>(string key, T value, When when, TimeSpan? expiry = null, bool keepTtl = false, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ConditionalWrite.ThrowIfInvalid(expiry, keepTtl);
+        return await WriteAsync(key, _options.Serializer.Serialize(value), expiry, when, keepTtl, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask SetBytesAsync(string key, ReadOnlyMemory<byte> value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)
@@ -595,20 +602,30 @@ internal sealed class RedisNearCache : IRedisNearCache
         ThrowIfDisposed();
         // Copied: a cancelled wait returns while the command may still be queued, and the caller's buffer (a pooled
         // one, from HybridCache) may be reused by then.
-        await WriteAsync(key, value.ToArray(), expiry, cancellationToken).ConfigureAwait(false);
+        await WriteAsync(key, value.ToArray(), expiry, When.Always, keepTtl: false, cancellationToken).ConfigureAwait(false);
     }
 
-    private async ValueTask WriteAsync(string key, byte[] bytes, TimeSpan? expiry, CancellationToken cancellationToken)
+    public async ValueTask<bool> SetBytesAsync(string key, ReadOnlyMemory<byte> value, When when, TimeSpan? expiry = null, bool keepTtl = false, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ConditionalWrite.ThrowIfInvalid(expiry, keepTtl);
+        // Copied for the same reason as the unconditional write above.
+        return await WriteAsync(key, value.ToArray(), expiry, when, keepTtl, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<bool> WriteAsync(string key, byte[] bytes, TimeSpan? expiry, When when, bool keepTtl, CancellationToken cancellationToken)
     {
         var db = _connection.Multiplexer.GetDatabase();
         // In Redirect mode tracking is armed with NOLOOP, so the server does not echo this write back; in Broadcast
         // mode it does (the push connection never writes), and the echo is harmless: it evicts what we evict here.
         // Any read of this key in flight before or during the write must therefore be discarded by us:
         // mark before the write (reads already on the wire) and after it (reads that raced the send).
+        // A conditional write (NX/XX) is treated no differently: whether it took is only known from the reply, so the
+        // key is evicted either way. One that did not happen costs a local eviction, never a stale read.
         InvalidateLocal(key);
         try
         {
-            await db.StringSetAsync(key, bytes, expiry, When.Always).WaitAsync(cancellationToken).ConfigureAwait(false);
+            return await db.StringSetAsync(key, bytes, expiry, keepTtl, when, CommandFlags.None).WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {

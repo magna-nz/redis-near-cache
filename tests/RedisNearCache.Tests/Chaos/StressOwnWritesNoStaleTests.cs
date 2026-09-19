@@ -5,7 +5,7 @@ namespace RedisNearCache.Tests.Chaos;
 
 /// <summary>
 /// The same stress as <see cref="StressNoStaleAfterQuiescenceTests"/> but the writer is the cache's own
-/// <see cref="IRedisNearCache.SetAsync{T}"/>. That is the NOLOOP path: the server deliberately does NOT echo
+/// <see cref="IRedisNearCache.SetAsync{T}(string, T, TimeSpan?, CancellationToken)"/>. That is the NOLOOP path: the server deliberately does NOT echo
 /// an invalidation back for our own writes, so coherence rests entirely on SetAsync marking the key in the
 /// in-flight tracker and evicting L1 on both sides of the write
 /// (src/RedisNearCache/Caching/RedisNearCache.cs:197-201). A concurrent reader whose GET passed the SET on
