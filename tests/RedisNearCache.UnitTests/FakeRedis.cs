@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Reflection;
 using RedisNearCache.Internal;
@@ -244,11 +245,25 @@ internal sealed class FakeMultiplexer
     public int StringSetCalls => Volatile.Read(ref _stringSetCalls);
     private int _stringSetCalls;
 
+    /// <summary>
+    /// How many <c>StringGetAsync</c> calls have reached the fake, in total and per key. The multi-key read asserts
+    /// on these: a key served from L1 must produce no GET at all, and a key named twice in one call must produce
+    /// exactly one.
+    /// </summary>
+    public int StringGetCalls => Volatile.Read(ref _stringGetCalls);
+    private int _stringGetCalls;
+    private readonly ConcurrentDictionary<string, int> _stringGetCallsByKey = new(StringComparer.Ordinal);
+
+    /// <summary>How many <c>StringGetAsync</c> calls the fake has answered for one key.</summary>
+    public int StringGetCallsFor(string key) => _stringGetCallsByKey.TryGetValue(key, out var calls) ? calls : 0;
+
     private object? HandleDatabase(MethodInfo method, object?[] args)
     {
         switch (method.Name)
         {
-            case "StringGetAsync" when args.Length > 0 && args[0] is RedisKey:
+            case "StringGetAsync" when args.Length > 0 && args[0] is RedisKey readKey:
+                Interlocked.Increment(ref _stringGetCalls);
+                _stringGetCallsByKey.AddOrUpdate(readKey.ToString(), 1, static (_, calls) => calls + 1);
                 return Task.FromResult(StoredValue);
             // One value for every key, as for reads: a write replaces it. The facade always calls the six-argument
             // overload StringSetAsync(key, value, expiry, keepTtl, when, flags), matched here by position/type so

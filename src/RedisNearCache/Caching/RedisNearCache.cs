@@ -311,6 +311,21 @@ internal sealed class RedisNearCache : IRedisNearCache
     public async ValueTask<byte[]?> GetBytesAsync(string key, CancellationToken cancellationToken = default) =>
         (await GetStoredBytesAsync(key, cancellationToken).ConfigureAwait(false))?.ToArray();
 
+    // Both multi-key reads are the interface's own fan-out over the single-key members above - there is no second
+    // read path to keep in step with GetStoredBytesAsync. They are implemented here only so that a disposed cache
+    // says so even for an empty key list, which never reaches a single-key read.
+    public async ValueTask<IReadOnlyDictionary<string, T?>> GetManyAsync<T>(IEnumerable<string> keys, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return await ManyReads.ReadAsync<T?>(keys, (key, token) => GetAsync<T>(key, token), cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<IReadOnlyDictionary<string, byte[]?>> GetManyBytesAsync(IEnumerable<string> keys, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return await ManyReads.ReadAsync<byte[]?>(keys, (key, token) => GetBytesAsync(key, token), cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>
     /// The read behind <c>IBufferDistributedCache.TryGetAsync</c>: the same path as <see cref="GetBytesAsync"/>, but
     /// copying the stored bytes straight into <paramref name="destination"/> instead of into an intermediate array

@@ -18,6 +18,21 @@
   version: a bare `default` as the third argument, `SetAsync(key, value, default)` or
   `SetBytesAsync(key, value, default)`; write `expiry: null` or leave the argument out. Already-compiled callers
   are unaffected. `When` is `StackExchange.Redis.When`.
+- Feature: multi-key reads, `GetManyAsync<T>(IEnumerable<string> keys, CancellationToken cancellationToken = default)`
+  returning `ValueTask<IReadOnlyDictionary<string, T?>>`, and the raw-bytes `GetManyBytesAsync` equivalent returning
+  `IReadOnlyDictionary<string, byte[]?>`. One entry per distinct key, compared ordinally; a key that does not exist
+  in Redis is present with `null`/`default`, exactly as `GetAsync<T>` returns for it, so a value type should be read
+  as its nullable form (`GetManyAsync<int?>`) to tell a missing key from a stored zero. Duplicates in `keys` are
+  read once, and `Statistics` counts one hit or miss per distinct key. Deliberately not an `MGET`: every key goes
+  through the same single-key read as `GetAsync<T>`/`GetBytesAsync`, all started together so the misses share a
+  round trip per Redis node, keeping each key's own in-flight race check, TTL cap, `KeyPrefixes` handling and
+  cluster slot routing, which an `MGET` across slots would refuse. Reads are issued at most 256 at a time, so a
+  very large key list cannot queue tens of thousands of commands at once and time out its own tail. If any read
+  fails, the call throws the first failure (in key order) after every read already started has finished; keys read
+  successfully by then stay cached. `keys` null throws `ArgumentNullException`; a null element throws
+  `ArgumentException`, before any read starts. Shipped as default interface methods built only on
+  `GetAsync<T>`/`GetBytesAsync`, so an existing `IRedisNearCache` implementation or decorator still compiles and
+  gets a correct multi-key read for free, through its own `GetAsync<T>`.
 
 ## 1.2.0 (2026-09-19)
 

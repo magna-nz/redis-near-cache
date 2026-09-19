@@ -28,6 +28,37 @@ public interface IRedisNearCache : IAsyncDisposable
     ValueTask<byte[]?> GetBytesAsync(string key, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Reads several keys at once: <see cref="GetAsync{T}"/> for every distinct key in <paramref name="keys"/>, all
+    /// started together so the misses share a round trip. Keys already in L1 are served locally; the rest are read
+    /// from Redis, tracked and stored exactly as a single-key read would.
+    /// </summary>
+    /// <returns>
+    /// One entry per distinct key, compared ordinally. A key that does not exist in Redis is present with
+    /// <c>default</c>, as <see cref="GetAsync{T}"/> returns for it; for a value type, read it as its nullable form
+    /// (<c>GetManyAsync&lt;int?&gt;</c>) to tell a missing key from a stored zero.
+    /// </returns>
+    /// <remarks>
+    /// This is not an <c>MGET</c>: every key goes through the single-key read path, so each keeps its own race
+    /// check, TTL cap, <c>KeyPrefixes</c> handling and cluster routing, and <see cref="Statistics"/> counts one hit
+    /// or miss per distinct key. Reads are issued at most 256 at a time. If any read fails the call throws the first
+    /// failure, after every read already started has finished; keys read successfully by then stay cached.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="keys"/> is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="keys"/> contains a null key.</exception>
+    ValueTask<IReadOnlyDictionary<string, T?>> GetManyAsync<T>(IEnumerable<string> keys, CancellationToken cancellationToken = default) =>
+        Internal.ManyReads.ReadAsync<T?>(keys, (key, token) => GetAsync<T>(key, token), cancellationToken);
+
+    /// <summary>
+    /// The raw-bytes form of <see cref="GetManyAsync{T}"/>: <see cref="GetBytesAsync"/> for every distinct key, with
+    /// the same result shape, batching and failure behaviour. A key that does not exist is present with <c>null</c>;
+    /// every array returned is the caller's own copy.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="keys"/> is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="keys"/> contains a null key.</exception>
+    ValueTask<IReadOnlyDictionary<string, byte[]?>> GetManyBytesAsync(IEnumerable<string> keys, CancellationToken cancellationToken = default) =>
+        Internal.ManyReads.ReadAsync<byte[]?>(keys, (key, token) => GetBytesAsync(key, token), cancellationToken);
+
+    /// <summary>
     /// Writes <paramref name="value"/> to Redis through RedisNearCache's own connection and evicts any L1 copy.
     /// The next <see cref="GetAsync{T}"/> re-reads and re-tracks the key. A null <paramref name="expiry"/> issues a
     /// plain <c>SET</c>, which clears whatever TTL the key already had; pass one to replace it, or use the

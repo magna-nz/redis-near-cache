@@ -86,6 +86,19 @@ event with a non-Initial reason, every `TrackingLost` and every `EndpointRemoved
 flush path (`inflight.MarkAllInvalidated()` first, then `L1.Clear()`), so a read in flight across a flush never
 stores its reply.
 
+**Multi-key reads.** `GetManyAsync<T>`/`GetManyBytesAsync` (`Abstractions/Internal/ManyReads.cs`) are the read
+path above run once per distinct key, all started before any is awaited, so the misses pipeline onto one round
+trip per node - not an `MGET`. An `MGET` would need the in-flight check, the TTL cap and its fallbacks,
+`KeyPrefixes` handling and slot routing built again outside the one place they already live, and a cluster refuses
+it across slots anyway. The cost of going through `GetAsync<T>`/`GetBytesAsync` instead: up to 2N commands (`GET`
++ `PTTL`) for N uncached keys against one `MGET`, for the same round trips. Reads run in windows of 256
+(`ManyReads.Window`) so a very large key list cannot queue tens of thousands of commands at once and time out its
+own tail. On failure, the first one (in key order) is thrown only once every read already started has finished, so
+none is left unobserved or still holding its in-flight token; keys read successfully by then stay cached. Shipped
+as default interface methods built only on `GetAsync<T>`/`GetBytesAsync`, so an implementation or decorator that
+predates them still compiles and gets a correct multi-key read for free; the library's own cache overrides both
+only so a disposed cache throws `ObjectDisposedException` even for an empty key list.
+
 ## Endpoint lifecycle and pass-through
 
 The armer raises three lifecycle events per endpoint; the facade mirrors them in its lost set.
