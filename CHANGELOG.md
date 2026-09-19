@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 (2026-09-20)
 
 - Feature: `RedisNearCacheOptions.KeyNamespace` (`string?`, default `null`), a prefix put in front of every key
   given to the cache, so several applications, tenants or cache instances can share one Redis database: with
