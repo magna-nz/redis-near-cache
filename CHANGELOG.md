@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 (2026-09-19)
 
 - Fix: under a sustained storm of writes to the same hot keys, L1 could stop storing anything at all, silently and for
   good, while `IsCoherent` stayed `true` and `Statistics` showed no flush, no re-arm and no race discard to explain it
