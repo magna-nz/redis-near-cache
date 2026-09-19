@@ -10,8 +10,35 @@ namespace RedisNearCache.Caching;
 /// <see cref="RedisNearCacheOptions.L1MaxAge"/> is <see cref="Timeout.InfiniteTimeSpan"/>, expires after that
 /// age as a safety net against a missed invalidation.
 /// </summary>
+/// <remarks>
+/// Not quite thin: <see cref="Set"/> and <see cref="Remove"/> take a lock for the key, and <see cref="Set"/> removes
+/// the key before it stores it. That is a workaround for <see cref="MemoryCache"/>'s size accounting in
+/// Microsoft.Extensions.Caching.Memory 9.0 through at least 10.0.12 (dotnet/runtime#129186; fixed for 11.0 by #129215,
+/// 8.0 is clean). It can go once the package floor is a build that has that fix - not before: a consuming
+/// application resolves its own version, and the storm tests fail at once without this. Its <c>Set</c>, finding an entry already there, subtracts that
+/// entry's size on the assumption that it is replacing it; if anything removes the entry at that moment - our
+/// <see cref="Remove"/> for an invalidation, its own expiry scan, a lookup that trips over an expired entry - the
+/// size is subtracted twice. The total only drifts down, and once it is below zero the capacity check, done
+/// unsigned, reads it as over the limit: every later <c>Set</c> is refused, silently and for good, until a
+/// <see cref="Clear"/>. Reads racing invalidations on hot keys are exactly that pattern.
+/// <para>
+/// The lock alone is not enough, because the expiry scan and <c>TryGetValue</c> remove entries outside it. Removing
+/// first is what closes it: with stores of one key serialised, <c>MemoryCache.Set</c> never finds an entry to
+/// replace, so the branch that double-counts is never taken, whoever else is removing. Nor is removing first enough
+/// without the lock: a second store of the key would find the first one's entry. <see cref="TryGet"/> stays
+/// lock-free; the cost is one lock per miss and per invalidation, contended only on a key several threads are
+/// storing or invalidating at once, and held for a remove and an insert (no callbacks are registered, so nothing of
+/// ours runs inside it). A reader between the remove and the set sees a miss where it used to see the value being
+/// replaced, which costs it a read from Redis, nothing more.
+/// </para>
+/// </remarks>
 internal sealed class L1Cache : IDisposable
 {
+    // Striped rather than per key: a lock object per key would need its own eviction. A power of two, so the stripe
+    // is a mask of the hash; collisions only serialise two unrelated keys for the length of a dictionary operation.
+    private const int StripeCount = 64;
+
+    private readonly object[] _stripes = CreateStripes();
     private readonly TimeSpan _maxAge;
     private readonly bool _sizeInBytes;
     private readonly MemoryCache _cache;
@@ -51,21 +78,21 @@ internal sealed class L1Cache : IDisposable
         var entryOptions = new MemoryCacheEntryOptions { Size = _sizeInBytes ? Math.Max(1, value.Length) : 1 };
         TimeSpan? lifetime = _maxAge == Timeout.InfiniteTimeSpan ? null : _maxAge;
         if (maxAge is { } cap && (lifetime is null || cap < lifetime.Value)) lifetime = cap;
-        if (lifetime is { } age)
+        if (lifetime is { } age && age > TimeSpan.Zero) entryOptions.AbsoluteExpirationRelativeToNow = age;
+
+        lock (Stripe(key))
         {
-            if (age <= TimeSpan.Zero)
-            {
-                _cache.Remove(key);
-                return;
-            }
-
-            entryOptions.AbsoluteExpirationRelativeToNow = age;
+            // Always remove first, so MemoryCache.Set below never sees an entry to replace; see the remarks on the class.
+            _cache.Remove(key);
+            if (lifetime is { } due && due <= TimeSpan.Zero) return;
+            _cache.Set(key, value, entryOptions);
         }
-
-        _cache.Set(key, value, entryOptions);
     }
 
-    public void Remove(string key) => _cache.Remove(key);
+    public void Remove(string key)
+    {
+        lock (Stripe(key)) _cache.Remove(key);
+    }
 
     public void Clear() => _cache.Clear();
 
@@ -76,5 +103,14 @@ internal sealed class L1Cache : IDisposable
     {
         Volatile.Write(ref _disposed, 1);
         _cache.Dispose();
+    }
+
+    private object Stripe(string key) => _stripes[key.GetHashCode() & (StripeCount - 1)];
+
+    private static object[] CreateStripes()
+    {
+        var stripes = new object[StripeCount];
+        for (var i = 0; i < stripes.Length; i++) stripes[i] = new object();
+        return stripes;
     }
 }

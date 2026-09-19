@@ -77,7 +77,7 @@ public class GetManyStressTests
             Assert.True(settled,
                 "after quiescence a multi-key read still did not leave every key in L1 holding what Redis holds. " +
                 "If every key is missing from L1 rather than holding a wrong value, see " +
-                nameof(L1StopsCachingAltogetherAfterAHighRateStorm) + " in this file." +
+                nameof(L1StillAcceptsNewKeysAfterAHighRateStorm) + " in this file." +
                 L1SizeDiagnostic(cache));
 
             var stale = await ChaosSupport.FindStaleAsync(cache, foreign, keys);
@@ -91,35 +91,22 @@ public class GetManyStressTests
     }
 
     /// <summary>
-    /// EXPECTED TO FAIL - a defect this suite found, not a claim about <see cref="IRedisNearCache.GetManyAsync{T}"/>.
+    /// After an unpaced write storm on a handful of hot keys the L1 store must still accept new entries: a key the
+    /// cache has never seen, created after the storm, is cached like any other miss.
     /// </summary>
     /// <remarks>
-    /// With the writers unpaced (tens of thousands of writes and hundreds of thousands of L1 stores and removes
-    /// over the same handful of keys in five seconds), the L1 store stops accepting entries ALTOGETHER and never
-    /// recovers: every later read is served from Redis and stored nowhere, including reads of keys the cache has
-    /// never seen before. The cache still reports <see cref="IRedisNearCache.IsCoherent"/> true, no flush, no
-    /// re-arm and no race discard, so nothing in <see cref="RedisNearCacheStatistics"/> shows it.
-    /// <para>
-    /// The cause is underneath <see cref="RedisNearCache.Caching.L1Cache"/>, in <c>MemoryCache</c>'s size
-    /// accounting: under concurrent <c>Set</c>/<c>Remove</c> of the same key its internal size counter drifts
-    /// below the number of entries actually held and eventually goes negative (observed: <c>Count</c> 0,
-    /// <c>Size</c> -6, <c>SizeLimit</c> 10,000). <c>MemoryCache</c> compares the prospective size against the
-    /// limit as unsigned, so a negative size reads as enormous and every subsequent <c>Set</c> is dropped
-    /// silently and permanently. Writing 0 back into that counter by reflection makes the very next read cache
-    /// again, which is what identified it.
-    /// </para>
-    /// <para>
-    /// It is not specific to the multi-key read - a plain <see cref="IRedisNearCache.GetAsync{T}"/> behaves the
-    /// same once the counter has drifted - but this test reaches it easily because one call reads every key.
-    /// <see cref="StressNoStaleAfterQuiescenceTests"/> does not, because its single writer awaits each write and
-    /// so manages roughly 1,500 writes where this one manages 50,000.
-    /// </para>
+    /// This is the integration-level guard for the workaround in <see cref="RedisNearCache.Caching.L1Cache"/>
+    /// (its remarks have the mechanism; <c>L1CacheSizeAccountingTests</c> is the unit-level guard). Before it,
+    /// <c>MemoryCache</c>'s size total drifted below zero under concurrent stores and removes of the same key
+    /// (observed here: <c>Count</c> 0, <c>Size</c> -4 to -6, <c>SizeLimit</c> 10,000) and every later store was
+    /// refused, silently and for good, while <see cref="IRedisNearCache.IsCoherent"/> stayed true and no counter in
+    /// <see cref="RedisNearCacheStatistics"/> moved. It was never specific to the multi-key read - a plain
+    /// <see cref="IRedisNearCache.GetAsync{T}"/> has the same L1 underneath - but one call reading every key reaches
+    /// it easily, where <see cref="StressNoStaleAfterQuiescenceTests"/>, whose single writer awaits each write,
+    /// never did.
     /// </remarks>
-    // Skipped, not deleted: it fails today for a reason that predates GetManyAsync and is not in it (reproduced with
-    // MemoryCache alone: Microsoft.Extensions.Caching.Memory 10.0.12, Set racing Remove on the same key under a
-    // SizeLimit). The fix belongs in L1Cache and in its own change; that change un-skips this test.
-    [Fact(Skip = "Pre-existing MemoryCache size-accounting drift under a same-key Set/Remove storm; fixed separately in L1Cache.")]
-    public async Task L1StopsCachingAltogetherAfterAHighRateStorm()
+    [Fact]
+    public async Task L1StillAcceptsNewKeysAfterAHighRateStorm()
     {
         var keys = StressHarness.KeyPool("gm-stress-hot", KeyCount);
         var fresh = TestHelpers.Key("gm-stress-fresh");
@@ -143,8 +130,8 @@ public class GetManyStressTests
 
             _out.WriteLine($"reads={outcome.Reads} writes={outcome.Writes} stats={cache.Statistics}{L1SizeDiagnostic(cache)}");
             Assert.True(cache.TryGetLocal<string>(fresh, out _),
-                "after a high-rate write storm the L1 store accepts nothing at all, not even an uncontended key read for " +
-                "the first time, and never recovers; see the remarks on this test." + L1SizeDiagnostic(cache));
+                "after a high-rate write storm the L1 store refused an uncontended key read for the first time: " +
+                "MemoryCache's size accounting has drifted again; see the remarks on L1Cache." + L1SizeDiagnostic(cache));
         }
         finally
         {
@@ -227,7 +214,7 @@ public class GetManyStressTests
     /// <summary>
     /// The L1 <c>MemoryCache</c>'s own entry count and size counter, read reflectively for failure messages only:
     /// when the two disagree (or the size is negative) the failure is the accounting drift described on
-    /// <see cref="L1StopsCachingAltogetherAfterAHighRateStorm"/> rather than anything about this library.
+    /// <see cref="L1StillAcceptsNewKeysAfterAHighRateStorm"/> rather than anything about this library.
     /// </summary>
     private static string L1SizeDiagnostic(IRedisNearCache cache)
     {

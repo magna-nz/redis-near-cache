@@ -81,10 +81,23 @@ GetAsync<T>(key):
   return Serializer.Deserialize<T>(bytes)
 ```
 
-Invalidation events call `L1.Remove(key)` and `inflight.MarkInvalidated(key)`. `FlushAll`, any `Armed`
+Invalidation events call `inflight.MarkInvalidated(key)` and then `L1.Remove(key)`, in that order. `FlushAll`, any `Armed`
 event with a non-Initial reason, every `TrackingLost` and every `EndpointRemoved` flush L1 through the one
 flush path (`inflight.MarkAllInvalidated()` first, then `L1.Clear()`), so a read in flight across a flush never
 stores its reply.
+
+**L1 and `MemoryCache`'s size accounting.** `L1Cache.Set` and `L1Cache.Remove` take a striped lock for the key,
+and `Set` removes the key before storing it. `MemoryCache.Set` (Microsoft.Extensions.Caching.Memory 9.0 through at
+least 10.0.12: dotnet/runtime#129186, fixed for 11.0 by #129215, 10.0 backport #129510 open; 8.0 is clean) subtracts the size of an entry it finds already there, as a replacement; if that entry is removed at the
+same moment (our invalidation, its expiry scan, a lookup tripping over an expired entry) the size goes twice. The
+total only drifts down, and below zero the unsigned capacity check refuses every `Set` for good: reads racing
+invalidations on hot keys got there in seconds under load, leaving a coherent-looking cache that stored nothing.
+The lock alone does not close it (the scan and `TryGetValue` remove outside it; measured -2 where unlocked gave
+-9); removing first does, because `MemoryCache.Set` then never sees an entry to replace (measured 0). Neither half
+works alone: without the lock a second store of the key sees the first one's entry. `TryGet` stays lock-free. A
+reader between the remove and the set misses (and counts a miss) where it used to see the value being replaced. A
+package reference is only a lower bound, and an ASP.NET Core 9/10 application resolves its own 9.x/10.x build, so
+the workaround stays until the package floor contains the fix; the storm tests fail at once if it is removed early.
 
 **Multi-key reads.** `GetManyAsync<T>`/`GetManyBytesAsync` (`Abstractions/Internal/ManyReads.cs`) are the read
 path above run once per distinct key, all started before any is awaited, so the misses pipeline onto one round
