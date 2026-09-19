@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 (2026-09-19)
 
 - Feature: a `System.Diagnostics.Metrics` `Meter` named `RedisNearCache` (`RedisNearCacheStatistics.MeterName`),
   one per cache instance and disposed with it. All instruments are observable, read from `Statistics` (or L1)
