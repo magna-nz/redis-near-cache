@@ -148,6 +148,21 @@ followed by `Armed` or `EndpointRemoved` for that endpoint; the armer mutates it
 one lock so the facade sees events in the same order as the armer's state, and the per-endpoint background retry
 loop (every 5 s) runs until one of the two happens.
 
+**Overlapping arms of one endpoint.** A node restart restores both connections and each `ConnectionRestored` queues
+an arm; a gate per endpoint keeps them from interleaving on the wire. One `Armed` answers every loss announced
+before it, so by the time the second arm gets the gate the facade is caching from that node again, and the arm opens
+with `CLIENT TRACKING OFF`. An arm therefore announces the loss again if the endpoint is no longer lost, twice: once
+it holds the gate (a queued arm means some event said tracking there is unreliable), and, under the lifecycle lock,
+immediately before every `OFF`, where it also forgets any pre-arm of that node. The pre-arm ends with the `OFF`, and an
+arm that then fails must not leave an entry a later reconcile would report as `Promoted`, armed with no re-arm, on a
+node whose tracking is off. An arm on its own still costs one flush, not two. The reconcile rarely adds to the queue:
+it skips a master that has an arm queued or running (before the promotion check too; the window before a queued arm
+registers can still let a second one through, which the re-announcement makes harmless), and the timer's sweep also
+leaves a lost master to the retry loop that owns it. A `ConfigurationChanged` is news and still arms a lost master at
+once. One window is left: `EndpointRemoved` for a node can land while an arm of that node is between its
+re-announcement and its `Armed`, which only matters if the node is in fact still serving reads (the multiplexer's role
+view and the probe's disagreeing); it lasts until that arm ends, at most the backoff ladder.
+
 An endpoint we armed counts as tracked **whatever its current replica flag**: in a graceful Sentinel failover the
 multiplexer can flag the old master as a replica before Sentinel kills our connections there, and those failures
 must still flush. `EndpointRemoved` flushes unconditionally because entries read from a node that is no longer a

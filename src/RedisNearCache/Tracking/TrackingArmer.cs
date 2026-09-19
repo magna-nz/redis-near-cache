@@ -91,6 +91,14 @@ internal sealed class TrackingArmer : ITrackingArmer
     private readonly ConcurrentDictionary<EndPoint, long> _connectionEpochs = new();
 
     /// <summary>
+    /// Per endpoint, how many arms are queued on or running under its gate. An arm in flight owns the endpoint's
+    /// outcome (it ends in <see cref="Armed"/> or hands over to the retry loop), so
+    /// <see cref="Reconcile(string)"/> leaves such an endpoint alone instead of queueing another arm behind it on
+    /// every sweep.
+    /// </summary>
+    private readonly ConcurrentDictionary<EndPoint, int> _arming = new();
+
+    /// <summary>
     /// The interval of the background reconcile loop, which arms replicas ahead of promotion and re-reads the
     /// multiplexer's topology. Tests pass <see cref="Timeout.InfiniteTimeSpan"/> to drive every step by hand.
     /// </summary>
@@ -264,6 +272,7 @@ internal sealed class TrackingArmer : ITrackingArmer
         _lost.Clear();
         foreach (var gate in _gates.Values) gate.Dispose();
         _gates.Clear();
+        _arming.Clear();
         _shutdown.Dispose();
     }
 
@@ -281,6 +290,20 @@ internal sealed class TrackingArmer : ITrackingArmer
         // for the whole attempt, including the backoff ladder and a failed TRACKINGINFO verification.
         if (reason != ArmReason.Initial) MarkLost(endPoint, forgetRedirect: false);
 
+        _arming.AddOrUpdate(endPoint, 1, static (_, arms) => arms + 1);
+        try
+        {
+            return await ArmGatedAsync(endPoint, reason, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArmingDone(endPoint);
+        }
+    }
+
+    /// <summary>The part of <see cref="ArmWithRetryAsync"/> that runs under the endpoint's gate.</summary>
+    private async Task<Exception?> ArmGatedAsync(EndPoint endPoint, ArmReason reason, CancellationToken cancellationToken)
+    {
         // One gate per endpoint: two arms of the same node must never interleave (CLIENT TRACKING OFF from
         // one would undo the ON of the other). Different nodes are independent and run concurrently.
         var gate = _gates.GetOrAdd(endPoint, _ => new SemaphoreSlim(1, 1));
@@ -295,6 +318,11 @@ internal sealed class TrackingArmer : ITrackingArmer
 
         try
         {
+            // Whoever held the gate may have armed this node and told the facade so (one Armed answers every loss
+            // announced before it, ours included), and the facade is then caching from it again. Our OFF would
+            // leave it serving keys the server no longer tracks, for as long as this attempt takes (the whole
+            // backoff ladder, if ON or the verification then fails). Announce the loss again before touching the node.
+            if (reason != ArmReason.Initial && !_lost.ContainsKey(endPoint)) MarkLost(endPoint, forgetRedirect: false);
 
             Exception? lastError = null;
             for (var attempt = 0; attempt <= RetryDelays.Length; attempt++)
@@ -355,6 +383,15 @@ internal sealed class TrackingArmer : ITrackingArmer
         }
     }
 
+    /// <summary>Takes one arm of <paramref name="endPoint"/> off <see cref="_arming"/>, dropping the entry with the last.</summary>
+    private void ArmingDone(EndPoint endPoint)
+    {
+        while (_arming.TryGetValue(endPoint, out var arms))
+        {
+            if (arms <= 1 ? _arming.TryRemove(KeyValuePair.Create(endPoint, arms)) : _arming.TryUpdate(endPoint, arms - 1, arms)) return;
+        }
+    }
+
     /// <summary>
     /// One arm attempt. Returns false (without throwing) when the node or its subscriber connection is not
     /// there yet, which is the normal state immediately after a reconnect event.
@@ -395,6 +432,18 @@ internal sealed class TrackingArmer : ITrackingArmer
         {
             _logger.LogDebug("RedisNearCache found no subscriber connection for client {ClientName} on {EndPoint} yet", _connection.ClientName, endPoint);
             return false;
+        }
+
+        // The point of no return: OFF makes the server forget every key it tracks for us on this node. Two things must
+        // hold before it goes out, decided under the lock every lifecycle transition takes. A pre-arm of this node
+        // ends with our OFF, so it is forgotten now: if this arm then fails, a reconcile must not find the entry and
+        // report the node as Promoted (armed, no re-arm needed) with its tracking off. And the endpoint is announced
+        // lost: a promotion that slipped in since this arm took the gate (the reconcile checks _arming outside the
+        // lock) has the facade caching from the node again.
+        lock (_lifecycle)
+        {
+            _replicaTargets.TryRemove(endPoint, out _);
+            if (reason != ArmReason.Initial && !_lost.ContainsKey(endPoint)) MarkLost(endPoint, forgetRedirect: false);
         }
 
         await server.ExecuteAsync("CLIENT", "TRACKING", "OFF").WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -608,13 +657,22 @@ internal sealed class TrackingArmer : ITrackingArmer
     /// </summary>
     private void OnConfigurationChanged(object? sender, EndPointEventArgs e) => Reconcile("configuration change");
 
+    /// <summary><see cref="Reconcile(string, bool)"/> for anything that is news: a configuration change, a retirement round.</summary>
+    private void Reconcile(string cause) => Reconcile(cause, periodic: false);
+
     /// <summary>
     /// Brings the armer in line with the multiplexer's current view of the deployment. Runs on every
     /// <c>ConfigurationChanged</c> and on the reconcile loop's timer, because StackExchange.Redis raises the event
     /// only for a reconfiguration it can blame on an endpoint; a periodic topology check that quietly relearns a
     /// promoted node's role raises nothing. Idempotent, and cheap when nothing changed.
     /// </summary>
-    private void Reconcile(string cause)
+    /// <param name="cause">What prompted the reconcile, for the log.</param>
+    /// <param name="periodic">
+    /// True for the timer's sweep, which is no news about any endpoint: a lost master the retry loop owns is left
+    /// to that loop (same cadence), rather than armed by both every interval. A configuration change is news, and
+    /// still arms a lost master at once.
+    /// </param>
+    private void Reconcile(string cause, bool periodic)
     {
         try
         {
@@ -624,6 +682,11 @@ internal sealed class TrackingArmer : ITrackingArmer
             foreach (var endPoint in masters)
             {
                 if (_redirectTargets.ContainsKey(endPoint)) continue;
+                // An arm already queued or running for this master decides what happens to it: it ends in Armed, or
+                // fails into the retry loop. Queueing another one behind it on every sweep bought nothing but a
+                // TrackingLost flush and a second OFF/ON once the first had succeeded; and a promotion recorded
+                // under a running arm would have the facade caching while that arm turns tracking off.
+                if (_arming.ContainsKey(endPoint)) continue;
                 var promoted = false;
                 lock (_lifecycle)
                 {
@@ -644,6 +707,7 @@ internal sealed class TrackingArmer : ITrackingArmer
                     }
                 }
                 if (promoted) continue;
+                if (periodic && _lost.ContainsKey(endPoint) && _retrying.ContainsKey(endPoint)) continue;
 
                 _logger.LogInformation("RedisNearCache saw a {Cause} adding master {EndPoint}; arming CLIENT TRACKING", cause, endPoint);
                 // Announced here rather than on the arm's own task: reads may already be routed to the new master, and
@@ -679,7 +743,7 @@ internal sealed class TrackingArmer : ITrackingArmer
     /// Starts (at most one per endpoint) a loop that forgets an armed or lost endpoint the multiplexer reports as no
     /// longer a master, but only once <see cref="TakeoverGuard.TakeoverArmedAsync"/> finds every master serving now
     /// tracked. A demoted node that is still armed keeps its redirect meanwhile: its tracking still covers the keys
-    /// read from it, and a promoted node is either pre-armed or announced lost by <see cref="Reconcile"/>. The loop
+    /// read from it, and a promoted node is either pre-armed or announced lost by <see cref="Reconcile(string)"/>. The loop
     /// stops without forgetting anything if the endpoint is forgotten elsewhere or the multiplexer no longer reports
     /// it as a non-master; an endpoint still announced lost is then handed to the retry loop.
     /// </summary>
@@ -705,7 +769,7 @@ internal sealed class TrackingArmer : ITrackingArmer
         }
     }
 
-    /// <summary>Every <see cref="_reconcileInterval"/>: <see cref="Reconcile"/>, which includes re-arming replicas that lost their pre-arm.</summary>
+    /// <summary>Every <see cref="_reconcileInterval"/>: <see cref="Reconcile(string)"/>, which includes re-arming replicas that lost their pre-arm.</summary>
     private void StartReconcileLoop()
     {
         if (_reconcileInterval == Timeout.InfiniteTimeSpan) return;
@@ -719,7 +783,7 @@ internal sealed class TrackingArmer : ITrackingArmer
                 while (!token.IsCancellationRequested)
                 {
                     await Task.Delay(_reconcileInterval, token).ConfigureAwait(false);
-                    Reconcile("topology check");
+                    Reconcile("topology check", periodic: true);
                 }
             }
             catch (OperationCanceledException)
