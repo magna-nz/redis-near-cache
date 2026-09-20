@@ -91,7 +91,22 @@ public class SubscriberSilentlyDeadTests
                 var clientStream = client.GetStream();
                 var serverStream = upstream.GetStream();
 
+                // Each pump swallows its own ending. WhenAny below leaves the loser running - which is deliberate,
+                // a blackholed flow must stay open - so it must never be able to fault: an unobserved task exception
+                // is rethrown by the finalizer inside whichever test the GC happens to interrupt.
                 async Task Pump(NetworkStream from, NetworkStream to, bool fromClient)
+                {
+                    try
+                    {
+                        await PumpCore(from, to, fromClient).ConfigureAwait(false);
+                    }
+                    catch (Exception)
+                    {
+                        // Cancelled, reset or closed: expected here.
+                    }
+                }
+
+                async Task PumpCore(NetworkStream from, NetworkStream to, bool fromClient)
                 {
                     var buffer = new byte[64 * 1024];
                     while (true)

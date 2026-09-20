@@ -75,9 +75,11 @@ public class StartupCoherenceTests
                         _ = Task.Run(() => PumpAsync(client), CancellationToken.None);
                     }
                 }
-                catch (OperationCanceledException) { /* stopped */ }
-                catch (SocketException) { /* stopped */ }
-                catch (ObjectDisposedException) { /* stopped */ }
+                catch (Exception)
+                {
+                    // Stopped, or the listener went away. Nothing here may escape: this task is never awaited, and a
+                    // fault on it would be an unobserved task exception charged to an unrelated test.
+                }
             }, CancellationToken.None);
         }
 
@@ -90,9 +92,28 @@ public class StartupCoherenceTests
                 await upstream.ConnectAsync(_targetHost, _targetPort, _stop.Token).ConfigureAwait(false);
                 var a = client.GetStream();
                 var b = upstream.GetStream();
-                await Task.WhenAny(a.CopyToAsync(b, _stop.Token), b.CopyToAsync(a, _stop.Token)).ConfigureAwait(false);
+                // First direction to end finishes the connection, but NEITHER task may fault: WhenAny leaves the
+                // loser running, and when Dispose cancels it the socket read throws with nobody watching. An
+                // unobserved task exception is rethrown by the finalizer inside whichever test the GC interrupts,
+                // which is how this cost an unrelated test (EdgeCases.DisposeRaceTests, which hooks
+                // TaskScheduler.UnobservedTaskException) a red build on one image only. CopyAsync swallows its own
+                // ending, so the loser completes quietly whenever it does.
+                await Task.WhenAny(CopyAsync(a, b), CopyAsync(b, a)).ConfigureAwait(false);
             }
             catch (Exception) { /* either side went away */ }
+        }
+
+        /// <summary>One direction, to completion. Its own end of the connection going away is the normal way to stop.</summary>
+        private async Task CopyAsync(Stream from, Stream to)
+        {
+            try
+            {
+                await from.CopyToAsync(to, _stop.Token).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Cancelled, reset or closed: expected, and never a fault anyone needs to see.
+            }
         }
 
         public void Dispose()
