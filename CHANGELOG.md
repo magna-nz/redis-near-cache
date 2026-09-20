@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.0 (2026-09-20)
 
 - Fix: in `TrackingMode.Redirect`, a second arm of one node could turn its tracking off while the cache was serving
   from it. A node restart restores both of the cache's connections and each queues an arm; the first one's `Armed`
