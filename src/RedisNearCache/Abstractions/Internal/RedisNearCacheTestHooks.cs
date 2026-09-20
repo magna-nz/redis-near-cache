@@ -15,4 +15,10 @@ internal sealed class RedisNearCacheTestHooks
     /// in that window and prove the post-store re-check evicts it.
     /// </summary>
     public Action? InsideFlushHandler { get; set; }
+
+    /// <summary>
+    /// How long the facade waits between attempts to start again after the invalidation subscription could not be
+    /// made at startup. Null in production: <c>TrackingRetry.SlowInterval</c>.
+    /// </summary>
+    public TimeSpan? StartRetryInterval { get; set; }
 }

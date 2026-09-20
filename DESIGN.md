@@ -148,6 +148,25 @@ followed by `Armed` or `EndpointRemoved` for that endpoint; the armer mutates it
 one lock so the facade sees events in the same order as the armer's state, and the per-endpoint background retry
 loop (every 5 s) runs until one of the two happens.
 
+**The start is not covered by the lost set.** Both trackers arm the connected masters concurrently and raise one
+`Armed(Initial)` per endpoint, and an initial arm announces no loss first (there is nothing in L1 to protect yet), so
+an empty lost set during the start does not mean every master is armed. The facade therefore caches nothing until the
+whole start sequence has returned, however many `Armed(Initial)` events arrive meanwhile: otherwise the first of them
+would let a read routed to a master whose `CLIENT TRACKING ON` is still in flight be stored, tracked by nobody, with
+no flush to follow (`Armed(Initial)` does not flush). Every arm after the start announces its loss first, so from then
+on the lost set alone decides. A start that fails (no connected master, or every arm failed) leaves the cache in
+pass-through, which the first `Armed` from the armer's own retry loop or reconcile ends; those two paths announce the
+loss before arming, so a recovery that overlaps the failure being reported cannot be undone by it. A `Reconcile` that
+finds several new masters announces all of them lost before queueing any arm, for the same reason.
+
+**A start whose subscription failed is retried.** With `abortConnect=false` - the documented way to let an
+application start before its Redis - the invalidation subscription can fail while the multiplexer has no connection.
+The armer is then never started, so it hooks no connection event and runs no sweep, and a start runs once: without a
+retry the cache would stay in pass-through for the life of the process. The facade retries the subscription every 5 s
+and starts the armer once it succeeds. `Ready` keeps the outcome the application saw and stays faulted; `IsCoherent`
+tracks what the cache is actually doing. (In `Broadcast` the listener and the armer are one object, whose own 5 s
+sweep arms a master that appears later, so only its failure is recorded.)
+
 **Overlapping arms of one endpoint.** A node restart restores both connections and each `ConnectionRestored` queues
 an arm; a gate per endpoint keeps them from interleaving on the wire. One `Armed` answers every loss announced
 before it, so by the time the second arm gets the gate the facade is caching from that node again, and the arm opens
@@ -182,6 +201,10 @@ it). While it waits, the private multiplexer is reconfigured (first round, then 
 lost endpoint keeps the cache in pass-through, and an armed one that was demoted while connected keeps its tracking,
 which still covers what was read from it. A master the reconcile newly finds (and, in `Redirect`, did not pre-arm) is
 announced lost on the spot, before its arm is queued, so reads routed to it are never stored before it is armed.
+
+The 5 s reconcile sweep and the replica pre-arm are started even when the initial arm threw, because they are what
+arm a master that connects later without an event naming it and what notice a promotion the multiplexer relearned
+quietly; a start runs once, so a sweep skipped here would never run at all.
 
 **Still a master?** (`MasterRole`) decides between retrying (stay in pass-through) and forgetting an endpoint.
 The multiplexer never changes the role it last saw for a node it cannot reach, so a killed master would otherwise

@@ -839,6 +839,9 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
             if (Volatile.Read(ref _disposed) == 1) return;
 
             var masters = MasterEndPoints();
+            // Queued only once every new master of this pass has been announced lost: the first one's Armed may be what
+            // takes the facade out of a failed start, and it must find the others in the lost set by then.
+            var toArm = new List<EndPoint>();
             foreach (var endPoint in masters)
             {
                 if (_sockets.ContainsKey(endPoint) || _lost.ContainsKey(endPoint) || _arming.ContainsKey(endPoint)) continue;
@@ -846,8 +849,10 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
                 // Announced here rather than on the arm's own task: reads may already be routed to the new master, and
                 // the facade must not store them before its socket is armed.
                 MarkLost(endPoint);
-                QueueArm(endPoint, ArmReason.TopologyChanged, announceLost: false);
+                toArm.Add(endPoint);
             }
+
+            foreach (var endPoint in toArm) QueueArm(endPoint, ArmReason.TopologyChanged, announceLost: false);
 
             var candidates = _sockets.Keys.Concat(_lost.Keys).Distinct().Where(ep => !masters.Contains(ep)).ToArray();
             if (candidates.Length == 0) return;

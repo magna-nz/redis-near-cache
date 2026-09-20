@@ -163,11 +163,20 @@ internal sealed class TrackingArmer : ITrackingArmer
         if (Interlocked.Exchange(ref _started, 1) == 1) return;
 
         HookEvents();
-        await RearmAllAsync(ArmReason.Initial, cancellationToken).ConfigureAwait(false);
-        // Replicas are armed after Ready, never as part of it: a failover cannot be made to wait on them and a
-        // replica that cannot be armed costs nothing but the pre-arm optimisation.
-        QueuePreArmReplicas();
-        StartReconcileLoop();
+        try
+        {
+            await RearmAllAsync(ArmReason.Initial, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Even when nothing could be armed (no master connected yet, or every arm failed): a start runs once, and
+            // the sweep is what arms a master that connects later without an event naming it, what re-arms replicas,
+            // and what notices a promotion the multiplexer relearned quietly. It must not depend on the start
+            // succeeding. Replicas are armed after Ready, never as part of it: a failover cannot be made to wait on
+            // them and a replica that cannot be armed costs nothing but the pre-arm optimisation.
+            QueuePreArmReplicas();
+            StartReconcileLoop();
+        }
     }
 
     /// <summary>
@@ -679,6 +688,9 @@ internal sealed class TrackingArmer : ITrackingArmer
             if (Volatile.Read(ref _disposed) == 1) return;
 
             var masters = MasterEndPoints();
+            // Queued only once every new master of this pass has been announced lost: the first one's Armed may be what
+            // takes the facade out of a failed start, and it must find the others in the lost set by then.
+            var toArm = new List<EndPoint>();
             foreach (var endPoint in masters)
             {
                 if (_redirectTargets.ContainsKey(endPoint)) continue;
@@ -713,8 +725,10 @@ internal sealed class TrackingArmer : ITrackingArmer
                 // Announced here rather than on the arm's own task: reads may already be routed to the new master, and
                 // the facade must not store them before its tracking is on.
                 if (!_lost.ContainsKey(endPoint)) MarkLost(endPoint, forgetRedirect: false);
-                QueueArm(endPoint, ArmReason.TopologyChanged);
+                toArm.Add(endPoint);
             }
+
+            foreach (var endPoint in toArm) QueueArm(endPoint, ArmReason.TopologyChanged);
 
             var candidates = _redirectTargets.Keys.Concat(_lost.Keys).Distinct().Where(ep => !masters.Contains(ep)).ToArray();
             if (candidates.Length > 0)

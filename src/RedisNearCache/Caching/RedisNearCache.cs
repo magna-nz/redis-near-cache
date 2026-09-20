@@ -3,6 +3,7 @@ using System.Net;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RedisNearCache.Internal;
+using RedisNearCache.Tracking;
 using StackExchange.Redis;
 
 namespace RedisNearCache.Caching;
@@ -26,6 +27,25 @@ internal sealed class RedisNearCache : IRedisNearCache
     private readonly RedisNearCacheMetrics _metrics;
     private volatile bool _degraded;
     private int _startupSettled;
+
+    /// <summary>
+    /// True until the start sequence has run to its end, background retry included. Nothing is cached meanwhile:
+    /// the masters are armed concurrently and each raises its own <see cref="ArmReason.Initial"/> <c>Armed</c>, which
+    /// says nothing about the others, and an initial arm never announces a loss first. A read let through by the
+    /// first of them could be routed to a master whose <c>CLIENT TRACKING ON</c> has not been sent yet and be stored
+    /// untracked, with no flush to follow. See <see cref="CachingEnabled"/>.
+    /// </summary>
+    private volatile bool _starting = true;
+
+    /// <summary>
+    /// Orders "the start failed" against an <c>Armed</c> raised by a recovery that beat it (the armer's retry loop or
+    /// its reconcile): whichever comes second must not leave the cache degraded with nothing left to clear it.
+    /// </summary>
+    private readonly object _startLock = new();
+    private bool _armedOutsideStart; // guarded by _startLock
+
+    /// <summary>Stops the background retry of a start whose subscription failed. Cancelled on dispose.</summary>
+    private readonly CancellationTokenSource _startRetry = new();
 
     /// <summary>
     /// Endpoints whose tracking is lost: added on <see cref="ITrackingArmer.TrackingLost"/>, removed on
@@ -117,13 +137,110 @@ internal sealed class RedisNearCache : IRedisNearCache
             // Listener first: the subscriber connection must exist and be subscribed before tracking is
             // armed, otherwise an invalidation could be redirected before anyone is listening for it.
             await _listener.StartAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "RedisNearCache failed to start tracking; the near cache will not be coherent.");
+            // The armer was never started, so it has hooked no event and runs no loop: nothing would ever arm this
+            // cache. Keep trying here. (Broadcast: listener and armer are one object, whose failed start is memoised
+            // and which recovers through its own sweep.)
+            if (ReferenceEquals(_listener, _armer)) StartFailed();
+            else RetryStartInBackground();
+            throw;
+        }
+
+        try
+        {
             await _armer.StartAsync(CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "RedisNearCache failed to start tracking; the near cache will not be coherent.");
+            StartFailed();
             throw;
         }
+
+        StartSucceeded();
+    }
+
+    /// <summary>
+    /// The armer's start returned: every master that was connected is armed or announced lost, so from here on the
+    /// lost set alone decides whether L1 may be used.
+    /// </summary>
+    private void StartSucceeded()
+    {
+        _starting = false;
+        Volatile.Write(ref _startupSettled, 1);
+        SignalCoherence();
+    }
+
+    /// <summary>
+    /// The armer's start failed: nothing is armed (it found no connected master, or could arm none). Pass-through
+    /// until the armer's own retry loops or reconcile raise <c>Armed</c>, which clears the flag. Every master those
+    /// paths arm was announced lost first, so the lost set covers the ones still to come.
+    /// </summary>
+    private void StartFailed()
+    {
+        lock (_startLock)
+        {
+            if (!_armedOutsideStart)
+            {
+                ResetCoherence();
+                _degraded = true;
+            }
+
+            Volatile.Write(ref _startupSettled, 1);
+        }
+
+        _starting = false;
+        SignalCoherence();
+    }
+
+    /// <summary>
+    /// The subscription could not be made (Redis unreachable while the application started, with
+    /// <c>abortConnect=false</c>). Retry it every few seconds, then start the armer for the first time. <see cref="Ready"/>
+    /// stays faulted; the cache stays in pass-through until this succeeds, and <see cref="IsCoherent"/> says so.
+    /// </summary>
+    private void RetryStartInBackground()
+    {
+        var token = _startRetry.Token;
+        var interval = _options.TestHooks.StartRetryInterval ?? TrackingRetry.SlowInterval;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (true)
+                {
+                    await Task.Delay(interval, token).ConfigureAwait(false);
+                    try
+                    {
+                        await _listener.StartAsync(token).ConfigureAwait(false);
+                        break;
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "RedisNearCache still cannot subscribe to the invalidation channel; retrying in {Interval}", interval);
+                    }
+                }
+
+                _logger.LogInformation("RedisNearCache subscribed to the invalidation channel after a failed start; arming CLIENT TRACKING");
+                await _armer.StartAsync(token).ConfigureAwait(false);
+                StartSucceeded();
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                // disposed
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "RedisNearCache could not arm CLIENT TRACKING after a failed start; the armer keeps retrying in the background");
+                StartFailed();
+            }
+        }, CancellationToken.None);
     }
 
     // Ordering rule: mark the in-flight tracker FIRST, then touch L1. A read that stores its reply between the
@@ -157,9 +274,17 @@ internal sealed class RedisNearCache : IRedisNearCache
         if (e.Reason is not (ArmReason.Initial or ArmReason.Promoted)) Statistics.Rearm();
         // Re-enable caching only AFTER the flush, so no concurrent read can hit an entry the flush discards.
         RemoveLost(e.EndPoint);
-        // An arm succeeded, so startup (or its recovery) is settled and the cache is no longer degraded.
-        Volatile.Write(ref _startupSettled, 1);
-        _degraded = false;
+        // One master's initial arm says nothing about the others the same start is still arming, none of which was
+        // announced lost: the start sequence settles startup itself, once all of them are done (see _starting).
+        if (e.Reason == ArmReason.Initial && _starting) return;
+        // Any other arm succeeded, so startup (or its recovery) is settled and the cache is no longer degraded.
+        lock (_startLock)
+        {
+            _armedOutsideStart = true;
+            Volatile.Write(ref _startupSettled, 1);
+            _degraded = false;
+        }
+
         SignalCoherence();
     }
 
@@ -202,6 +327,10 @@ internal sealed class RedisNearCache : IRedisNearCache
 
     /// <summary>L1 may only be read or populated while tracking is believed to be armed everywhere.</summary>
     /// <remarks>
+    /// <para>
+    /// "Everywhere" is what the lost set cannot say while the cache is starting: an initial arm announces no loss, so
+    /// the set is empty although masters are still unarmed. <see cref="_starting"/> covers that stretch.
+    /// </para>
     /// Evaluated on every read, L1 hits included, so it must not lock: <c>ConcurrentDictionary.IsEmpty</c>, used here
     /// before, takes every one of its locks when the dictionary is empty, which is the steady state.
     /// <para>
@@ -236,7 +365,7 @@ internal sealed class RedisNearCache : IRedisNearCache
     /// sees one endpoint's events in the armer's order.
     /// </para>
     /// </remarks>
-    private bool CachingEnabled => !_degraded && _lostCount == 0;
+    private bool CachingEnabled => !_starting && !_degraded && _lostCount == 0;
 
     /// <inheritdoc />
     public bool IsCoherent => Volatile.Read(ref _startupSettled) == 1 && CachingEnabled && Volatile.Read(ref _disposed) == 0;
@@ -402,15 +531,10 @@ internal sealed class RedisNearCache : IRedisNearCache
                 }
             }
 
-            // Settle exactly once. A faulted or cancelled startup degrades to a pass-through (every read goes
-            // to Redis, nothing is cached) until the armer's background retry raises Armed, which clears the
-            // flag and settles startup itself. Never re-derive the flag from Ready on later calls: Ready stays
-            // faulted forever, but the cache does not.
-            if (Interlocked.Exchange(ref _startupSettled, 1) == 0 && !Ready.IsCompletedSuccessfully)
-            {
-                ResetCoherence();
-                _degraded = true;
-            }
+            // Nothing to settle here: the start sequence settles its own outcome before Ready completes (see
+            // StartSucceeded and StartFailed). A faulted startup is a pass-through (every read goes to Redis, nothing
+            // is cached) until an Armed clears it, or, where the subscription itself failed, until the background
+            // retry of the start succeeds. Ready stays faulted forever; the cache does not.
         }
 
         if (CachingEnabled && _l1.TryGet(key, out var cached))
@@ -746,6 +870,8 @@ internal sealed class RedisNearCache : IRedisNearCache
         _armer.Armed -= OnArmed;
         _armer.TrackingLost -= OnTrackingLost;
         _armer.EndpointRemoved -= OnEndpointRemoved;
+        // Before the armer goes: a background retry of the start must not start it after it was disposed.
+        _startRetry.Cancel();
 
         try
         {
@@ -765,6 +891,7 @@ internal sealed class RedisNearCache : IRedisNearCache
         }
 
         await _connection.DisposeAsync().ConfigureAwait(false);
+        _startRetry.Dispose();
         // Waiters can never be satisfied now; wake them so they observe the disposal.
         lock (_coherenceLock) _coherence.TrySetResult();
     }

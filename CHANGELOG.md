@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- Fix: on a deployment with more than one master, the cache could store a value that nothing was tracking for the
+  whole of its start. The masters are armed concurrently and each raises its own `Armed(Initial)`; the first of them
+  settled startup, so reads stopped waiting for `Ready` and were cached again - including a read routed to a master
+  whose `CLIENT TRACKING ON` had not been sent yet. No invalidation can arrive for such an entry and no flush follows
+  (`Armed(Initial)` does not flush), so whatever was written to the key afterwards was not served until the entry
+  reached its TTL or `L1MaxAge`. The facade now caches nothing until the whole start sequence has returned. Both
+  modes, every released version, clusters and Sentinel deployments with several masters; a single-master deployment
+  was never affected. Reproduced against a three-master cluster with one node paused.
+- Fix: a cache built while Redis was unreachable (`abortConnect=false`) never cached again for the life of the
+  process. The invalidation subscription threw, so the tracking armer was never started: it hooked no connection
+  event and ran no sweep, and a start runs once, so nothing armed the cache when Redis appeared - `IsCoherent` stayed
+  false and every read went to Redis, with no error after the first. The facade now retries the subscription every
+  5 s and starts the armer once it succeeds. `Ready` still reports the start the application saw.
+- Fix: `TrackingArmer` skipped its 5 s reconcile sweep and its replica pre-arm entirely when the initial arm threw
+  (no connected master at startup). Those are what arm a master that connects later without an event naming it, so a
+  deployment whose masters all appeared after the cache was built stayed in pass-through. `BroadcastTracker` already
+  started its sweep in a `finally`; `TrackingArmer` now does too.
+- Fix: a `Reconcile` that found several new masters queued each arm as it went, so the first `Armed` could take the
+  facade out of pass-through while the others were still unannounced. All of them are now announced lost first.
+
 ## 1.5.0 (2026-09-20)
 
 - Fix: in `TrackingMode.Redirect`, a second arm of one node could turn its tracking off while the cache was serving
