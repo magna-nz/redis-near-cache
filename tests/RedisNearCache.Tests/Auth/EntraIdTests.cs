@@ -322,7 +322,9 @@ public class EntraIdTests
             Assert.Empty(extensionFailures);
 
             // The extension refreshed the token exactly once, through the fake and nothing else.
-            Assert.Equal(1, tokenRefreshes);
+            Assert.True(await Poll.UntilAsync(() => Volatile.Read(ref tokenRefreshes) >= 1, TimeSpan.FromSeconds(15)),
+                "the extension never raised TokenRefreshed.");
+            Assert.Equal(1, Volatile.Read(ref tokenRefreshes));
             Assert.True(credential.Calls >= 2, $"expected at least the initial acquire and one refresh; saw {credential.Calls}.");
             Assert.All(credential.RequestedScopes, scope => Assert.Equal(RedisScope, scope));
             Assert.Equal(token2, cfg.Password);
@@ -340,8 +342,12 @@ public class EntraIdTests
             // The extension re-authenticated the private multiplexer. Only multiplexers that went through its
             // AfterConnectAsync hook are in its list, and the private multiplexer is the only multiplexer these
             // options ever built - so this event IS the hook firing for a clone-built multiplexer.
-            Assert.True(reauthenticated.Count >= 1,
-                "the extension re-authenticated no connection: its AfterConnectAsync hook never registered the private multiplexer.");
+            // Waited for, not read: the extension's AUTH on the multiplexer is its own round trip, started by the same
+            // refresh that handed the tracker the new token, and the tracker's AUTH can finish first (it did on two
+            // of six CI jobs).
+            Assert.True(await Poll.UntilAsync(() => !reauthenticated.IsEmpty, TimeSpan.FromSeconds(15)),
+                "the extension re-authenticated no connection: its AfterConnectAsync hook never registered the private multiplexer. " +
+                $"extension failures=[{string.Join("; ", extensionFailures)}]");
             AuthSupport.AssertConnectedAs(AuthSupport.Auth, clientName, oid, "entra rotation, after");
 
             // (a) Tracking is alive on the re-authenticated socket. Token 1 is gone from here on, so nothing below
