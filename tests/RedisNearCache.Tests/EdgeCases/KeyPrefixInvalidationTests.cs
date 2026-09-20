@@ -30,9 +30,18 @@ public class KeyPrefixInvalidationTests
             Assert.Equal("v1", await cache.GetAsync<string>(uncachedKey));
             Assert.False(cache.TryGetLocal<string>(uncachedKey, out _), "b:-prefixed key must never be cached.");
 
+            var invalidationsBeforeCachedWrite = cache.Statistics.Invalidations;
             RedisCli.Standalone("SET", cachedKey, "v2");
             var evicted = await Poll.UntilAsync(() => !cache.TryGetLocal<string>(cachedKey, out _), TimeSpan.FromSeconds(5));
             Assert.True(evicted, "external write to the cached prefix did not evict.");
+
+            // The eviction becomes visible one statement BEFORE the counter moves: the invalidation handler marks the
+            // in-flight tracker, removes the entry, and only then counts it. Snapshotting the counter as soon as the
+            // entry is gone can therefore capture it pre-increment, and this key's own invalidation then lands inside
+            // the window below and is blamed on the untracked key. Wait for it to be counted first.
+            Assert.True(
+                await Poll.UntilAsync(() => cache.Statistics.Invalidations > invalidationsBeforeCachedWrite, TimeSpan.FromSeconds(5)),
+                "the eviction of the cached key was never counted as an invalidation.");
 
             var invalidationsBefore = cache.Statistics.Invalidations;
             RedisCli.Standalone("SET", uncachedKey, "v2");
