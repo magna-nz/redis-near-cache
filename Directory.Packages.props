@@ -22,5 +22,10 @@
     <PackageVersion Include="ZiggyCreatures.FusionCache.Serialization.SystemTextJson" Version="2.8.0" />
     <PackageVersion Include="ZiggyCreatures.FusionCache.Backplane.StackExchangeRedis" Version="2.8.0" />
     <PackageVersion Include="Sailfish" Version="4.0.221" />
+    <!-- The real Microsoft Entra ID extension for StackExchange.Redis, used only by the integration test project
+         (tests/RedisNearCache.Tests/Auth/EntraIdTests.cs). Its StackExchange.Redis dependency is >= 2.10.1, which
+         the centrally pinned 3.2.0 satisfies, so no downgrade/conflict is introduced. Azure.Core (TokenCredential,
+         AccessToken) comes in transitively through Microsoft.Extensions.Azure and is not referenced directly. -->
+    <PackageVersion Include="Microsoft.Azure.StackExchangeRedis" Version="3.3.1" />
   </ItemGroup>
 </Project>

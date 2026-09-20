@@ -19,5 +19,8 @@
     <!-- Needed only for the host-level ValidateOnStart test (Host.CreateApplicationBuilder / IHost.StartAsync);
          already centrally pinned in Directory.Packages.props. -->
     <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <!-- The real Microsoft Entra ID extension, driven by Auth/EntraIdTests.cs against a local container with a
+         fake TokenCredential. Integration tests only: nothing under src/ references it. -->
+    <PackageReference Include="Microsoft.Azure.StackExchangeRedis" />
   </ItemGroup>
 </Project>

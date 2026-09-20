@@ -29,6 +29,13 @@
   `Broadcast` faults `Ready` and stays in pass-through; sentinels without a password in front of password-protected
   data nodes work, and a sentinel password different from the data nodes' cannot be expressed (one `Password`, as for
   a plain `ConnectionMultiplexer`).
+- Tests: Entra ID. `Auth/EntraIdTests.cs` drives the real `Microsoft.Azure.StackExchangeRedis` extension (a
+  test-only dependency) with a stand-in `TokenCredential` against a local server whose ACL user is the token's object
+  id and whose password is the token. Both tracking modes work; every connection the cache opens authenticates as
+  that user; and on a token rotation the live `Broadcast` connection is re-authenticated in place (same connection,
+  no `TrackingLost`, no flush, invalidations still delivered) while the extension re-authenticates the private
+  multiplexer, shown by removing the old token from the server and killing the multiplexer's connections. This was
+  "verified by hand, not by CI" until now. There is no Azure tenant in CI: the mechanism is proven, not the service.
 - Docs: the ACL permissions reference now shows the two least-privilege users the suite runs, in place of the untested
   illustration, which was too small to connect with. About half of what is needed is StackExchange.Redis's own
   (`INFO`, `ECHO`, `CONFIG GET`, `SELECT`, `CLIENT ID`, `CLUSTER SLOTS`, `READONLY`, from Redis 7.2 `CLIENT SETINFO`,

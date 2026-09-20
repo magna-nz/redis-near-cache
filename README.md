@@ -101,9 +101,9 @@ services.AddRedisNearCacheHybridCache();               // HybridCache's own L1 i
 ### Authentication
 
 Passwords, ACL users, mutual TLS and Entra ID tokens are taken from the `ConfigurationOptions` (or connection
-string) you pass in; every connection the cache opens uses them. The `Auth` test suite runs the first three
+string) you pass in; every connection the cache opens uses them. The `Auth` test suite runs each of these
 against real servers (standalone, cluster and Sentinel; Redis 6.2 to 8 and Valkey 8.1; the Redis Enterprise
-proxy); Entra ID is covered below:
+proxy for passwords):
 
 - **Password or ACL user** (`password=`, `user=`): both tracking modes. A least-privilege ACL for each mode, with
   what every grant is for, is in the [docs](https://magna-nz.github.io/redis-near-cache/#acl-permissions); about
@@ -118,8 +118,10 @@ proxy); Entra ID is covered below:
 
 ### EntraID Auth
 
-Entra ID authentication (`Microsoft.Azure.StackExchangeRedis`) works with `Broadcast`, including in-place
-re-authentication of a live connection when the token rotates. Configure `ConfigurationOptions` with the
+Entra ID authentication (`Microsoft.Azure.StackExchangeRedis`) works in both tracking modes, including in-place
+re-authentication of a live `Broadcast` connection when the token rotates: no reconnect, no flush. The test suite
+runs the real extension against a local server with a stand-in token credential (there is no Azure tenant in CI), so
+what it proves is the mechanism, not the service. Configure `ConfigurationOptions` with the
 extension and pass it as `RedisNearCacheOptions.Configuration`:
 
 ```csharp
