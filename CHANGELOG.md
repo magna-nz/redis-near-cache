@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.6.0 (2026-09-20)
 
 - Fix: on a deployment with more than one master, the cache could store a value that nothing was tracking for the
   whole of its start. The masters are armed concurrently and each raises its own `Armed(Initial)`; the first of them
