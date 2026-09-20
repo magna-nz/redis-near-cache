@@ -269,12 +269,19 @@ token provider: StackExchange.Redis resolves `User`/`Password` through `Configur
 `Clone()` copies by reference, so an Entra ID token provider installed by `Microsoft.Azure.StackExchangeRedis` (or
 any custom `DefaultOptionsProvider` subclass) is visible to every connection RedisNearCache opens. The private
 multiplexer is created from that same provider, so the extension registers it through its `AfterConnectAsync` hook
-(the hook was seen to fire for a clone-built multiplexer on StackExchange.Redis 3.2.0; the
-re-authentication itself is the extension's documented behaviour) and re-authenticates it exactly as it does any multiplexer it manages. Every broadcast connection reads the current object id and token when it connects,
+and re-authenticates it as it does any multiplexer it manages: an `AUTH` on each server's interactive connection (the
+subscriber connection picks the current token up when it next reconnects). `Auth/EntraIdTests.cs` runs the real
+extension (3.3.1, on StackExchange.Redis 3.2.0) against a local server with a fake `TokenCredential`: all three
+connections authenticate as the token's object id, and after a rotation, with the old token removed from the server
+and the private multiplexer's connections killed, it reconnects, which only the new token allows. Every broadcast connection reads the current object id and token when it connects,
 and a live broadcast connection compares its current credentials against the provider on every keepalive tick
-(10 s, up to about 15 s if a `PING` is in flight); when they changed, it re-authenticates in place with `AUTH <objectId> <token>` without dropping tracking (verified by hand, not by CI, on Redis 6.2, 7.4, Valkey 8.1 and the Redis Enterprise proxy: `CLIENT TRACKINGINFO`
-is unchanged after `AUTH` and pushes keep arriving),
-without a `TrackingLost`, and without an L1 flush. A failed `AUTH` is treated as connection death: the connection
+(10 s, up to about 15 s if a `PING` is in flight); when they changed, it re-authenticates in place with `AUTH <objectId> <token>` without dropping tracking, without a `TrackingLost`, and without an L1 flush (asserted on every CI image by
+`Auth/EntraIdTests.cs` and `Broadcast/CredentialRotationTests.cs`: same connection id, no lifecycle event, no flush, and
+an external write still evicts afterwards; against the Redis Enterprise proxy it was verified by hand only:
+`CLIENT TRACKINGINFO` is unchanged after `AUTH` and pushes keep arriving). That periodic read does a second job with
+the Azure extension: its `Password` getter starts a token refresh once the current token has expired, so in `Broadcast`
+an expiry is picked up within a keepalive tick or two, while in `Redirect`, where nothing reads the credential
+periodically, rotation waits for the extension's own heartbeat (2 minutes, not configurable in 3.3.1). A failed `AUTH` is treated as connection death: the connection
 is re-armed with the current credentials, flushing L1 as for any other reconnect. Values set directly on `ConfigurationOptions.User`/`Password` (a `password=` in a connection
 string included) are static and shadow the provider, so a rotating credential must come through the provider.
 Re-authenticating the private multiplexer is the provider's own job (the Azure extension does it through

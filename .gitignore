@@ -7,4 +7,5 @@ TestResults/
 certs/*.crt
 certs/*.key
 certs/*.srl
+certs/*.pfx
 bench/results/
