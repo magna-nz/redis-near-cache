@@ -66,6 +66,22 @@ validator likewise validates only `Options.DefaultName`). Its `Meter` carries an
 `name`, stable across restarts unlike `rnc.client_name`. None of this touches the default instance's registration,
 options or metrics: an application that never calls `AddKeyedRedisNearCache` sees no difference at all.
 
+**Being the application's `IDistributedCache`.** `AddRedisNearCacheDistributedCache` (and the `HybridCache` form)
+displaces an `IDistributedCache` registered before it, rather than standing aside. `TryAdd` skips when any descriptor
+for the service type exists, so `AddDistributedMemoryCache()` earlier in `Program.cs` used to keep the registration
+while `AddRedisNearCacheHybridCache` still switched `HybridCache`'s own local cache off: `HybridCache` then had no
+local tier at all and an L2 that was process-local, which is slower than either tier alone and incoherent across
+processes, and nothing said so. Ordering between this library's own named and unnamed forms is unchanged - whichever
+runs first decides which cache backs the interfaces - because only a foreign registration is displaced. A
+`services.Add` afterwards still wins; nothing at registration time can see the future.
+
+**The serializer's two directions must agree.** `JsonRedisNearCacheSerializer` dispatches on the static type in both
+directions. Dispatching `Serialize` on the runtime value instead made `string` and `byte[]` asymmetric with their own
+`Deserialize`: a declaration pattern never matches `null`, so a null string was written as the JSON literal and read
+back as the four-character string `"null"`. `string` and `byte[]` pass through untouched and so cannot represent
+null - Redis holds bytes or holds nothing - so a null of those types is refused outright; a null of a JSON-serialized
+type is representable and stays legal.
+
 **Package validation.** Both `src/RedisNearCache/RedisNearCache.csproj` and
 `src/RedisNearCache.HybridCache/RedisNearCache.HybridCache.csproj` now set `EnablePackageValidation` and
 `PackageValidationBaselineVersion` (`1.3.0`; restored from nuget.org, and only ever raised to a version already published), so `dotnet pack` fails if the build removed or altered public API an
@@ -148,6 +164,25 @@ followed by `Armed` or `EndpointRemoved` for that endpoint; the armer mutates it
 one lock so the facade sees events in the same order as the armer's state, and the per-endpoint background retry
 loop (every 5 s) runs until one of the two happens.
 
+**The start is not covered by the lost set.** Both trackers arm the connected masters concurrently and raise one
+`Armed(Initial)` per endpoint, and an initial arm announces no loss first (there is nothing in L1 to protect yet), so
+an empty lost set during the start does not mean every master is armed. The facade therefore caches nothing until the
+whole start sequence has returned, however many `Armed(Initial)` events arrive meanwhile: otherwise the first of them
+would let a read routed to a master whose `CLIENT TRACKING ON` is still in flight be stored, tracked by nobody, with
+no flush to follow (`Armed(Initial)` does not flush). Every arm after the start announces its loss first, so from then
+on the lost set alone decides. A start that fails (no connected master, or every arm failed) leaves the cache in
+pass-through, which the first `Armed` from the armer's own retry loop or reconcile ends; those two paths announce the
+loss before arming, so a recovery that overlaps the failure being reported cannot be undone by it. A `Reconcile` that
+finds several new masters announces all of them lost before queueing any arm, for the same reason.
+
+**A start whose subscription failed is retried.** With `abortConnect=false` - the documented way to let an
+application start before its Redis - the invalidation subscription can fail while the multiplexer has no connection.
+The armer is then never started, so it hooks no connection event and runs no sweep, and a start runs once: without a
+retry the cache would stay in pass-through for the life of the process. The facade retries the subscription every 5 s
+and starts the armer once it succeeds. `Ready` keeps the outcome the application saw and stays faulted; `IsCoherent`
+tracks what the cache is actually doing. (In `Broadcast` the listener and the armer are one object, whose own 5 s
+sweep arms a master that appears later, so only its failure is recorded.)
+
 **Overlapping arms of one endpoint.** A node restart restores both connections and each `ConnectionRestored` queues
 an arm; a gate per endpoint keeps them from interleaving on the wire. One `Armed` answers every loss announced
 before it, so by the time the second arm gets the gate the facade is caching from that node again, and the arm opens
@@ -182,6 +217,36 @@ it). While it waits, the private multiplexer is reconfigured (first round, then 
 lost endpoint keeps the cache in pass-through, and an armed one that was demoted while connected keeps its tracking,
 which still covers what was read from it. A master the reconcile newly finds (and, in `Redirect`, did not pre-arm) is
 announced lost on the spot, before its arm is queued, so reads routed to it are never stored before it is armed.
+
+The 5 s reconcile sweep and the replica pre-arm are started even when the initial arm threw, because they are what
+arm a master that connects later without an event naming it and what notice a promotion the multiplexer relearned
+quietly; a start runs once, so a sweep skipped here would never run at all.
+
+**Verifying an arm nothing reported broken.** Every other path here reacts to a `ConnectionFailed`/`ConnectionRestored`
+from StackExchange.Redis. The subscriber connection is the one that never sends anything, so it is the one a NAT or
+load balancer drops as idle - and a half-open socket raises nothing: the server keeps redirecting invalidations to a
+client that is gone, the interactive connection stays healthy, reads keep being served from L1, and `IsCoherent` stays
+true. Measured against a proxy that swallowed that one flow: about 67 s of silent stale reads while the multiplexer's
+60 s keepalive got round to it, and unbounded (466 of 466 reads stale over 260 s, 29 reconnect attempts, not one
+event raised) when the reconnect could not complete either. Two things close it:
+
+- the private multiplexer's `KeepAlive` is forced to 10 s (as `ConfigCheckSeconds` is forced to 5), so
+  StackExchange.Redis itself notices a silent socket in about 20 s rather than 67 s and reconnects, which re-arms;
+- every sixth sweep (about 30 s) re-checks every armed master: the server must still be redirecting to the client id
+  of our subscriber connection *as `CLIENT LIST` reports it now*, and `CLIENT TRACKINGINFO` (where the server has it,
+  and it is only ever read as evidence, never as an instruction) must still agree. A mismatch is announced as
+  `TrackingLost` and re-armed, so the case where no event ever comes ends in pass-through in about 30 s instead of
+  lasting for ever. Not on every sweep, because the server answers `CLIENT LIST` by walking every client it has, and
+  an application with thousands of its own connections would pay for that continuously; `CLIENT LIST TYPE pubsub`, or
+  `CLIENT LIST ID` on 6.2+, would make it cheap enough to run more often.
+
+A failure to read either command is never treated as a broken arm: only a positive mismatch re-arms, because a blip
+would otherwise cost a flush and a pass-through window for nothing. The endpoint's gate is held for the reads, so an
+arm in flight is never mistaken for a broken one. What is left is the window where the server still believes the
+subscriber is there - nothing can see that from either end, so it is bounded by the keepalive, about 20 s, and L1 is
+served from during it. A pre-armed replica's redirect is not verified this way; if it dangles and that replica is then
+promoted, the promotion is reported as `Promoted` (no re-arm) on a node whose redirect is dead, until the next
+`TrackingLost` there.
 
 **Still a master?** (`MasterRole`) decides between retrying (stay in pass-through) and forgetting an endpoint.
 The multiplexer never changes the role it last saw for a node it cannot reach, so a killed master would otherwise

@@ -246,8 +246,13 @@ public class OverlappingArmTests
         // The reconcile that now learns of the promotion must arm the node, not report it as already armed.
         replica.CommandHook = null;
         rig.Mux.RaiseConfigurationChanged(replica);
-        Assert.True(await UntilAsync(() => rig.Armer.RedirectTargets.ContainsKey(replica.EndPoint)), "the promoted node was never armed: " + rig.Describe());
+        // Waited for on the EVENT, not on the redirect map: the arm records itself and then raises, and the map is
+        // exposed as an unsynchronised snapshot, so a test that polls the map can read Events before the arm has
+        // enqueued anything. (Seen on net8.0 in CI: two losses recorded and no arm, with the map already populated.)
+        Assert.True(
+            await UntilAsync(() => rig.Events.Contains($"armed {replica.EndPoint} {ArmReason.TopologyChanged}")),
+            "the promoted node was never armed: " + rig.Describe());
+        Assert.True(rig.Armer.RedirectTargets.ContainsKey(replica.EndPoint), "armed, but not recorded as a redirect target: " + rig.Describe());
         Assert.DoesNotContain($"armed {replica.EndPoint} {ArmReason.Promoted}", rig.Events);
-        Assert.Contains($"armed {replica.EndPoint} {ArmReason.TopologyChanged}", rig.Events);
     }
 }

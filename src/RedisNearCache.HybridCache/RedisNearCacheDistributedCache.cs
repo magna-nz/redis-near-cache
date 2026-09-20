@@ -7,8 +7,14 @@ namespace RedisNearCache.HybridCache;
 /// <summary>
 /// Adapts <see cref="IRedisNearCache"/> to <see cref="IDistributedCache"/> and
 /// <see cref="IBufferDistributedCache"/>, so that anything built against the standard distributed-cache
-/// abstractions (session state, output caching, <c>Microsoft.Extensions.Caching.Hybrid.HybridCache</c>) gets
-/// server-assisted client-side caching for its reads.
+/// abstractions (output caching, <c>Microsoft.Extensions.Caching.Hybrid.HybridCache</c>) gets server-assisted
+/// client-side caching for its reads.
+/// <para>
+/// <b>Not for ASP.NET Core session state.</b> <c>DistributedSession</c> keeps a session alive by re-reading it and
+/// relying on the store to extend a sliding window; here <see cref="Refresh"/> is a no-op and a sliding expiration
+/// becomes a fixed TTL measured from the write (see below), so a session that is only read would expire a full
+/// <c>IdleTimeout</c> after its last write and sign the user out mid-visit.
+/// </para>
 /// </summary>
 /// <remarks>
 /// Values are stored exactly as given, through <see cref="IRedisNearCache.GetBytesAsync"/> and

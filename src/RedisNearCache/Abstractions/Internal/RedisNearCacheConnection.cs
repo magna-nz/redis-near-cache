@@ -36,6 +36,14 @@ internal sealed class RedisNearCacheConnection : IAsyncDisposable
         // promoted node is untracked. Check every 5 s on the private multiplexer (cheap: one ROLE/CLUSTER
         // NODES per node) unless the caller already asked for something shorter.
         if (cfg.ConfigCheckSeconds <= 0 || cfg.ConfigCheckSeconds > 5) cfg.ConfigCheckSeconds = 5;
+        // StackExchange.Redis's own keepalive is what notices a connection that went silent without being closed - a
+        // NAT or load balancer dropping one idle flow, which is what happens to the SUBSCRIBER connection, since it
+        // only ever receives. That connection is the redirect target for every invalidation, so while nobody notices
+        // it is dead the server keeps redirecting to a client that is gone and L1 serves values nothing can
+        // invalidate. At the 60 s default that was measured at about 67 s of silent staleness. 10 s unless the caller
+        // already asked for less, matching the Broadcast tracker's own keepalive; the armer's 5 s verification sweep
+        // is the backstop for the case where the reconnect never completes and no event is raised at all.
+        if (cfg.KeepAlive <= 0 || cfg.KeepAlive > 10) cfg.KeepAlive = 10;
         return cfg;
     }
 

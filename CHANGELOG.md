@@ -1,5 +1,68 @@
 # Changelog
 
+## 1.6.0 (2026-09-20)
+
+- Fix: on a deployment with more than one master, the cache could store a value that nothing was tracking for the
+  whole of its start. The masters are armed concurrently and each raises its own `Armed(Initial)`; the first of them
+  settled startup, so reads stopped waiting for `Ready` and were cached again - including a read routed to a master
+  whose `CLIENT TRACKING ON` had not been sent yet. No invalidation can arrive for such an entry and no flush follows
+  (`Armed(Initial)` does not flush), so whatever was written to the key afterwards was not served until the entry
+  reached its TTL or `L1MaxAge`. The facade now caches nothing until the whole start sequence has returned. Both
+  modes, every released version, clusters and Sentinel deployments with several masters; a single-master deployment
+  was never affected. Reproduced against a three-master cluster with one node paused.
+- Fix: a cache built while Redis was unreachable (`abortConnect=false`) never cached again for the life of the
+  process. The invalidation subscription threw, so the tracking armer was never started: it hooked no connection
+  event and ran no sweep, and a start runs once, so nothing armed the cache when Redis appeared - `IsCoherent` stayed
+  false and every read went to Redis, with no error after the first. The facade now retries the subscription every
+  5 s and starts the armer once it succeeds. `Ready` still reports the start the application saw.
+- Fix: `TrackingArmer` skipped its 5 s reconcile sweep and its replica pre-arm entirely when the initial arm threw
+  (no connected master at startup). Those are what arm a master that connects later without an event naming it, so a
+  deployment whose masters all appeared after the cache was built stayed in pass-through. `BroadcastTracker` already
+  started its sweep in a `finally`; `TrackingArmer` now does too.
+- Fix: a `Reconcile` that found several new masters queued each arm as it went, so the first `Armed` could take the
+  facade out of pass-through while the others were still unannounced. All of them are now announced lost first.
+- Fix: in `TrackingMode.Redirect`, a subscriber connection that died silently was not noticed, and L1 kept serving
+  values the server could no longer invalidate while `IsCoherent` stayed true. The subscriber connection only ever
+  receives, so it is what a NAT or load balancer drops as idle, and a half-open socket raises no event: the server
+  goes on redirecting every invalidation to a client that is gone. Measured against a proxy that swallowed that one
+  flow: about 67 s of silent stale reads, and unbounded (466 of 466 reads stale over 260 s, 29 reconnect attempts,
+  not one `ConnectionFailed`/`ConnectionRestored` raised) when the reconnect could not complete either. Two changes:
+  the private multiplexer's `KeepAlive` is now 10 s rather than the 60 s default, so StackExchange.Redis notices a
+  silent socket in about 20 s and reconnects; and every sixth sweep (about 30 s) now re-checks that each armed master
+  is still redirecting to the client id of our subscriber connection as `CLIENT LIST` reports it, re-arming when it is
+  not, so the case where no event ever arrives ends in pass-through in about 30 s instead of lasting indefinitely.
+  Not on every sweep: the server answers `CLIENT LIST` by walking every client it has. A failed read
+  of either command is not treated as a broken arm, so a blip costs nothing. Remaining window, documented in
+  DESIGN.md: while the server still believes the subscriber is there, which neither end can see, staleness is bounded
+  by the keepalive rather than eliminated. `Broadcast` mode was never affected (it has its own 10 s keepalive).
+- Fix: `AddRedisNearCacheDistributedCache` / `AddRedisNearCacheHybridCache` now displace an `IDistributedCache`
+  registered before them. Both used `TryAdd`, which skips when any descriptor for the service type exists, so an
+  `AddDistributedMemoryCache()` earlier in `Program.cs` (ASP.NET Core session-state boilerplate, itself a `TryAdd`)
+  kept the registration while `AddRedisNearCacheHybridCache` still switched `HybridCache`'s own local cache off. The
+  result was `HybridCache` with no local tier over a process-local L2 - slower than either tier alone, incoherent
+  across processes, and with nothing logged to say so. Ordering between this library's own named and unnamed forms is
+  unchanged (the first one called still decides which cache backs the interfaces); a registration made *after* ours
+  still wins, which is now documented rather than accidental.
+- Fix: the default serializer dispatched `Serialize` on the runtime value and `Deserialize` on the static type, so
+  the two disagreed. `SetAsync<string>(key, null)` wrote the four bytes `null` and `GetAsync<string>` handed back the
+  four-character string `"null"` - a value the caller never stored; `SetAsync<byte[]>(key, null)` likewise. Both now
+  throw `ArgumentNullException`: `string` and `byte[]` pass through untouched, so there is nothing in Redis that means
+  null (store nothing, or remove the key). And `Serialize<object>("abc")` wrote raw bytes that `Deserialize<object>`
+  could only throw on; `object` now takes the JSON path in both directions. A `null` of a JSON-serialized type is
+  still stored as the JSON literal and still reads back as null, unchanged.
+- Fix: `CLIENT TRACKINGINFO` reporting tracking off is now treated as a failed arm even when it still reports the
+  expected redirect id.
+- Options validation: a `KeyNamespace` containing `{` or `}` is refused (on a cluster it is a hash tag, so every key
+  the cache touches would land in one slot - the hazard was documented on the property but nothing enforced it), as
+  is one with leading or trailing whitespace; a whitespace-only `KeyPrefixes` entry is refused alongside null and
+  empty (in `Broadcast` it would go out as a `BCAST PREFIX` argument); and `L1SizeLimit` is no longer validated when
+  `L1SizeLimitBytes` is set, since it is ignored then - a zero there used to fail startup over a setting nothing reads.
+- Docs: `RedisNearCacheDistributedCache` no longer offers itself for ASP.NET Core session state. `Refresh` is a no-op
+  and a sliding expiration becomes a fixed TTL measured from the write, so a session that is only read would expire a
+  full `IdleTimeout` after its last write and sign the user out mid-visit. The expiry mapping itself is unchanged and
+  was already tested. Real Redis answers `redirect -1` once tracking is off, so this only bites behind something
+  that answers differently, but the check cost nothing to add.
+
 ## 1.5.0 (2026-09-20)
 
 - Fix: in `TrackingMode.Redirect`, a second arm of one node could turn its tracking off while the cache was serving

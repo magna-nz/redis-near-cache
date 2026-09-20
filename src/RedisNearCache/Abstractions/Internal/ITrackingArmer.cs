@@ -23,6 +23,12 @@ internal enum ArmReason
     /// entries that were read from the demoted master.
     /// </summary>
     Promoted,
+    /// <summary>
+    /// The periodic sweep found the arm no longer good: the server is redirecting to a client id that is not our
+    /// subscriber connection any more, or its tracking flags are off. Nothing raised an event, so nothing else
+    /// would have noticed.
+    /// </summary>
+    VerificationFailed,
     /// <summary>The broadcast push connection to this endpoint was re-established; tracking on it died with the socket.</summary>
     PushConnectionRestored,
 }

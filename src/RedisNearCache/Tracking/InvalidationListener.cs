@@ -49,7 +49,21 @@ internal sealed class InvalidationListener : IInvalidationListener
         if (Interlocked.Exchange(ref _started, 1) == 1) return;
 
         var subscriber = _connection.Multiplexer.GetSubscriber();
-        await subscriber.SubscribeAsync(InvalidateChannel, _handler).WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await subscriber.SubscribeAsync(InvalidateChannel, _handler).WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Not started: the facade tries again (Redis may simply have been unreachable while the application
+            // started). Take back whatever StackExchange.Redis kept of the failed attempt first, so the next one does
+            // not register the handler a second time and deliver every invalidation twice.
+            try { subscriber.Unsubscribe(InvalidateChannel, _handler, CommandFlags.FireAndForget); }
+            catch (Exception ex) { _logger.LogDebug(ex, "RedisNearCache could not withdraw a failed subscription to {Channel}", InvalidateChannel.ToString()); }
+            Volatile.Write(ref _started, 0);
+            throw;
+        }
+
         _subscriber = subscriber;
         _logger.LogInformation("RedisNearCache subscribed to {Channel} as client {ClientName}", InvalidateChannel.ToString(), _connection.ClientName);
     }

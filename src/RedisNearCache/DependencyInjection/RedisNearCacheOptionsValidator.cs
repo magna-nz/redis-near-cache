@@ -32,7 +32,9 @@ internal sealed class RedisNearCacheOptionsValidator : IValidateOptions<RedisNea
                          $"{nameof(RedisNearCacheOptions)}.{nameof(RedisNearCacheOptions.ConnectionString)} must be set.");
         }
 
-        if (options.L1SizeLimit <= 0)
+        // Only when it is the limit in force: with L1SizeLimitBytes set, L1SizeLimit is ignored (see L1Cache), and
+        // failing on a value nothing reads would be a startup failure for nothing.
+        if (options.L1SizeLimitBytes is null && options.L1SizeLimit <= 0)
         {
             failures.Add($"{nameof(RedisNearCacheOptions)}.{nameof(RedisNearCacheOptions.L1SizeLimit)} must be greater than zero.");
         }
@@ -58,9 +60,23 @@ internal sealed class RedisNearCacheOptionsValidator : IValidateOptions<RedisNea
             failures.Add($"{nameof(RedisNearCacheOptions)}.{nameof(RedisNearCacheOptions.Serializer)} must not be null.");
         }
 
-        if (options.KeyPrefixes.Any(string.IsNullOrEmpty))
+        // Whitespace as well as empty: a prefix of " " matches nothing a caller would ever read, and in Broadcast mode
+        // it goes out as a BCAST PREFIX argument, arming the server for keys that begin with a space.
+        if (options.KeyPrefixes.Any(string.IsNullOrWhiteSpace))
         {
-            failures.Add($"{nameof(RedisNearCacheOptions)}.{nameof(RedisNearCacheOptions.KeyPrefixes)} must not contain a null or empty prefix.");
+            failures.Add($"{nameof(RedisNearCacheOptions)}.{nameof(RedisNearCacheOptions.KeyPrefixes)} must not contain a null, empty or whitespace prefix.");
+        }
+
+        // A namespace is concatenated in front of every key, so braces in it are a cluster hash tag and every key the
+        // cache touches would hash to one slot - documented on the property, and cheap to refuse outright.
+        if (options.KeyNamespace is { Length: > 0 } keyNamespace && (keyNamespace.Contains('{') || keyNamespace.Contains('}')))
+        {
+            failures.Add($"{nameof(RedisNearCacheOptions)}.{nameof(RedisNearCacheOptions.KeyNamespace)} must not contain '{{' or '}}': on a cluster that is a hash tag, and every key would land in one slot.");
+        }
+
+        if (options.KeyNamespace is { Length: > 0 } padded && padded.Trim().Length != padded.Length)
+        {
+            failures.Add($"{nameof(RedisNearCacheOptions)}.{nameof(RedisNearCacheOptions.KeyNamespace)} must not begin or end with whitespace: it is concatenated in front of every key.");
         }
 
         return failures.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(failures);
