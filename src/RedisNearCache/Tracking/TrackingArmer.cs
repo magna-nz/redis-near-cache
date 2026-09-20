@@ -555,11 +555,54 @@ internal sealed class TrackingArmer : ITrackingArmer
 
         _logger.LogDebug("RedisNearCache CLIENT TRACKINGINFO on {EndPoint} => {TrackingInfo}", endPoint, Describe(info));
 
+        // Tracking off with a redirect still reported: real Redis answers redirect -1 once tracking is off, so the
+        // check below normally catches it, but a server (or proxy) that keeps the old redirect would otherwise look
+        // armed. An unreadable flag list says nothing, so it is not held against the server.
+        if (TryReadTrackingOff(info))
+        {
+            _logger.LogWarning("RedisNearCache armed {EndPoint} but CLIENT TRACKINGINFO reports tracking off; retrying", endPoint);
+            return false;
+        }
+
         if (!TryReadRedirect(info, out var actualRedirectId)) return true; // unexpected shape: do not fight the server
         if (actualRedirectId == expectedRedirectId) return true;
 
         _logger.LogWarning("RedisNearCache armed {EndPoint} with REDIRECT {Expected} but CLIENT TRACKINGINFO reports {Actual}; retrying",
             endPoint, expectedRedirectId, actualRedirectId);
+        return false;
+    }
+
+    /// <summary>
+    /// True only when <c>CLIENT TRACKINGINFO</c> positively reports tracking as off: a <c>flags</c> list that is
+    /// readable and contains <c>off</c>. A missing or unreadable list returns false, so nothing is concluded from a
+    /// shape this code does not know.
+    /// </summary>
+    private static bool TryReadTrackingOff(RedisResult info)
+    {
+        try
+        {
+            if (info.IsNull) return false;
+            var items = (RedisResult[]?)info;
+            if (items is null) return false;
+
+            for (var i = 0; i + 1 < items.Length; i += 2)
+            {
+                if (!string.Equals(items[i].ToString(), "flags", StringComparison.OrdinalIgnoreCase)) continue;
+                var flags = (RedisResult[]?)items[i + 1];
+                if (flags is null) return false;
+                foreach (var flag in flags)
+                {
+                    if (string.Equals(flag.ToString(), "off", StringComparison.OrdinalIgnoreCase)) return true;
+                }
+
+                return false;
+            }
+        }
+        catch (InvalidCastException)
+        {
+            return false;
+        }
+
         return false;
     }
 
@@ -798,6 +841,11 @@ internal sealed class TrackingArmer : ITrackingArmer
                 {
                     await Task.Delay(_reconcileInterval, token).ConfigureAwait(false);
                     Reconcile("topology check", periodic: true);
+                    if (Interlocked.Increment(ref _sweepsSinceVerification) >= SweepsBetweenVerifications)
+                    {
+                        Volatile.Write(ref _sweepsSinceVerification, 0);
+                        QueueVerifyArmed();
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -809,6 +857,128 @@ internal sealed class TrackingArmer : ITrackingArmer
                 _logger.LogWarning(ex, "RedisNearCache reconcile loop stopped unexpectedly");
             }
         }, CancellationToken.None);
+    }
+
+    // --- verifying an arm that nothing reported broken -------------------------------------------------
+
+    /// <summary>At most one verification sweep at a time; a request while one runs is simply dropped.</summary>
+    private int _verifying;
+
+    /// <summary>
+    /// Reconcile sweeps between verifications. The check costs a <c>CLIENT LIST</c> per armed master, which the
+    /// server answers by walking every client it has, so it does not run on every 5 s sweep: an application with
+    /// thousands of connections of its own would pay for that continuously. Six sweeps bounds the case nothing else
+    /// can see - no event ever arriving - at about 30 s; the ordinary silent socket, which the server still believes
+    /// in, is found by the multiplexer's 10 s keepalive well before that either way.
+    /// </summary>
+    private const int SweepsBetweenVerifications = 6;
+    private int _sweepsSinceVerification;
+
+    /// <summary>
+    /// Runs <see cref="VerifyArmedAsync"/> in the background. Everything else in this class reacts to an event;
+    /// this is the one check that assumes no event will come.
+    /// </summary>
+    private void QueueVerifyArmed()
+    {
+        if (Interlocked.CompareExchange(ref _verifying, 1, 0) != 0) return;
+        CancellationToken token;
+        try { token = _shutdown.Token; } catch (ObjectDisposedException) { Volatile.Write(ref _verifying, 0); return; }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await VerifyArmedAsync(token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // shutting down
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "RedisNearCache could not verify its arms");
+            }
+            finally
+            {
+                Volatile.Write(ref _verifying, 0);
+            }
+        }, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Re-checks every armed master: the server must still be redirecting to the client id of our subscriber
+    /// connection as <c>CLIENT LIST</c> reports it now, and <c>CLIENT TRACKINGINFO</c> (where the server has it) must
+    /// still agree. A subscriber connection that dies silently - a NAT or load balancer dropping the one flow that
+    /// never sends anything - leaves the server redirecting to a client that is gone, so every invalidation is
+    /// dropped while the facade keeps serving L1 and reporting itself coherent. StackExchange.Redis raises
+    /// <c>ConnectionRestored</c> once it notices and reconnects, which re-arms; but a reconnect whose handshake never
+    /// completes raises nothing at all, and then this sweep is the only thing that finds it.
+    /// </summary>
+    /// <remarks>
+    /// A failure to read either command is never treated as a broken arm: a blip would otherwise cost a flush and a
+    /// pass-through window. Only a positive mismatch re-arms. The endpoint's gate is held for the reads so an arm in
+    /// flight cannot be mistaken for a broken one, and released before the re-arm is queued (the arm takes it too).
+    /// </remarks>
+    private async Task VerifyArmedAsync(CancellationToken cancellationToken)
+    {
+        foreach (var endPoint in _redirectTargets.Keys.ToArray())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Volatile.Read(ref _disposed) == 1) return;
+            // Something already owns this endpoint: an arm in flight, or a loss the facade is already waiting on.
+            if (_lost.ContainsKey(endPoint) || _arming.ContainsKey(endPoint) || _retrying.ContainsKey(endPoint)) continue;
+
+            string? broken = null;
+            try
+            {
+                var server = _connection.Multiplexer.GetServer(endPoint);
+                if (!server.IsConnected || server.IsReplica) continue;
+
+                var gate = _gates.GetOrAdd(endPoint, static _ => new SemaphoreSlim(1, 1));
+                await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    // Re-checked under the gate: any of these may have changed while we queued behind an arm.
+                    if (_lost.ContainsKey(endPoint) || _arming.ContainsKey(endPoint)) continue;
+                    if (!_redirectTargets.TryGetValue(endPoint, out var armedRedirectId)) continue;
+
+                    var clients = await server.ClientListAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
+                    var live = FindSubscriberId(clients, endPoint);
+                    if (live is null)
+                    {
+                        broken = "the subscriber connection it redirects to is no longer listed on that server";
+                    }
+                    else if (live.Value != armedRedirectId)
+                    {
+                        broken = $"it redirects to client {armedRedirectId} but our subscriber connection is now client {live.Value}";
+                    }
+                    else if (!await VerifyAsync(server, endPoint, armedRedirectId, cancellationToken).ConfigureAwait(false))
+                    {
+                        broken = "CLIENT TRACKINGINFO no longer reports tracking on with that redirect";
+                    }
+                }
+                finally
+                {
+                    try { gate.Release(); } catch (ObjectDisposedException) { /* disposed underneath us */ }
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // Could not ask. Says nothing about the arm, so leave it alone and try again on the next sweep.
+                _logger.LogDebug(ex, "RedisNearCache could not verify the arm on {EndPoint}", endPoint);
+                continue;
+            }
+
+            if (broken is null) continue;
+            _logger.LogWarning(
+                "RedisNearCache found tracking on {EndPoint} is no longer armed as it recorded ({Reason}); re-arming. Invalidations from that node were being lost",
+                endPoint, broken);
+            QueueArm(endPoint, ArmReason.VerificationFailed);
+        }
     }
 
     // --- replica pre-arm --------------------------------------------------------------------------------

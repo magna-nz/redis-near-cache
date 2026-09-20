@@ -44,7 +44,20 @@ internal sealed class FakeServer
     public volatile bool IsConnected = true;
     public volatile bool IsReplica;
     public ServerType ServerType { get; }
-    public long SubscriberId { get; }
+    /// <summary>
+    /// Client id of our subscriber connection as this server reports it. Settable so a test can model the
+    /// subscriber reconnecting with a new id while the armer still holds the old one.
+    /// </summary>
+    public long SubscriberId { get; set; }
+
+    /// <summary>When false, CLIENT LIST no longer lists our subscriber connection (the server dropped it).</summary>
+    public bool SubscriberListed { get; set; } = true;
+
+    /// <summary>Redirect id CLIENT TRACKINGINFO reports. Null means <see cref="SubscriberId"/>, i.e. a healthy arm.</summary>
+    public long? TrackingInfoRedirect { get; set; }
+
+    /// <summary>The single flag CLIENT TRACKINGINFO reports; "off" models a server that dropped tracking.</summary>
+    public string TrackingInfoFlags { get; set; } = "on";
     public IServer Proxy { get; }
 
     /// <summary>
@@ -104,7 +117,9 @@ internal sealed class FakeServer
             case "ToString": return EndPoint.ToString();
             case "GetHashCode": return EndPoint.GetHashCode();
             case "ClientListAsync":
-                return Task.FromResult(new[] { FakeRedis.Client(SubscriberId, _owner.ClientName, ClientFlags.PubSubSubscriber) });
+                return Task.FromResult(SubscriberListed
+                    ? new[] { FakeRedis.Client(SubscriberId, _owner.ClientName, ClientFlags.PubSubSubscriber) }
+                    : []);
             case "ClusterNodesAsync":
                 return Task.FromResult<ClusterConfiguration?>(null);
             case "ExecuteAsync" when args.Length == 2 && args[1] is object[] commandArgs:
@@ -112,8 +127,8 @@ internal sealed class FakeServer
                 {
                     return Task.FromResult(RedisResult.Create(
                     [
-                        RedisResult.Create((RedisValue)"flags"), RedisResult.Create([RedisResult.Create((RedisValue)"on")]),
-                        RedisResult.Create((RedisValue)"redirect"), RedisResult.Create((RedisValue)SubscriberId),
+                        RedisResult.Create((RedisValue)"flags"), RedisResult.Create([RedisResult.Create((RedisValue)TrackingInfoFlags)]),
+                        RedisResult.Create((RedisValue)"redirect"), RedisResult.Create((RedisValue)(TrackingInfoRedirect ?? SubscriberId)),
                     ]));
                 }
                 // The armer calls server.ExecuteAsync("ROLE") with no extra arguments, so the command name lands in

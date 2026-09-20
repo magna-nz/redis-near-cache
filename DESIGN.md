@@ -206,6 +206,32 @@ The 5 s reconcile sweep and the replica pre-arm are started even when the initia
 arm a master that connects later without an event naming it and what notice a promotion the multiplexer relearned
 quietly; a start runs once, so a sweep skipped here would never run at all.
 
+**Verifying an arm nothing reported broken.** Every other path here reacts to a `ConnectionFailed`/`ConnectionRestored`
+from StackExchange.Redis. The subscriber connection is the one that never sends anything, so it is the one a NAT or
+load balancer drops as idle - and a half-open socket raises nothing: the server keeps redirecting invalidations to a
+client that is gone, the interactive connection stays healthy, reads keep being served from L1, and `IsCoherent` stays
+true. Measured against a proxy that swallowed that one flow: about 67 s of silent stale reads while the multiplexer's
+60 s keepalive got round to it, and unbounded (466 of 466 reads stale over 260 s, 29 reconnect attempts, not one
+event raised) when the reconnect could not complete either. Two things close it:
+
+- the private multiplexer's `KeepAlive` is forced to 10 s (as `ConfigCheckSeconds` is forced to 5), so
+  StackExchange.Redis itself notices a silent socket in about 20 s rather than 67 s and reconnects, which re-arms;
+- every sixth sweep (about 30 s) re-checks every armed master: the server must still be redirecting to the client id
+  of our subscriber connection *as `CLIENT LIST` reports it now*, and `CLIENT TRACKINGINFO` (where the server has it,
+  and it is only ever read as evidence, never as an instruction) must still agree. A mismatch is announced as
+  `TrackingLost` and re-armed, so the case where no event ever comes ends in pass-through in about 30 s instead of
+  lasting for ever. Not on every sweep, because the server answers `CLIENT LIST` by walking every client it has, and
+  an application with thousands of its own connections would pay for that continuously; `CLIENT LIST TYPE pubsub`, or
+  `CLIENT LIST ID` on 6.2+, would make it cheap enough to run more often.
+
+A failure to read either command is never treated as a broken arm: only a positive mismatch re-arms, because a blip
+would otherwise cost a flush and a pass-through window for nothing. The endpoint's gate is held for the reads, so an
+arm in flight is never mistaken for a broken one. What is left is the window where the server still believes the
+subscriber is there - nothing can see that from either end, so it is bounded by the keepalive, about 20 s, and L1 is
+served from during it. A pre-armed replica's redirect is not verified this way; if it dangles and that replica is then
+promoted, the promotion is reported as `Promoted` (no re-arm) on a node whose redirect is dead, until the next
+`TrackingLost` there.
+
 **Still a master?** (`MasterRole`) decides between retrying (stay in pass-through) and forgetting an endpoint.
 The multiplexer never changes the role it last saw for a node it cannot reach, so a killed master would otherwise
 be a master forever:

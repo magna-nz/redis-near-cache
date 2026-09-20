@@ -21,6 +21,23 @@
   started its sweep in a `finally`; `TrackingArmer` now does too.
 - Fix: a `Reconcile` that found several new masters queued each arm as it went, so the first `Armed` could take the
   facade out of pass-through while the others were still unannounced. All of them are now announced lost first.
+- Fix: in `TrackingMode.Redirect`, a subscriber connection that died silently was not noticed, and L1 kept serving
+  values the server could no longer invalidate while `IsCoherent` stayed true. The subscriber connection only ever
+  receives, so it is what a NAT or load balancer drops as idle, and a half-open socket raises no event: the server
+  goes on redirecting every invalidation to a client that is gone. Measured against a proxy that swallowed that one
+  flow: about 67 s of silent stale reads, and unbounded (466 of 466 reads stale over 260 s, 29 reconnect attempts,
+  not one `ConnectionFailed`/`ConnectionRestored` raised) when the reconnect could not complete either. Two changes:
+  the private multiplexer's `KeepAlive` is now 10 s rather than the 60 s default, so StackExchange.Redis notices a
+  silent socket in about 20 s and reconnects; and every sixth sweep (about 30 s) now re-checks that each armed master
+  is still redirecting to the client id of our subscriber connection as `CLIENT LIST` reports it, re-arming when it is
+  not, so the case where no event ever arrives ends in pass-through in about 30 s instead of lasting indefinitely.
+  Not on every sweep: the server answers `CLIENT LIST` by walking every client it has. A failed read
+  of either command is not treated as a broken arm, so a blip costs nothing. Remaining window, documented in
+  DESIGN.md: while the server still believes the subscriber is there, which neither end can see, staleness is bounded
+  by the keepalive rather than eliminated. `Broadcast` mode was never affected (it has its own 10 s keepalive).
+- Fix: `CLIENT TRACKINGINFO` reporting tracking off is now treated as a failed arm even when it still reports the
+  expected redirect id. Real Redis answers `redirect -1` once tracking is off, so this only bites behind something
+  that answers differently, but the check cost nothing to add.
 
 ## 1.5.0 (2026-09-20)
 
