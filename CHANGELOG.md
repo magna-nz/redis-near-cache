@@ -35,8 +35,32 @@
   of either command is not treated as a broken arm, so a blip costs nothing. Remaining window, documented in
   DESIGN.md: while the server still believes the subscriber is there, which neither end can see, staleness is bounded
   by the keepalive rather than eliminated. `Broadcast` mode was never affected (it has its own 10 s keepalive).
+- Fix: `AddRedisNearCacheDistributedCache` / `AddRedisNearCacheHybridCache` now displace an `IDistributedCache`
+  registered before them. Both used `TryAdd`, which skips when any descriptor for the service type exists, so an
+  `AddDistributedMemoryCache()` earlier in `Program.cs` (ASP.NET Core session-state boilerplate, itself a `TryAdd`)
+  kept the registration while `AddRedisNearCacheHybridCache` still switched `HybridCache`'s own local cache off. The
+  result was `HybridCache` with no local tier over a process-local L2 - slower than either tier alone, incoherent
+  across processes, and with nothing logged to say so. Ordering between this library's own named and unnamed forms is
+  unchanged (the first one called still decides which cache backs the interfaces); a registration made *after* ours
+  still wins, which is now documented rather than accidental.
+- Fix: the default serializer dispatched `Serialize` on the runtime value and `Deserialize` on the static type, so
+  the two disagreed. `SetAsync<string>(key, null)` wrote the four bytes `null` and `GetAsync<string>` handed back the
+  four-character string `"null"` - a value the caller never stored; `SetAsync<byte[]>(key, null)` likewise. Both now
+  throw `ArgumentNullException`: `string` and `byte[]` pass through untouched, so there is nothing in Redis that means
+  null (store nothing, or remove the key). And `Serialize<object>("abc")` wrote raw bytes that `Deserialize<object>`
+  could only throw on; `object` now takes the JSON path in both directions. A `null` of a JSON-serialized type is
+  still stored as the JSON literal and still reads back as null, unchanged.
 - Fix: `CLIENT TRACKINGINFO` reporting tracking off is now treated as a failed arm even when it still reports the
-  expected redirect id. Real Redis answers `redirect -1` once tracking is off, so this only bites behind something
+  expected redirect id.
+- Options validation: a `KeyNamespace` containing `{` or `}` is refused (on a cluster it is a hash tag, so every key
+  the cache touches would land in one slot - the hazard was documented on the property but nothing enforced it), as
+  is one with leading or trailing whitespace; a whitespace-only `KeyPrefixes` entry is refused alongside null and
+  empty (in `Broadcast` it would go out as a `BCAST PREFIX` argument); and `L1SizeLimit` is no longer validated when
+  `L1SizeLimitBytes` is set, since it is ignored then - a zero there used to fail startup over a setting nothing reads.
+- Docs: `RedisNearCacheDistributedCache` no longer offers itself for ASP.NET Core session state. `Refresh` is a no-op
+  and a sliding expiration becomes a fixed TTL measured from the write, so a session that is only read would expire a
+  full `IdleTimeout` after its last write and sign the user out mid-visit. The expiry mapping itself is unchanged and
+  was already tested. Real Redis answers `redirect -1` once tracking is off, so this only bites behind something
   that answers differently, but the check cost nothing to add.
 
 ## 1.5.0 (2026-09-20)

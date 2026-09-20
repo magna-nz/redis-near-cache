@@ -19,14 +19,20 @@ public static class ServiceCollectionExtensions
     /// either interface without a prior call to <c>AddRedisNearCache</c> throws
     /// <see cref="InvalidOperationException"/> (from resolving <see cref="IRedisNearCache"/>), not from this
     /// method itself.
+    /// <para>
+    /// Any <see cref="IDistributedCache"/> registered before this call - <c>AddDistributedMemoryCache()</c>,
+    /// <c>AddStackExchangeRedisCache()</c> - is displaced: calling this method is a request for this library to BE
+    /// the application's distributed cache. Ordering between this library's own named and unnamed forms is
+    /// unchanged (the first one called decides which cache backs the interfaces).
+    /// </para>
     /// </summary>
     public static IServiceCollection AddRedisNearCacheDistributedCache(this IServiceCollection services)
     {
         ArgumentNullException.ThrowIfNull(services);
 
+        var alreadyOurs = services.Any(d => d.ServiceType == typeof(RedisNearCacheDistributedCache));
         services.TryAddSingleton(sp => new RedisNearCacheDistributedCache(sp.GetRequiredService<IRedisNearCache>()));
-        services.TryAddSingleton<IDistributedCache>(sp => sp.GetRequiredService<RedisNearCacheDistributedCache>());
-        services.TryAddSingleton<IBufferDistributedCache>(sp => sp.GetRequiredService<RedisNearCacheDistributedCache>());
+        PointDistributedCacheAtOurs(services, alreadyOurs);
 
         return services;
     }
@@ -113,17 +119,17 @@ public static class ServiceCollectionExtensions
     /// </summary>
     /// <remarks>
     /// A separate method rather than an overload taking the name, so that no existing call (in particular one passing
-    /// <c>null</c>) can bind differently. Like the unnamed form this only adds what is not there yet: whichever of the
-    /// two is called first decides which cache backs <see cref="IDistributedCache"/>.
+    /// <c>null</c>) can bind differently. Whichever of the two forms is called first decides which cache backs
+    /// <see cref="IDistributedCache"/>; a foreign registration made before either is displaced, as in the unnamed form.
     /// </remarks>
     public static IServiceCollection AddRedisNearCacheDistributedCacheFor(this IServiceCollection services, string name)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentException.ThrowIfNullOrEmpty(name);
 
+        var alreadyOurs = services.Any(d => d.ServiceType == typeof(RedisNearCacheDistributedCache));
         services.TryAddSingleton(sp => new RedisNearCacheDistributedCache(sp.GetRequiredKeyedService<IRedisNearCache>(name)));
-        services.TryAddSingleton<IDistributedCache>(sp => sp.GetRequiredService<RedisNearCacheDistributedCache>());
-        services.TryAddSingleton<IBufferDistributedCache>(sp => sp.GetRequiredService<RedisNearCacheDistributedCache>());
+        PointDistributedCacheAtOurs(services, alreadyOurs);
         return services;
     }
 
@@ -144,5 +150,39 @@ public static class ServiceCollectionExtensions
         // Registering the distributed cache first is what makes the call below a no-op for that part; the rest of it
         // (HybridCache itself, with its local cache disabled) is exactly what the unnamed form sets up.
         return services.AddRedisNearCacheHybridCache(configure);
+    }
+
+    /// <summary>
+    /// Points <see cref="IDistributedCache"/> and <see cref="IBufferDistributedCache"/> at the
+    /// <see cref="RedisNearCacheDistributedCache"/> singleton, displacing any registration that is not this
+    /// library's own.
+    /// </summary>
+    /// <remarks>
+    /// <c>TryAdd</c> alone was wrong here: it skips when <em>any</em> descriptor for the service type exists, so
+    /// <c>AddDistributedMemoryCache()</c> or <c>AddStackExchangeRedisCache()</c> called BEFORE this method kept the
+    /// registration and this library's cache was built, registered as its own concrete type, and never used - while
+    /// <c>AddRedisNearCacheHybridCache</c> still switched <c>HybridCache</c>'s own local cache off. The result was
+    /// silent: <c>HybridCache</c> with no local tier over a process-local (or simply untracked) L2, which is both
+    /// slower and, across processes, incoherent - and nothing said so.
+    /// <para>
+    /// Ordering between this library's own registrations is unchanged, and is what <c>alreadyOurs</c> preserves:
+    /// whichever of the named and unnamed forms runs first decides which cache backs the interfaces. Only a foreign
+    /// registration is displaced, and only one made before this call: a <c>services.Add</c> afterwards still wins,
+    /// because nothing here can see the future.
+    /// </para>
+    /// </remarks>
+    private static void PointDistributedCacheAtOurs(IServiceCollection services, bool alreadyOurs)
+    {
+        if (alreadyOurs)
+        {
+            services.TryAddSingleton<IDistributedCache>(sp => sp.GetRequiredService<RedisNearCacheDistributedCache>());
+            services.TryAddSingleton<IBufferDistributedCache>(sp => sp.GetRequiredService<RedisNearCacheDistributedCache>());
+            return;
+        }
+
+        services.RemoveAll<IDistributedCache>();
+        services.RemoveAll<IBufferDistributedCache>();
+        services.AddSingleton<IDistributedCache>(sp => sp.GetRequiredService<RedisNearCacheDistributedCache>());
+        services.AddSingleton<IBufferDistributedCache>(sp => sp.GetRequiredService<RedisNearCacheDistributedCache>());
     }
 }

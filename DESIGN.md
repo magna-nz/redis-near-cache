@@ -66,6 +66,22 @@ validator likewise validates only `Options.DefaultName`). Its `Meter` carries an
 `name`, stable across restarts unlike `rnc.client_name`. None of this touches the default instance's registration,
 options or metrics: an application that never calls `AddKeyedRedisNearCache` sees no difference at all.
 
+**Being the application's `IDistributedCache`.** `AddRedisNearCacheDistributedCache` (and the `HybridCache` form)
+displaces an `IDistributedCache` registered before it, rather than standing aside. `TryAdd` skips when any descriptor
+for the service type exists, so `AddDistributedMemoryCache()` earlier in `Program.cs` used to keep the registration
+while `AddRedisNearCacheHybridCache` still switched `HybridCache`'s own local cache off: `HybridCache` then had no
+local tier at all and an L2 that was process-local, which is slower than either tier alone and incoherent across
+processes, and nothing said so. Ordering between this library's own named and unnamed forms is unchanged - whichever
+runs first decides which cache backs the interfaces - because only a foreign registration is displaced. A
+`services.Add` afterwards still wins; nothing at registration time can see the future.
+
+**The serializer's two directions must agree.** `JsonRedisNearCacheSerializer` dispatches on the static type in both
+directions. Dispatching `Serialize` on the runtime value instead made `string` and `byte[]` asymmetric with their own
+`Deserialize`: a declaration pattern never matches `null`, so a null string was written as the JSON literal and read
+back as the four-character string `"null"`. `string` and `byte[]` pass through untouched and so cannot represent
+null - Redis holds bytes or holds nothing - so a null of those types is refused outright; a null of a JSON-serialized
+type is representable and stays legal.
+
 **Package validation.** Both `src/RedisNearCache/RedisNearCache.csproj` and
 `src/RedisNearCache.HybridCache/RedisNearCache.HybridCache.csproj` now set `EnablePackageValidation` and
 `PackageValidationBaselineVersion` (`1.3.0`; restored from nuget.org, and only ever raised to a version already published), so `dotnet pack` fails if the build removed or altered public API an
