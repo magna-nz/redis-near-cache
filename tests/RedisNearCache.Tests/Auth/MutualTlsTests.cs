@@ -204,10 +204,13 @@ public class MutualTlsTests
             Assert.NotNull(startupFailure);
             Assert.Empty(handle.Armer.RedirectTargets);
 
-            // The startup exception itself names the cause: the TLS handshake of the broadcast socket, not a timeout.
-            var messages = AuthSupport.Describe(startupFailure);
-            Assert.Contains("BCAST", messages, StringComparison.Ordinal);
-            Assert.Contains("Authentication failed", messages, StringComparison.Ordinal);
+            // The startup exception itself names the cause: TLS authentication of the broadcast socket, not a timeout.
+            // Asserted on the exception TYPE: which half of the limitation bites first is the platform's business.
+            // The socket can read neither event, so OpenSSL (Linux) rejects the server certificate it was given no way
+            // to validate ("...errors in the certificate chain: UntrustedRoot") before the client certificate comes
+            // up at all, while macOS gets as far as the server aborting for want of one ("handshake failure").
+            Assert.Contains("BCAST", AuthSupport.Describe(startupFailure), StringComparison.Ordinal);
+            Assert.Contains(AuthSupport.Flatten(startupFailure!), e => e is System.Security.Authentication.AuthenticationException);
 
             await AuthSupport.AssertPassThroughStillCorrectAsync(
                 handle.Cache, key, ExternalSet, "broadcast, client certificate via the event only");
