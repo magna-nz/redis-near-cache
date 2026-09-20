@@ -20,7 +20,13 @@ Containers (image overridable with RNC_REDIS_IMAGE, default redis:7.4; enterpris
                                                                           (redis-near-cache-sentinel)
     managed-up.sh        restricted admin commands :6410                  (redis-near-cache-restricted)
                          hostname-announcing cluster localhost:7200-7205  (redis-near-cache-cluster-hostname, 7.0+)
-    enterprise-up.sh     single-node Redis Software behind its proxy :12000  (redis-near-cache-enterprise; not in up.sh,
+    auth-up.sh           password + ACL users :6450                       (redis-near-cache-auth)
+                         mTLS, client certificate required :6460          (redis-near-cache-mtls)
+                         password-protected cluster 127.0.0.1:7300-7305   (redis-near-cache-auth-cluster)
+                         password-protected master :6470, replicas :6471-6472, one sentinel each for
+                         same / no / different sentinel password :26390-26392
+                                                                          (redis-near-cache-auth-sentinel)
+    enterprise-up.sh     single-node Redis Software behind its proxy :12000, and a password-protected database :12001  (redis-near-cache-enterprise; not in up.sh,
                          ~4 min to boot, image redislabs/redis; the local stand-in for Azure Managed Redis / Redis Cloud)
 
 Integration tests expect all of them except the Enterprise one to be running; the `Enterprise` suite is skipped

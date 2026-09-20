@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+- Fix: in `TrackingMode.Redirect`, a second arm of one node could turn its tracking off while the cache was serving
+  from it. A node restart restores both of the cache's connections and each queues an arm; the first one's `Armed`
+  answered every loss announced so far, so the cache was caching again (`IsCoherent` true) when the second arm opened
+  with `CLIENT TRACKING OFF`. For two or three round trips, or the whole retry ladder (about 2.4 s plus timeouts) if
+  that arm then failed, L1 served keys the server no longer tracked, with nothing marking it. An arm now announces
+  the loss again once it is its turn and, under the lifecycle lock, immediately before every `OFF`, where it also
+  forgets any pre-arm of that node: a promoted replica whose arm sent `OFF` and then failed used to be reported as
+  `Promoted` (armed, no re-arm needed) by the next reconcile, with its tracking off and no time limit. An arm on its
+  own still costs one flush. Every released version is affected; `Broadcast` mode is not.
+- Fix: the 5 s reconcile queued a new arm, a flush and a log line for any connected master missing from its redirect
+  targets, including one whose arm was still running and one that cannot be armed at all (a proxy without `REDIRECT`,
+  a restricted ACL user), on top of the retry loop doing the same job. It now skips a master with an arm queued or
+  running, and the timer's sweep leaves a lost master to its retry loop. A `ConfigurationChanged` still arms a lost
+  master at once, so failover recovery is no slower.
+- Tests: an `Auth` integration suite, run on every push against every supported server (Redis 6.2, 7.0, 7.2, 7.4, 8,
+  Valkey 8.1) and, for `Broadcast`, the Redis Enterprise proxy. New containers from `auth-up.sh` (part of `up.sh`): a
+  password-protected server with ACL users, a server that requires client certificates, a password-protected cluster,
+  and a password-protected Sentinel deployment with sentinels that share the data nodes' password, have none, or
+  have a different one; `enterprise-up.sh` gains a password-protected database. Every "works" case is proven end to
+  end (arm, L1 hit, an external write evicting it); every unsupported one is proven to fail loudly and promptly.
+  What it established: `password=` alone works in both modes, including `HELLO 3 AUTH default <password>` through the
+  Enterprise proxy; least-privilege ACL users work in both modes, standalone and on a cluster, with the server's
+  `ACL LOG` empty afterwards; mutual TLS works in `Redirect` however the certificate is supplied and in `Broadcast`
+  through `SslClientAuthenticationOptions`, and with the certificate only on the `CertificateSelection` event
+  `Broadcast` faults `Ready` and stays in pass-through; sentinels without a password in front of password-protected
+  data nodes work, and a sentinel password different from the data nodes' cannot be expressed (one `Password`, as for
+  a plain `ConnectionMultiplexer`).
+- Docs: the ACL permissions reference now shows the two least-privilege users the suite runs, in place of the untested
+  illustration, which was too small to connect with. About half of what is needed is StackExchange.Redis's own
+  (`INFO`, `ECHO`, `CONFIG GET`, `SELECT`, `CLIENT ID`, `CLUSTER SLOTS`, `READONLY`, from Redis 7.2 `CLIENT SETINFO`,
+  its tie-breaker key and its configuration channel), and for this library `RemoveAsync` is `UNLINK`, not `DEL`, and
+  `SetAsync` with an expiry is `SETEX` or `PSETEX`. The README has an Authentication section; the mutual-TLS
+  limitation says what happens and where it is tested; a Sentinel-password limitation is added.
+
 ## 1.4.0 (2026-09-20)
 
 - Feature: `RedisNearCacheOptions.KeyNamespace` (`string?`, default `null`), a prefix put in front of every key

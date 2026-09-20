@@ -11,7 +11,7 @@
   </p>
   <p>
     <a href="https://magna-nz.github.io/redis-near-cache/#enterprise"><img src="https://img.shields.io/badge/works%20with-Azure%20Managed%20Redis%20%C2%B7%20Redis%20Cloud%20%C2%B7%20Redis%20Software-A41E11" alt="Works with Azure Managed Redis, Redis Cloud and Redis Software" /></a>
-    <a href="#entraid-auth"><img src="https://img.shields.io/badge/auth-ACL%20%C2%B7%20Entra%20ID%20%C2%B7%20mTLS-0078D4" alt="Auth: ACL, Entra ID and mTLS" /></a>
+    <a href="#authentication"><img src="https://img.shields.io/badge/auth-ACL%20%C2%B7%20Entra%20ID%20%C2%B7%20mTLS-0078D4" alt="Auth: ACL, Entra ID and mTLS" /></a>
   </p>
   <p><a href="https://magna-nz.github.io/redis-near-cache/">Documentation</a></p>
 </div>
@@ -97,6 +97,24 @@ Behind `HybridCache`:
 services.AddRedisNearCache("localhost:6379");
 services.AddRedisNearCacheHybridCache();               // HybridCache's own L1 is disabled; ours is the coherent one
 ```
+
+### Authentication
+
+Passwords, ACL users, mutual TLS and Entra ID tokens are taken from the `ConfigurationOptions` (or connection
+string) you pass in; every connection the cache opens uses them. The `Auth` test suite runs the first three
+against real servers (standalone, cluster and Sentinel; Redis 6.2 to 8 and Valkey 8.1; the Redis Enterprise
+proxy); Entra ID is covered below:
+
+- **Password or ACL user** (`password=`, `user=`): both tracking modes. A least-privilege ACL for each mode, with
+  what every grant is for, is in the [docs](https://magna-nz.github.io/redis-near-cache/#acl-permissions); about
+  half of it is what StackExchange.Redis itself needs.
+- **Mutual TLS**: in `Redirect`, supply the client certificate however you do for StackExchange.Redis. In
+  `Broadcast`, supply it through `ConfigurationOptions.SslClientAuthenticationOptions`: the broadcast connection
+  cannot read the `CertificateSelection`/`CertificateValidation` events, and with only those set the cache fails
+  loudly at startup and stays in pass-through rather than caching.
+- **Sentinel**: the sentinels and the data nodes share the one `Password` StackExchange.Redis has. Sentinels with
+  no password in front of password-protected data nodes work; a *different* sentinel password cannot be expressed.
+- A wrong or missing credential is an exception at startup, never a cache that silently does not invalidate.
 
 ### EntraID Auth
 

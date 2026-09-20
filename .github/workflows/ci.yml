@@ -16,7 +16,9 @@ permissions:
 env:
   # Suites that must have run (and passed at least this many tests) in every integration job; see
   # .github/scripts/check-suites-ran.sh. Managed is added per job because its count depends on the server.
-  RNC_REQUIRED_SUITES: Core=1 Chaos=1 EdgeCases=1 Compat=1 Resilience=1 HybridCache=1 Sentinel=4 Broadcast=1
+  # Auth is the whole suite (password, ACL, mTLS, cluster and Sentinel with auth; containers from auth-up.sh):
+  # none of it is gated on the image, so a test that stops running is a regression in coverage.
+  RNC_REQUIRED_SUITES: Core=1 Chaos=1 EdgeCases=1 Compat=1 Resilience=1 HybridCache=1 Sentinel=4 Broadcast=1 Auth=23
 
 jobs:
   unit:
@@ -52,7 +54,7 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
-      - name: Start Redis 7.4 (standalone, replica, TLS, cluster, Sentinel, restricted, hostname cluster)
+      - name: Start Redis 7.4 (standalone, replica, TLS, cluster, Sentinel, restricted, hostname cluster, auth/ACL/mTLS)
         run: ./up.sh
       - name: Build
         run: dotnet build -c Release -nologo
@@ -87,7 +89,7 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
-      - name: Start ${{ matrix.image }} (standalone, replica, TLS, cluster, Sentinel, managed-style)
+      - name: Start ${{ matrix.image }} (standalone, replica, TLS, cluster, Sentinel, managed-style, auth/ACL/mTLS)
         run: ./up.sh
       - name: Build
         run: dotnet build -c Release -nologo
@@ -119,17 +121,18 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
-      - name: Start single-node Redis Software behind its proxy (:12000)
+      - name: Start single-node Redis Software behind its proxy (:12000, and a password-protected database on :12001)
         run: ./enterprise-up.sh
       - name: Build
         run: dotnet build -c Release -nologo
       - name: Broadcast-mode tests against the Enterprise proxy
         env:
           RNC_ENTERPRISE_REDIS: localhost:12000
+          RNC_ENTERPRISE_AUTH_REDIS: localhost:12001
         run: dotnet test tests/RedisNearCache.Tests -c Release --no-build -nologo --filter "FullyQualifiedName~RedisNearCache.Tests.Enterprise" --logger "trx;LogFileName=enterprise.trx"
       - name: Check the suite ran
         if: always()
-        run: .github/scripts/check-suites-ran.sh tests/RedisNearCache.Tests/TestResults/enterprise.trx Enterprise=1
+        run: .github/scripts/check-suites-ran.sh tests/RedisNearCache.Tests/TestResults/enterprise.trx Enterprise=9
       - name: Container logs
         if: failure()
         run: docker logs --tail 200 redis-near-cache-enterprise
