@@ -1,6 +1,7 @@
 using System.Diagnostics.Metrics;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using RedisNearCache.Internal;
 using RedisNearCache.Tracking;
 using Xunit;
 using Facade = RedisNearCache.Caching.RedisNearCache;
@@ -161,5 +162,38 @@ public class MetricsTests
         Assert.False(cache.IsCoherent);
         // The meter went with the cache, so the gauge is no longer published at all rather than stuck at 1.
         Assert.False(Collect(clientName).Longs.ContainsKey("redisnearcache.coherent"));
+    }
+
+    /// <summary>
+    /// The invariant DESIGN.md states for the breakdowns: summed over the <c>reason</c> tag, each total is unchanged,
+    /// which only holds while every reason is either emitted or deliberately excluded. The flush reasons are derived
+    /// from <see cref="FlushReason"/>, so they cannot drift; the re-arm reasons are a hardcoded list, and adding an
+    /// <see cref="ArmReason"/> without adding it there would silently drop it from the breakdown with nothing failing.
+    /// Asserted on what the meter actually emits, not on the private list, so it also covers the names.
+    /// </summary>
+    [Fact]
+    public async Task EveryArmAndFlushReasonIsEitherEmittedOrDeliberatelyExcluded()
+    {
+        var clientName = "rnc-metrics-reasons-" + Guid.NewGuid().ToString("N");
+        await using var cache = await StartAsync(clientName);
+        var measurements = Collect(clientName);
+
+        var rearmReasons = measurements.ByReason.Keys
+            .Where(k => k.Instrument == "redisnearcache.rearms")
+            .Select(k => k.Reason)
+            .ToHashSet(StringComparer.Ordinal);
+        // Initial and Promoted are arms but never re-arms, so they are excluded on purpose; nothing else may be.
+        Assert.Equal(
+            Enum.GetNames<ArmReason>().ToHashSet(StringComparer.Ordinal),
+            rearmReasons.Append(nameof(ArmReason.Initial)).Append(nameof(ArmReason.Promoted)).ToHashSet(StringComparer.Ordinal));
+        Assert.DoesNotContain(nameof(ArmReason.Initial), rearmReasons);
+        Assert.DoesNotContain(nameof(ArmReason.Promoted), rearmReasons);
+
+        // The flush reasons are derived from the enum, and every one of them is emitted, zeros included.
+        var flushReasons = measurements.ByReason.Keys
+            .Where(k => k.Instrument == "redisnearcache.flushes")
+            .Select(k => k.Reason)
+            .ToHashSet(StringComparer.Ordinal);
+        Assert.Equal(Enum.GetNames<FlushReason>().ToHashSet(StringComparer.Ordinal), flushReasons);
     }
 }

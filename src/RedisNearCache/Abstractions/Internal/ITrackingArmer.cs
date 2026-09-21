@@ -74,7 +74,10 @@ internal interface ITrackingArmer : IAsyncDisposable
     /// Failed attempts to pre-arm a replica, read by the facade when something collects (the same arrangement as
     /// <see cref="ReplicaRedirectTargets"/>: pre-arm state the armer owns and the facade only observes). The armer is
     /// constructed before the facade and cannot be handed its <see cref="RedisNearCacheStatistics"/>, so the count
-    /// lives here. Monotonic; never reset.
+    /// lives here. Monotonic for the life of the armer: nothing resets it. What an OBSERVER sees can still go back to
+    /// 0, because disposing the cache detaches the reader that
+    /// <see cref="RedisNearCacheStatistics.PreArmFailures"/> and the health check's <c>preArmFailures</c> read this
+    /// through, and an unattached reader answers 0.
     /// </summary>
     long PreArmFailures { get; }
 

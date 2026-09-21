@@ -113,12 +113,16 @@ public sealed class Basket([FromKeyedServices("sessions")] IRedisNearCache cache
 ## Metrics and health checks
 
 `IRedisNearCache.Statistics` and a `System.Diagnostics.Metrics` meter (`RedisNearCacheStatistics.MeterName`) expose the
-same counters, plus L1 entry count and coherence as gauges, tagged with each instance's Redis client name. A health
-check reports `Degraded` (not `Unhealthy`) while the cache is in pass-through, since reads still succeed straight
-from Redis.
+same counters, plus L1 entry count and coherence as gauges, tagged with each instance's Redis client name. An
+`ActivitySource` of the same name (`RedisNearCacheStatistics.ActivitySourceName`) carries two spans: a Redis round
+trip on a miss (`redisnearcache.read`; an L1 hit starts no span) and arming an endpoint (`redisnearcache.arm`). A
+health check reports `Degraded` (not `Unhealthy`) while the cache is in pass-through, since reads still succeed
+straight from Redis.
 
 ```csharp
-services.AddOpenTelemetry().WithMetrics(m => m.AddMeter(RedisNearCacheStatistics.MeterName));
+services.AddOpenTelemetry()
+    .WithMetrics(m => m.AddMeter(RedisNearCacheStatistics.MeterName))
+    .WithTracing(t => t.AddSource(RedisNearCacheStatistics.ActivitySourceName));
 services.AddHealthChecks().AddCheck<RedisNearCacheHealthCheck>("redis-near-cache");
 ```
 

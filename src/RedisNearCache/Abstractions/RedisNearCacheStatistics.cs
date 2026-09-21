@@ -12,6 +12,19 @@ public sealed class RedisNearCacheStatistics
     /// </summary>
     public const string MeterName = "RedisNearCache";
 
+    /// <summary>
+    /// The <see cref="System.Diagnostics.ActivitySource"/> name RedisNearCache starts its spans under. Pass it to
+    /// OpenTelemetry's <c>AddSource</c> (or any other <see cref="System.Diagnostics.ActivityListener"/>) to collect
+    /// them. There are two: <c>redisnearcache.read</c> around the Redis round trip of a read that missed the local
+    /// cache (a local hit starts no span at all), and <c>redisnearcache.arm</c> around arming <c>CLIENT TRACKING</c>
+    /// on one endpoint. Both carry the same <c>rnc.client_name</c> tag the measurements carry.
+    /// <para>
+    /// Deliberately the same string as <see cref="MeterName"/>: the metrics and the spans of one cache instance are
+    /// one instrumentation scope, so a caller who has registered the meter name knows this one too.
+    /// </para>
+    /// </summary>
+    public const string ActivitySourceName = MeterName;
+
     private long _hits, _misses, _invalidations, _flushes, _rearms, _raceDiscards, _serializerFailures;
 
     /// <summary>

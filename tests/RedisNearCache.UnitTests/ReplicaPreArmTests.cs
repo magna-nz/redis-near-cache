@@ -384,25 +384,142 @@ public class ReplicaPreArmTests
     }
 
     /// <summary>
-    /// A permanently hidden subscriber connection (an Enterprise proxy, a restricted ACL) is the identical condition
-    /// the master arm path already warns about with remediation; it gets the same counter and the same latch.
+    /// A hidden subscriber connection is counted on every sweep, but NOT warned about on the first one: on a healthy
+    /// deployment a replica's subscriber connection turns up in CLIENT LIST a sweep or two after the node does, and the
+    /// warning carries remediation advice (TrackingMode.Broadcast) that only applies where the proxy or the ACL hides
+    /// it for good. Only the endpoint still failing after three consecutive sweeps gets it - the escalation
+    /// TakeoverGuard.WarnAfterRounds uses - and then only once.
     /// </summary>
     [Fact]
-    public async Task HiddenSubscriberConnectionOnAReplicaCountsAndWarnsOnce()
+    public async Task HiddenSubscriberConnectionOnAReplicaCountsEverySweepButWarnsOnlyAfterThreeOfThem()
     {
         var recorder = new RecordingLogger();
         await using var rig = await Rig.StartAsync((_, replica) => replica.SubscriberListed = false, recorder);
 
-        Assert.True(await UntilAsync(() => CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint) >= 1, 3000),
-            "the hidden subscriber was never warned about: " + rig.Describe());
-        Assert.Equal(1, CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint));
-        Assert.True(rig.Armer.PreArmFailures >= 1, "the warned failure must also be counted.");
+        // The first sweep must have run and been counted, and must NOT have warned: the message says "yet".
+        Assert.True(await UntilAsync(() => rig.Armer.PreArmFailures >= 1, 3000), "the first sweep never failed to pre-arm: " + rig.Describe());
+        Assert.Equal(0, CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint));
         Assert.Empty(rig.Armer.ReplicaRedirectTargets);
 
+        // Drive sweeps until the escalation fires. Asserted on the message rather than on a sweep count, because
+        // nothing here controls how many sweeps the start itself ran.
+        for (var sweep = 0; sweep < 10 && CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint) == 0; sweep++)
+        {
+            var failures = rig.Armer.PreArmFailures;
+            rig.Mux.RaiseConfigurationChanged(rig.Master);
+            Assert.True(await UntilAsync(() => rig.Armer.PreArmFailures > failures, 3000), "a later sweep never re-attempted the pre-arm: " + rig.Describe());
+        }
+
+        Assert.True(await UntilAsync(() => CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint) == 1, 3000),
+            "the permanently hidden subscriber was never warned about: " + rig.Describe());
+        Assert.True(rig.Armer.PreArmFailures >= 3, "every failed sweep must be counted, including the ones that only log at Debug.");
+        lock (recorder.Entries)
+        {
+            Assert.Contains(recorder.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("for 3 consecutive sweeps", StringComparison.Ordinal));
+            // The sweeps before it said "yet", at Debug, and said which sweep they were.
+            Assert.Contains(recorder.Entries, e => e.Level == LogLevel.Debug && e.Message.Contains("(sweep 1)", StringComparison.Ordinal));
+            Assert.Contains(recorder.Entries, e => e.Level == LogLevel.Debug && e.Message.Contains("(sweep 2)", StringComparison.Ordinal));
+        }
+
+        // And it stays at one warning however long it goes on failing.
+        var counted = rig.Armer.PreArmFailures;
         rig.Mux.RaiseConfigurationChanged(rig.Master);
-        Assert.True(await UntilAsync(() => CountAt(recorder, LogLevel.Debug, rig.Replica.EndPoint) >= 1, 3000),
-            "a second sweep never re-attempted the pre-arm: " + rig.Describe());
+        Assert.True(await UntilAsync(() => rig.Armer.PreArmFailures > counted, 3000), "a further sweep never ran: " + rig.Describe());
         Assert.Equal(1, CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint));
+    }
+
+    /// <summary>
+    /// The disarm probe of a replica whose pre-arm SUCCEEDED is not a pre-arm attempt, so a ROLE it cannot answer must
+    /// not touch PreArmFailures. It runs every 5 s for the life of the process, and ROLE is exactly the command a proxy
+    /// or a least-privilege ACL restricts (managed-up.sh :6410, the Enterprise fixture), so counting it here reported a
+    /// permanently failing pre-arm on a healthy, successfully pre-armed replica.
+    /// </summary>
+    [Fact]
+    public async Task AFailedRecheckOfAPreArmedReplicaIsNotCountedAsAPreArmFailure()
+    {
+        var recorder = new RecordingLogger();
+        await using var rig = await Rig.StartAsync(logger: recorder);
+        Assert.True(await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000),
+            "the replica was never pre-armed: " + rig.Describe());
+        Assert.Equal(0, rig.Armer.PreArmFailures);
+
+        // From here the replica cannot answer ROLE at all, which is the only command the re-check issues.
+        rig.Replica.CommandHook = command =>
+            string.Equals(command, "ROLE", StringComparison.Ordinal)
+                // The text a least-privilege ACL answers with; the catch under test takes any exception, and the
+                // typed RedisServerException constructor that carries it is obsolete.
+                ? Task.FromException(new InvalidOperationException("NOPERM this user has no permissions to run the 'role' command"))
+                : Task.CompletedTask;
+
+        for (var sweep = 0; sweep < 3; sweep++)
+        {
+            var roleCalls = rig.Replica.RoleCalls;
+            rig.Mux.RaiseConfigurationChanged(rig.Master);
+            Assert.True(await UntilAsync(() => rig.Replica.RoleCalls > roleCalls, 3000), $"sweep {sweep} never re-checked the replica: " + rig.Describe());
+        }
+
+        // The failure has to have been seen at all for the assertion below to mean anything.
+        Assert.True(await UntilAsync(() => CountedDebug(recorder, "could not re-check pre-armed replica") >= 1, 3000),
+            "the re-check never failed: " + rig.Describe());
+        Assert.Equal(0, rig.Armer.PreArmFailures);
+        // The pre-arm itself stands: nothing about a ROLE we cannot read says the arm is gone.
+        Assert.True(rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint));
+        Assert.Equal(0, CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint));
+    }
+
+    private static int CountedDebug(RecordingLogger log, string text)
+    {
+        lock (log.Entries) return log.Entries.Count(e => e.Level == LogLevel.Debug && e.Message.Contains(text, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The warn-once latch must not survive the node being armed as a MASTER: a replica whose pre-arm failed, was then
+    /// promoted and armed, and is later demoted has nothing stale to stay quiet about, and without this a genuine
+    /// pre-arm failure after that only ever logs at Debug.
+    /// <para>
+    /// Asserted on the latch itself, by reflection, deliberately: every route from "armed master" back to
+    /// "pre-armable replica" goes through <c>RemoveEndpoint</c> (the retirement loop, the retry loop), which clears
+    /// the latch as well, so the log level of a later failure cannot distinguish the two. The latch is the only
+    /// observable difference, and it is what the next demotion-and-failure depends on.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ArmingAFailedPreArmNodeAsAMasterClearsItsWarnOnceLatch()
+    {
+        var recorder = new RecordingLogger();
+        var failing = true;
+        await using var rig = await Rig.StartAsync((_, replica) =>
+        {
+            replica.CommandHook = command =>
+                command.StartsWith("CLIENT TRACKING ON", StringComparison.Ordinal) && failing
+                    ? Task.FromException(new InvalidOperationException("boom"))
+                    : Task.CompletedTask;
+        }, recorder);
+
+        Assert.True(await UntilAsync(() => CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint) >= 1, 3000),
+            "the failed pre-arm was never warned about: " + rig.Describe());
+        Assert.True(Warned(rig.Armer, rig.Replica.EndPoint), "the warn-once latch must be set after a warned pre-arm failure.");
+
+        // Promoted, and arming works again: the ordinary master arm path takes it (it was never pre-armed, so this is
+        // not the Promoted shortcut).
+        failing = false;
+        rig.Replica.IsReplica = false;
+        rig.Mux.RaiseConfigurationChanged(rig.Replica);
+
+        // Wait on the Armed event, never on the redirect map: the armer writes the map first.
+        Assert.True(await UntilAsync(() => rig.Events.Any(e => e.StartsWith($"armed {rig.Replica.EndPoint}", StringComparison.Ordinal)), 3000),
+            "the promoted node was never armed as a master: " + rig.Describe());
+        Assert.False(Warned(rig.Armer, rig.Replica.EndPoint),
+            "arming the node as a master must clear the latch, or a pre-arm failure after a later demotion never warns again.");
+    }
+
+    /// <summary>Whether the armer still holds a warn-once latch entry for an endpoint; see the test above for why this is read directly.</summary>
+    private static bool Warned(TrackingArmer armer, EndPoint endPoint)
+    {
+        var latch = (System.Collections.Concurrent.ConcurrentDictionary<EndPoint, byte>)typeof(TrackingArmer)
+            .GetField("_preArmWarned", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(armer)!;
+        return latch.ContainsKey(endPoint);
     }
 
     /// <summary>

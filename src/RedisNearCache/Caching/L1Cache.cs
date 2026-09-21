@@ -44,7 +44,6 @@ internal sealed class L1Cache : IDisposable
     private readonly long _sizeLimit;
     private readonly MemoryCache _cache;
     private long _storeRefusals;
-    private long _clearEpoch;
     private int _disposed;
 
     public L1Cache(RedisNearCacheOptions options)
@@ -74,6 +73,14 @@ internal sealed class L1Cache : IDisposable
     /// point of the <see cref="Set"/> that was refused. Under a tight <see cref="RedisNearCacheOptions.L1SizeLimitBytes"/>
     /// with churn, a non-zero count can therefore be entirely benign. The only reliable way to tell them apart is the
     /// internal size total, reachable only by reflection, which this deliberately does not use.
+    /// <para>
+    /// It errs towards under-counting in the other direction, too: <see cref="Set"/> does not check for a refusal at
+    /// all when the entry's own lifetime is under <c>RefusalCheckMinLifetime</c> (50 ms), because an entry that expired
+    /// between the store and the check is indistinguishable from one that was refused. A pause longer than the lifetime
+    /// of an entry ABOVE that threshold can still be miscounted as a refusal; nothing short of MemoryCache telling us
+    /// why a <c>Set</c> did not take can close that, and one-in-a-blue-moon over-count on an idle counter is the
+    /// cheaper error than a counter that ticks over every short-lived entry.
+    /// </para>
     /// </remarks>
     public long StoreRefusals => Volatile.Read(ref _storeRefusals);
 
@@ -81,12 +88,16 @@ internal sealed class L1Cache : IDisposable
     internal void CountStoreRefusal() => Interlocked.Increment(ref _storeRefusals);
 
     /// <summary>
-    /// Incremented by every <see cref="Clear"/>. <see cref="Clear"/> deliberately takes no stripe lock -
-    /// <c>MemoryCache.Clear</c> swaps the whole backing collection - so a flush landing between a store and the
-    /// check that the store took would otherwise read as a refusal. Comparing the epoch either side of the store
-    /// is how that case is told apart from a real one.
+    /// The shortest entry lifetime <see cref="Set"/> will check for a refusal at all. Below it, the entry can be gone
+    /// from the presence check for the ordinary reason that it EXPIRED between the store and the check one statement
+    /// later - a preemption or a GC pause longer than the entry's own lifetime - which is indistinguishable from a
+    /// refusal and would be counted as one. 50 ms is far longer than any pause between two adjacent dictionary
+    /// operations on one thread (a gen-0/gen-1 collection is sub-millisecond to a few, a scheduler quantum on an
+    /// oversubscribed machine ~16 ms), and short enough to leave ordinary entries checked: <see cref="RedisNearCacheOptions.L1MaxAge"/>
+    /// is minutes by default, and a <see cref="RedisNearCacheOptions.RespectServerTtl"/> cap that lands under 50 ms is
+    /// a key about to vanish anyway.
     /// </summary>
-    internal long ClearEpoch => Volatile.Read(ref _clearEpoch);
+    private static readonly TimeSpan RefusalCheckMinLifetime = TimeSpan.FromMilliseconds(50);
 
     private static MemoryCache CreateCache(long sizeLimit) => new(new MemoryCacheOptions { SizeLimit = sizeLimit });
 
@@ -118,11 +129,10 @@ internal sealed class L1Cache : IDisposable
         if (lifetime is { } age && age > TimeSpan.Zero) entryOptions.AbsoluteExpirationRelativeToNow = age;
 
         // A value that alone cannot fit the whole budget is refused by MemoryCache by design (see SizeLimit); that
-        // is not a symptom of the drift bug in the class remarks and must not be counted as a refusal.
-        var fitsBudget = entryOptions.Size is null || entryOptions.Size.Value <= _sizeLimit;
-        // Read before the lock: Clear() deliberately takes no stripe lock, so a flush racing the store below would
-        // otherwise be misread as a refusal (see ClearEpoch).
-        var epochBefore = ClearEpoch;
+        // is not a symptom of the drift bug in the class remarks and must not be counted as a refusal. Nor is an
+        // entry whose own lifetime is short enough to expire inside the check below (see RefusalCheckMinLifetime).
+        var checkRefusal = (entryOptions.Size is null || entryOptions.Size.Value <= _sizeLimit)
+                           && (lifetime is null || lifetime.Value >= RefusalCheckMinLifetime);
 
         lock (Stripe(key))
         {
@@ -131,9 +141,9 @@ internal sealed class L1Cache : IDisposable
             if (lifetime is { } due && due <= TimeSpan.Zero) return;
             _cache.Set(key, value, entryOptions);
             // One extra dictionary lookup, on the store path only (never on TryGet's hit path): a concurrent
-            // L1Cache.Remove takes this same stripe lock, and the entry just given a positive expiry, so a miss
-            // here - other than one racing Clear() - means MemoryCache silently refused the store.
-            if (fitsBudget && !_cache.TryGetValue(key, out _) && ClearEpoch == epochBefore)
+            // L1Cache.Remove takes this same stripe lock, Clear() takes every stripe including this one, and the entry
+            // was just given a positive expiry, so a miss here means MemoryCache silently refused the store.
+            if (checkRefusal && !_cache.TryGetValue(key, out _))
             {
                 CountStoreRefusal();
             }
@@ -147,14 +157,13 @@ internal sealed class L1Cache : IDisposable
 
     public void Clear()
     {
-        // Before the clear, so a store that samples the epoch either side of itself sees a flush that crossed it.
-        Interlocked.Increment(ref _clearEpoch);
-        // Then every stripe, in a fixed order, around the clear itself. Set's refusal check asks whether the entry it
-        // just stored is still there, and MemoryCache.Clear replaces the whole backing collection; a clear
-        // interleaving between that store and that check would empty the cache and read as a silent refusal. The
-        // epoch alone cannot close that: it is bumped before a clear whose O(n) body has not run yet, so a store that
-        // samples it afterwards and stores before the body still sees an unchanged epoch. Holding the stripes makes
-        // the store and its check atomic with respect to a flush, which is what makes the counter exact.
+        // Every stripe, in a fixed order, around the clear itself. Set's refusal check asks whether the entry it just
+        // stored is still there, and MemoryCache.Clear detaches its whole coherent state with an Interlocked.Exchange
+        // and then walks the ALREADY-DETACHED old state raising the expiry callbacks; so the race is not that the
+        // clear removes the new entry (it cannot - it never touches the new state), it is that a store lands in the
+        // state that is about to be swapped away: Set stores into the old state, the exchange replaces it, and Set's
+        // presence check then looks in the new, empty one and reads a flush as a silent refusal. Holding the stripes
+        // makes the store and its check atomic with respect to a flush, which is what makes the counter exact.
         // The cost is 64 uncontended monitors on a path that already replaces the backing collection, and a flush is
         // rare (a re-arm, an endpoint removal, a server flush) where a store is per miss. Deadlock-free: Set and
         // Remove take exactly one stripe and never call in here.

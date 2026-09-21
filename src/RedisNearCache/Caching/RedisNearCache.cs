@@ -26,6 +26,7 @@ internal sealed class RedisNearCache : IRedisNearCache
     private readonly L1Cache _l1;
     private readonly InFlightTracker _inflight;
     private readonly RedisNearCacheMetrics _metrics;
+    private readonly RedisNearCacheTracing _tracing;
     private volatile bool _degraded;
     private int _startupSettled;
 
@@ -151,6 +152,22 @@ internal sealed class RedisNearCache : IRedisNearCache
             () => _armer.PreArmFailures);
         // Observable instruments only: they read what is counted anyway, so no metric costs the read path anything.
         _metrics = new RedisNearCacheMetrics(Statistics, _connection.ClientName, () => IsCoherent, _options.InstanceName);
+        // Spans cannot be observed on pull the way the instruments are, so the rule is where they are started from:
+        // only around a Redis round trip that is happening anyway (a miss) and around an arm. An L1 hit never reaches
+        // this object at all - see GetStoredBytesAsync.
+        _tracing = new RedisNearCacheTracing(_connection.ClientName, _options.InstanceName);
+        // The armer is built before the facade, so it cannot be handed this in its constructor - the same ordering
+        // that puts PreArmFailures on the armer and has the statistics pull it from there. A type test per concrete
+        // armer rather than a member on ITrackingArmer, which lives in Abstractions/Internal and must not point at a
+        // Caching type. Both modes arm per endpoint and both are traced, under the one span name: Redirect sends
+        // CLIENT TRACKING OFF / ON REDIRECT / TRACKINGINFO, Broadcast sends a handshake, CLIENT TRACKING ON BCAST and
+        // the same TRACKINGINFO on a fresh socket (no OFF - a new socket never has tracking on), with a retry ladder
+        // Redirect does not have.
+        switch (_armer)
+        {
+            case TrackingArmer redirectArmer: redirectArmer.AttachTracing(_tracing); break;
+            case Tracking.Broadcast.BroadcastTracker broadcastTracker: broadcastTracker.AttachTracing(_tracing); break;
+        }
 
         _listener.KeyInvalidated += OnKeyInvalidated;
         _listener.FlushAll += OnFlushAll;
@@ -648,6 +665,10 @@ internal sealed class RedisNearCache : IRedisNearCache
 
         Statistics.Miss();
         var cacheable = MatchesPrefixes(key);
+        // The read span starts HERE and nowhere earlier. The L1 hit above returns without calling into _tracing at
+        // all: not even StartActivity, which is not free (field reads and a branch with no listener, an allocation
+        // with one). Everything below this line is a round trip to Redis, which the span cannot measurably slow down.
+        using var activity = _tracing.StartRead(key);
         long token = _inflight.Begin(key);
         try
         {
@@ -759,6 +780,9 @@ internal sealed class RedisNearCache : IRedisNearCache
             byte[]? bytes = (byte[]?)value;
             if (bytes is null)
             {
+                // Nothing came back, so there was nothing to store: a different thing from a reply that was served
+                // and dropped, and the span says which.
+                RedisNearCacheTracing.RecordNotStored(activity, ReadNotStored.KeyMissing);
                 return null;
             }
 
@@ -778,6 +802,7 @@ internal sealed class RedisNearCache : IRedisNearCache
                 if (cap == TimeSpan.Zero || _inflight.WasInvalidated(key, token))
                 {
                     Statistics.RaceDiscard();
+                    RedisNearCacheTracing.RecordNotStored(activity, ReadNotStored.RaceDiscarded);
                 }
                 else
                 {
@@ -788,17 +813,45 @@ internal sealed class RedisNearCache : IRedisNearCache
                     {
                         _l1.Remove(key);
                         Statistics.RaceDiscard();
+                        RedisNearCacheTracing.RecordNotStored(activity, ReadNotStored.RaceDiscarded);
+                    }
+                    else
+                    {
+                        RedisNearCacheTracing.RecordStored(activity);
                     }
                 }
             }
+            else
+            {
+                RedisNearCacheTracing.RecordNotStored(activity, NotStoredReason(cacheable, ttlUnknown));
+            }
 
             return bytes;
+        }
+        catch (Exception ex)
+        {
+            // Recorded on the span and rethrown untouched - never swallowed, never wrapped. Nothing is counted here
+            // either: a serializer throw is counted where it is caught, and happens in GetAsync, outside this span.
+            RedisNearCacheTracing.RecordFailure(activity, ex);
+            throw;
         }
         finally
         {
             _inflight.End(key, token);
         }
     }
+
+    /// <summary>
+    /// Why a reply that arrived was not put in L1, for the read span. The order of the tests is the order the
+    /// condition on the store above ANDs them in, so the reason named is the first one that actually failed.
+    /// </summary>
+    private ReadNotStored NotStoredReason(bool cacheable, bool ttlUnknown) =>
+        !CachingEnabled ? ReadNotStored.CachingDisabled
+        : !cacheable ? ReadNotStored.OutsideKeyPrefixes
+        : ttlUnknown ? ReadNotStored.TtlUnknown
+        // Nothing else is left: the read went out while caching was off, so it carries no TTL to cap the entry by,
+        // and caching came back before the reply landed.
+        : ReadNotStored.CachingResumedMidRead;
 
     /// <summary>
     /// <c>MULTI</c> / <c>CLIENT CACHING NO</c> / <c>GET</c> / <c>EXEC</c>. If the node is not in OPTOUT mode (tracking
@@ -989,6 +1042,9 @@ internal sealed class RedisNearCache : IRedisNearCache
             // and its callbacks would keep this cache, its L1 and its multiplexer reachable.
             // Stop publishing before L1 goes, so no collection cycle can reach a disposed store.
             _metrics.Dispose();
+            // Same lifetime, same reason: an undisposed ActivitySource stays registered with every listener in the
+            // process. The armer above is already gone, so no arm can be starting a span on it now.
+            _tracing.Dispose();
             Statistics.DetachL1();
             Statistics.DetachFacade();
             _l1.Dispose();

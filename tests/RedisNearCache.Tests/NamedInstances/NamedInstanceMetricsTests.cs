@@ -31,6 +31,13 @@ public class NamedInstanceMetricsTests
             var copy = tags.ToArray();
             if (copy.Any(t => t.Key == ClientNameTag && (string?)t.Value == clientName)) tagSets.Add(copy);
         });
+        // The one double instrument (redisnearcache.pass_through.seconds) is otherwise never registered here, so
+        // its tag set - the same instance tags every other instrument carries - would go unchecked.
+        listener.SetMeasurementEventCallback<double>((_, _, tags, _) =>
+        {
+            var copy = tags.ToArray();
+            if (copy.Any(t => t.Key == ClientNameTag && (string?)t.Value == clientName)) tagSets.Add(copy);
+        });
         listener.Start();
         listener.RecordObservableInstruments();
         return tagSets;

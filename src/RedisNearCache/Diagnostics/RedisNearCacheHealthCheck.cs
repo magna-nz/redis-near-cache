@@ -75,8 +75,21 @@ public sealed class RedisNearCacheHealthCheck : IHealthCheck
     /// or <see cref="HealthStatus.Degraded"/> while the cache is in pass-through (reads still succeed against
     /// Redis directly). Never throws, never awaits Redis, and never inspects <see cref="IRedisNearCache.Ready"/>:
     /// it only reads the already-computed <see cref="IRedisNearCache.IsCoherent"/> flag and counters, so it is
-    /// safe to call even on a disposed cache (where <c>IsCoherent</c> is false and every counter reads its last
-    /// value, reporting Degraded).
+    /// safe to call even on a disposed cache, which reports Degraded.
+    /// <para>
+    /// A DISPOSED cache's <c>Data</c> is not simply its last reading, though. The plain counters keep their values
+    /// (<c>hits</c>, <c>misses</c>, <c>invalidations</c>, <c>flushes</c>, <c>rearms</c>, <c>raceDiscards</c>,
+    /// <c>serializerFailures</c>), because they are fields on <see cref="RedisNearCacheStatistics"/> that nothing
+    /// resets, and so does <c>lostEndpoints</c>, which the facade answers from its own set. The seven entries computed
+    /// by reading the cache's live state through <c>RedisNearCacheStatistics.AttachL1</c>/<c>AttachFacade</c> read
+    /// 0/false instead, because dispose detaches those readers rather than let them reach a disposed store or let
+    /// <c>passThroughSeconds</c> grow for the life of the process: <c>l1Entries</c>, <c>passThroughSeconds</c>,
+    /// <c>lostEndpointCount</c>, <c>ttlCapAbandoned</c>, <c>untrackedReadsUnavailable</c>, <c>l1StoreRefusals</c> and
+    /// <c>preArmFailures</c>. So a disposed cache reads as Degraded with nothing in those entries explaining why, and
+    /// <c>lostEndpointCount</c> can be 0 next to a non-empty <c>lostEndpoints</c>. That combination - Degraded,
+    /// zeroed - means "disposed", not "healthy but degraded", and it is why a live instance's numbers should be read
+    /// from a scrape taken before shutdown, not from the last one.
+    /// </para>
     /// </summary>
     /// <param name="context">The health check context. <see cref="HealthCheckRegistration.FailureStatus"/> is
     /// deliberately not consulted; see the type-level remarks.</param>

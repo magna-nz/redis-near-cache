@@ -480,12 +480,12 @@ public class ObservabilityTests
     // --- L1 refusal and pre-arm plumbing --------------------------------------------------------------------
 
     /// <summary>
-    /// The counter, the retained size limit and the clear epoch the refusal detection will be built on. The detection
-    /// itself is not here yet; what is asserted is that the pieces it needs exist and behave, and that nothing about
-    /// <c>Set</c> or <c>Clear</c> changed in adding them.
+    /// The plumbing the refusal detection in <c>L1Cache.Set</c> is built on: the counter and the retained size limit.
+    /// The detection itself is exercised by <see cref="L1CacheSizeAccountingTests"/>; what is asserted here is that
+    /// the pieces it needs exist and behave, and that nothing about <c>Set</c> or <c>Clear</c> changed in adding them.
     /// </summary>
     [Fact]
-    public void TheL1RefusalPlumbingCountsAndTheClearEpochMovesWithEveryClear()
+    public void TheL1RefusalPlumbingCountsAndSetAndClearStillBehave()
     {
         var options = new RedisNearCacheOptions();
         using var l1 = new Caching.L1Cache(options);
@@ -499,15 +499,15 @@ public class ObservabilityTests
         l1.CountStoreRefusal();
         Assert.Equal(2, l1.StoreRefusals);
 
-        // Set still stores, and Clear still empties: the plumbing is additive.
+        // Set still stores, and Clear still empties: the plumbing is additive. A second Clear of an empty cache is a
+        // no-op rather than anything the refusal check could notice.
         l1.Set(Key, [1, 2, 3]);
         Assert.True(l1.TryGet(Key, out _));
-        var epoch = l1.ClearEpoch;
         l1.Clear();
         Assert.False(l1.TryGet(Key, out _));
-        Assert.True(l1.ClearEpoch > epoch, "a flush must be visible to a store that samples the epoch either side of itself");
         l1.Clear();
-        Assert.Equal(epoch + 2, l1.ClearEpoch);
+        Assert.Equal(0, l1.Count);
+        Assert.Equal(2, l1.StoreRefusals);
     }
 
     [Fact]

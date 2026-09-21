@@ -62,8 +62,13 @@ internal sealed class RedisNearCacheMetrics : IDisposable
     private static readonly string[] RearmReasonNames = Array.ConvertAll(RearmReasons, r => Enum.GetName(r) ?? r.ToString());
     private static readonly string[] FlushReasonNames = Array.ConvertAll(FlushReasons, r => Enum.GetName(r) ?? r.ToString());
 
-    // Without the "+<commit sha>" a SourceLink build appends: it would only be noise in the instrumentation scope.
-    private static readonly string? MeterVersion =
+    /// <summary>
+    /// The package version, as the version of both instrumentation scopes: this <see cref="Meter"/> and
+    /// <see cref="RedisNearCacheTracing"/>'s <see cref="System.Diagnostics.ActivitySource"/>, which share a name and
+    /// must therefore share a version. Without the "+&lt;commit sha&gt;" a SourceLink build appends: it would only be
+    /// noise in the scope.
+    /// </summary>
+    internal static readonly string? InstrumentationVersion =
         typeof(RedisNearCacheMetrics).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0];
 
     private readonly Meter _meter;
@@ -80,7 +85,7 @@ internal sealed class RedisNearCacheMetrics : IDisposable
             : [new KeyValuePair<string, object?>(ClientNameTag, clientName), new KeyValuePair<string, object?>(InstanceTag, instanceName)];
         _rearmReasonTags = Array.ConvertAll(RearmReasonNames, TagsWithReason);
         _flushReasonTags = Array.ConvertAll(FlushReasonNames, TagsWithReason);
-        _meter = new Meter(MeterName, MeterVersion);
+        _meter = new Meter(MeterName, InstrumentationVersion);
 
         _meter.CreateObservableCounter("redisnearcache.hits", () => Observe(() => statistics.Hits),
             "{read}", "Reads served from L1 without touching Redis.");

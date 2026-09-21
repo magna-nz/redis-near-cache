@@ -98,10 +98,17 @@ public class L1ConfigurationTests
                 Assert.False(cache.TryGetLocal<string>(key, out _), $"read {i + 1}: a value larger than the whole byte budget must never enter L1.");
             }
 
+            // A value too big for the whole budget is refused BY DESIGN (L1Cache.SizeLimit's remarks): that is not
+            // the MemoryCache size-accounting drift redisnearcache.l1.store_refusals exists to surface, so it must
+            // not be counted as one. This is the deterministic, non-flaky half of that counter's coverage; the
+            // drift bug itself needs a write storm and is already covered by Chaos/L1SizeAccountingStormTests.
+            Assert.Equal(0, cache.Statistics.L1StoreRefusals);
+
             // A value that does fit still caches, so the oversized one did not poison the budget.
             var small = TestHelpers.Key("size-bytes-small");
             await cache.SetAsync(small, "v1");
             Assert.True(await TestHelpers.ReadUntilCachedAsync(cache, small, "v1"), "a value within the budget must still be cached.");
+            Assert.Equal(0, cache.Statistics.L1StoreRefusals);
         }
         finally
         {
