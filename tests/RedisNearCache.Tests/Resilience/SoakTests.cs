@@ -16,7 +16,9 @@ namespace RedisNearCache.Tests.Resilience;
 /// </summary>
 /// <remarks>
 /// Tagged <c>Soak</c> and excluded from the normal CI filter. It runs for <c>RNC_SOAK_SECONDS</c> seconds
-/// (default 30, so it is usable locally as a smoke test); the manual CI job sets 1800.
+/// (default 30, so it is usable locally as a smoke test); the nightly run against main in <c>soak.yml</c> and the
+/// dispatchable job in <c>ci.yml</c> both set 1800. Neither did until 2026-09-21 - the comment claimed 1800 while
+/// nothing set the variable, so every CI soak until then was a 30-second smoke test.
 /// <c>FLUSHDB</c> wipes the whole standalone database, hence the named collection - the assembly already
 /// disables parallelization, but the intent should survive that changing.
 /// </remarks>
