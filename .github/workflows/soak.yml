@@ -1,0 +1,71 @@
+name: soak
+
+# The soak hunts bugs whose probability per event is small - one missed re-arm in a few hundred, one read that
+# stores its reply on the wrong side of an invalidation - so it is a poor gate and a good canary. On every PR it
+# would either double the wall clock or be shortened until it detects nothing; here it runs nightly against main,
+# where a rare regression surfaces within a day of merging and is still pre-release.
+#
+# Deliberately a separate workflow rather than a fifth trigger on ci.yml: that file's jobs are guarded by
+# github.event_name, and "publishing a Release is the only way to ship" is an invariant worth leaving undisturbed.
+#
+# 03:17 rather than midnight: GitHub delays scheduled runs under load, and 0 0 * * * is the most contended cron
+# on the platform.
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: How long to soak for, in seconds (default 1800)
+        required: false
+        default: '1800'
+
+permissions:
+  contents: read
+
+# A soak that overruns must not have the next night's run pile up behind it.
+concurrency:
+  group: soak
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: soak against main
+    runs-on: ubuntu-latest
+    # 30 minutes of soak plus containers and a Release build; generous enough for a dispatched longer run, and
+    # still a backstop against a hang burning hours.
+    timeout-minutes: 180
+    steps:
+      # schedule always runs the default branch's workflow file and checks out the default branch, but say so
+      # explicitly: a dispatched run from another branch should still soak main, which is what this is for.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-dotnet@v4
+        with:
+          # tests/RedisNearCache.Tests is single-target net10.0, unlike the multi-targeted unit tests.
+          dotnet-version: 10.0.x
+      - name: Start Redis (standalone, replica, TLS, cluster, Sentinel, managed-style, auth/ACL/mTLS)
+        run: ./up.sh
+      - name: Build
+        run: dotnet build -c Release -nologo
+      - name: Soak
+        env:
+          # Without this the test falls back to its 30-second local-smoke-test default, which detects almost
+          # nothing of what it exists to find.
+          RNC_SOAK_SECONDS: ${{ github.event.inputs.seconds || '1800' }}
+        run: dotnet test tests/RedisNearCache.Tests -c Release --no-build -nologo --filter "Category=Soak" --logger "trx;LogFileName=soak.trx"
+      - name: Check the suite ran
+        if: always()
+        run: .github/scripts/check-suites-ran.sh tests/RedisNearCache.Tests/TestResults/soak.trx Resilience=1
+      # A probabilistic failure is worth nothing without the evidence: the run that catches a one-in-a-few-hundred
+      # event is the only chance to diagnose it, and the trx carries the test's own output (read counts, kills,
+      # staleness) which the console log discards on a pass.
+      - name: Container logs
+        if: failure()
+        run: docker logs --tail 300 redis-near-cache-redis
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-test-results
+          path: tests/RedisNearCache.Tests/TestResults/*.trx
