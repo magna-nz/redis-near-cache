@@ -96,6 +96,93 @@ public class L1CacheSizeAccountingTests
         if (ReadSize(l1) is { } size) Assert.Equal(1, size);
     }
 
+    // --- Set's own store-refusal detection (StoreRefusals) ---------------------------------------------------
+
+    /// <summary>
+    /// A genuine refusal: with an entry-count budget of 1, MemoryCache's overcapacity compaction rounds
+    /// <c>1 * CompactionPercentage</c> down to 0 entries to evict, so a second distinct key is refused outright
+    /// (the first key survives untouched) rather than evicted to make room. Deterministic on both net8.0 and
+    /// net10.0 (checked directly against MemoryCache before writing this test).
+    /// </summary>
+    [Fact]
+    public void ARefusedStoreIsCounted()
+    {
+        using var l1 = new L1Cache(new RedisNearCacheOptions { L1SizeLimit = 1 });
+        l1.Set("a", [1]);
+        Assert.Equal(0, l1.StoreRefusals);
+
+        l1.Set("b", [2]);
+
+        Assert.True(l1.TryGet("a", out _), "the first key must still be there for this to be a refusal rather than an eviction.");
+        Assert.False(l1.TryGet("b", out _), "the second key must have been refused for the counter assertion to mean anything.");
+        Assert.Equal(1, l1.StoreRefusals);
+    }
+
+    /// <summary>
+    /// The same genuine refusal as <see cref="ARefusedStoreIsCounted"/>, but on an entry whose own lifetime is shorter
+    /// than <c>L1Cache.RefusalCheckMinLifetime</c>. <c>Set</c>'s presence check cannot tell "refused" from "expired
+    /// between the store and the check one statement later" - a preemption longer than 2 ms is all it takes - so such
+    /// an entry is not checked at all and nothing is counted. An entry whose lifetime is above the threshold still is:
+    /// the guard is about lifetimes too short to be distinguishable, not about capped entries in general.
+    /// </summary>
+    [Fact]
+    public void ARefusedStoreTooShortLivedToTellFromAnExpiryIsNotCounted()
+    {
+        using var l1 = new L1Cache(new RedisNearCacheOptions { L1SizeLimit = 1 });
+        l1.Set("a", [1]);
+        Assert.Equal(0, l1.StoreRefusals);
+
+        l1.Set("short", [2], TimeSpan.FromMilliseconds(2));
+
+        Assert.True(l1.TryGet("a", out _), "the first key must still be there for this to be a refusal rather than an eviction.");
+        Assert.False(l1.TryGet("short", out _), "the store must have been refused for the counter assertion to mean anything.");
+        Assert.Equal(0, l1.StoreRefusals);
+
+        // Identical refusal, a lifetime that cannot plausibly expire inside the check: counted.
+        l1.Set("long", [3], TimeSpan.FromSeconds(30));
+
+        Assert.False(l1.TryGet("long", out _));
+        Assert.Equal(1, l1.StoreRefusals);
+    }
+
+    /// <summary>
+    /// Documented behaviour (see <see cref="L1CacheTests.SizeLimitBytesRefusesAValueBiggerThanTheWholeBudget"/> and
+    /// <c>L1ConfigurationTests</c> in the integration suite): a value that alone cannot fit the whole byte budget is
+    /// refused by design, not a symptom of the size-accounting drift bug, and must not inflate the counter.
+    /// </summary>
+    [Fact]
+    public void AValueBiggerThanTheWholeByteBudgetIsNotCountedAsARefusal()
+    {
+        using var l1 = new L1Cache(new RedisNearCacheOptions { L1SizeLimitBytes = 100 });
+
+        l1.Set("big", new byte[101]);
+
+        Assert.False(l1.TryGet("big", out _));
+        Assert.Equal(0, l1.StoreRefusals);
+    }
+
+    /// <summary>
+    /// <see cref="L1Cache.Clear"/> takes every stripe around <c>MemoryCache.Clear</c>, which is what makes
+    /// <c>Set</c>'s store and its own presence check atomic with respect to a flush. Without that, a store that landed
+    /// in the state the clear is about to swap away would find itself missing and be misread as a refusal. With a
+    /// generous budget (no genuine refusal is possible) and continuous concurrent stores and clears, any refusal at
+    /// all proves those locks are missing or wrong.
+    /// </summary>
+    [Fact]
+    public async Task AClearRacingAStoreIsNotCountedAsARefusal()
+    {
+        using var l1 = new L1Cache(new RedisNearCacheOptions { L1SizeLimit = 10_000 });
+        var stop = DateTime.UtcNow.AddMilliseconds(500);
+
+        var keys = Enumerable.Range(0, 12).Select(i => "k" + i).ToArray();
+        var rnd = new Random();
+        var setter = Task.Run(() => { while (DateTime.UtcNow < stop) l1.Set(keys[rnd.Next(keys.Length)], [1, 2, 3]); });
+        var clearer = Task.Run(async () => { while (DateTime.UtcNow < stop) { l1.Clear(); await Task.Delay(5); } });
+        await Task.WhenAll(setter, clearer);
+
+        Assert.Equal(0, l1.StoreRefusals);
+    }
+
     /// <summary>
     /// <c>MemoryCache.Size</c> is internal. Null when it cannot be read (a renamed member in a later package), in
     /// which case the behavioural assertions still stand on their own.

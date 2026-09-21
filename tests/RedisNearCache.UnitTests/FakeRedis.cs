@@ -243,6 +243,23 @@ internal sealed class FakeMultiplexer
     /// <summary>When set, the typed TTL (the facade's fallback when the raw PTTL fails) faults with this exception.</summary>
     public Exception? TypedTtlFailure { get; set; }
 
+    /// <summary>
+    /// When set, the <c>EXEC</c> of the untracked read's <c>MULTI</c>/<c>CLIENT CACHING NO</c>/<c>GET</c>/<c>EXEC</c>
+    /// faults with this exception. A <see cref="RedisServerException"/> here is the EXECABORT a server that will not
+    /// even queue <c>CLIENT CACHING</c> answers with (an ACL without it, a proxy).
+    /// </summary>
+    public Exception? ExecFailure { get; set; }
+
+    /// <summary>
+    /// When false, the <c>EXEC</c> reports that the transaction did not run, which sends the facade to a plain
+    /// tracked GET without latching anything.
+    /// </summary>
+    public bool ExecSucceeds { get; set; } = true;
+
+    /// <summary>How many transactions the untracked read path has opened.</summary>
+    public int TransactionCalls => Volatile.Read(ref _transactionCalls);
+    private int _transactionCalls;
+
     /// <summary>How many typed TTL calls the fake has answered (or faulted).</summary>
     public int TypedTtlCalls => Volatile.Read(ref _typedTtlCalls);
     private int _typedTtlCalls;
@@ -339,8 +356,37 @@ internal sealed class FakeMultiplexer
                 Interlocked.Increment(ref _typedTtlCalls);
                 if (TypedTtlFailure is { } typedFailure) return Task.FromException<TimeSpan?>(typedFailure);
                 return Task.FromResult<TimeSpan?>(StoredTtlMilliseconds < 0 ? null : TimeSpan.FromMilliseconds(StoredTtlMilliseconds));
+            // The untracked read of a key outside KeyPrefixes: MULTI / CLIENT CACHING NO / GET / EXEC. Modelled only
+            // as far as that path needs - the queued commands answer as they would inside a transaction that ran.
+            case "CreateTransaction":
+                Interlocked.Increment(ref _transactionCalls);
+                return FakeProxy.Create<ITransaction>(HandleTransaction);
             default:
                 throw new NotSupportedException($"IDatabase.{method.Name} is not modelled by the fake");
+        }
+    }
+
+    /// <summary>
+    /// The transaction the untracked read builds. <c>ExecuteAsync()</c> with a single <c>CommandFlags</c> argument is
+    /// the <c>EXEC</c>; <c>ExecuteAsync(command, args)</c> is a queued command, which answers OK. The GET answers the
+    /// one stored value, as outside a transaction, and is counted with the others so an untracked read still shows up
+    /// in <see cref="StringGetCalls"/>.
+    /// </summary>
+    private object? HandleTransaction(MethodInfo method, object?[] args)
+    {
+        switch (method.Name)
+        {
+            case "ExecuteAsync" when args.Length == 1:
+                if (ExecFailure is { } execFailure) return Task.FromException<bool>(execFailure);
+                return Task.FromResult(ExecSucceeds);
+            case "ExecuteAsync":
+                return Task.FromResult(RedisResult.Create((RedisValue)"OK"));
+            case "StringGetAsync" when args.Length > 0 && args[0] is RedisKey readKey:
+                Interlocked.Increment(ref _stringGetCalls);
+                _stringGetCallsByKey.AddOrUpdate(readKey.ToString(), 1, static (_, calls) => calls + 1);
+                return Task.FromResult(StoredValue);
+            default:
+                throw new NotSupportedException($"ITransaction.{method.Name} is not modelled by the fake");
         }
     }
 }

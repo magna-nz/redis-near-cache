@@ -1,9 +1,11 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
 using Microsoft.Extensions.Logging;
+using RedisNearCache.Caching;
 using RedisNearCache.Internal;
 using StackExchange.Redis;
 
@@ -153,6 +155,16 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
     internal IReadOnlyList<string> Prefixes => _prefixes;
 
     /// <summary>
+    /// The span source of the cache this tracker belongs to, or null. Attached by the facade after construction
+    /// (<see cref="AttachTracing"/>) rather than injected, because the tracker is built first. Null while a tracker is
+    /// driven without a facade (tests, diagnostics): arming must not depend on it.
+    /// </summary>
+    private RedisNearCacheTracing? _tracing;
+
+    /// <summary>Hands the tracker the tracing of the cache that owns it; see <see cref="_tracing"/>.</summary>
+    public void AttachTracing(RedisNearCacheTracing tracing) => _tracing = tracing;
+
+    /// <summary>
     /// How many times a live broadcast socket has been re-authenticated in place after the configuration handed
     /// out a rotated credential. Cumulative over every socket this tracker has armed, and never reset, so a socket
     /// that is replaced does not take its count with it.
@@ -277,6 +289,14 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
     /// <remarks>Always empty: a broadcast socket tracks for itself, so there is nothing to pre-arm on a replica.</remarks>
     public IReadOnlyDictionary<EndPoint, long> ReplicaRedirectTargets => NoReplicas;
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// Always 0: broadcast mode never pre-arms a replica. There is no redirect target to point ahead of time - a
+    /// broadcast socket tracks for itself - so there is no pre-arm that could fail, and a promotion is answered by
+    /// the sweep arming the new master's own socket.
+    /// </remarks>
+    public long PreArmFailures => 0;
+
     // --- arming ---------------------------------------------------------------------------------------
 
     /// <summary>
@@ -389,6 +409,14 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
         using var handshake = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         handshake.CancelAfter(handshakeTimeout);
         var token = handshake.Token;
+        // The same span, name and attributes as the REDIRECT armer's, so a trace query need not know the mode. It
+        // covers exactly the arm on this socket - the handshake, CLIENT TRACKING ON BCAST and the TRACKINGINFO that
+        // verifies it - and ends BEFORE Publish below, which raises Armed under the lifecycle lock and runs the
+        // facade's flush handler: the invariant is that no flush handler ever runs with this span current. One span per
+        // ATTEMPT, as in REDIRECT mode, so the retry ladder above shows up as several. Nothing on a timer is traced:
+        // no span on the reconcile sweep, none on the keepalive PING. rnc.redirect_client_id is omitted - a BCAST
+        // socket tracks for itself, so there is no redirect target to report.
+        var activity = _tracing?.StartArm(endPoint, reason);
         try
         {
             // Read once, here, and remembered on the socket: the configuration can hand out a different credential
@@ -444,7 +472,16 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
 
             var flags = info is null ? ["on", "bcast", "(unverified)"] : ReadFlags(info);
             if (!flags.Contains("on", StringComparer.OrdinalIgnoreCase) || !flags.Contains("bcast", StringComparer.OrdinalIgnoreCase))
+            {
+                // The same span status the REDIRECT armer records for an arm the server would not confirm.
+                RedisNearCacheTracing.RecordArmNotVerified(activity);
                 throw new RedisNearCacheTrackingException($"CLIENT TRACKINGINFO on {endPoint} reported flags [{string.Join(",", flags)}], expected 'on' and 'bcast'.");
+            }
+
+            // The arm is done and verified: close the span here, so Publish (which raises Armed, and with it the
+            // facade's flush) never runs with it current. The finally below closes it on every failure path instead.
+            activity?.Dispose();
+            activity = null;
 
             published = Publish(endPoint, socket, generation, reason);
             if (!published)
@@ -462,10 +499,21 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            throw new TimeoutException($"The broadcast socket to {endPoint} did not complete the tracking handshake within {handshakeTimeout} ms.");
+            var timedOut = new TimeoutException($"The broadcast socket to {endPoint} did not complete the tracking handshake within {handshakeTimeout} ms.");
+            RedisNearCacheTracing.RecordFailure(activity, timedOut);
+            throw timedOut;
+        }
+        catch (Exception ex)
+        {
+            // Recorded and rethrown untouched: the retry ladder in ArmWithRetryAsync is what decides what happens
+            // next. Left alone when the verification above already recorded a more specific status.
+            if (activity?.Status != ActivityStatusCode.Error) RedisNearCacheTracing.RecordFailure(activity, ex);
+            throw;
         }
         finally
         {
+            // Null already if the arm was verified and the span closed before Publish; still open on every other path.
+            activity?.Dispose();
             if (!published) await DisposeSocketAsync(socket).ConfigureAwait(false);
         }
     }

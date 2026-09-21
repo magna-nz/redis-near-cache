@@ -15,6 +15,7 @@ public class NamedInstanceMetricsTests
 {
     private const string ClientNameTag = "rnc.client_name";
     private const string InstanceTag = "rnc.instance";
+    private const string ReasonTag = "reason";
 
     /// <summary>The tag set of every measurement published for one client name, one per instrument.</summary>
     private static List<KeyValuePair<string, object?>[]> TagSetsFor(string clientName)
@@ -26,6 +27,13 @@ public class NamedInstanceMetricsTests
             if (instrument.Meter.Name == RedisNearCacheStatistics.MeterName) l.EnableMeasurementEvents(instrument);
         };
         listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            var copy = tags.ToArray();
+            if (copy.Any(t => t.Key == ClientNameTag && (string?)t.Value == clientName)) tagSets.Add(copy);
+        });
+        // The one double instrument (redisnearcache.pass_through.seconds) is otherwise never registered here, so
+        // its tag set - the same instance tags every other instrument carries - would go unchecked.
+        listener.SetMeasurementEventCallback<double>((_, _, tags, _) =>
         {
             var copy = tags.ToArray();
             if (copy.Any(t => t.Key == ClientNameTag && (string?)t.Value == clientName)) tagSets.Add(copy);
@@ -66,17 +74,21 @@ public class NamedInstanceMetricsTests
             Assert.NotEmpty(namedTagSets);
             Assert.NotEmpty(defaultTagSets);
 
+            // The INSTANCE-identifying tags are what this test is about, so the per-reason breakdown tag carried by
+            // redisnearcache.flushes and redisnearcache.rearms is excluded from the comparison: it varies per
+            // measurement, not per instance. That it appears at all, and only on those two, is asserted by the unit
+            // twin (NamedInstanceMetricsTagTests).
             foreach (var tags in namedTagSets)
             {
                 Assert.Equal(
                     new[] { ClientNameTag, InstanceTag },
-                    tags.Select(t => t.Key).OrderBy(k => k, StringComparer.Ordinal).ToArray());
+                    tags.Select(t => t.Key).Where(k => k != ReasonTag).OrderBy(k => k, StringComparer.Ordinal).ToArray());
                 Assert.Equal("a", (string?)tags.Single(t => t.Key == InstanceTag).Value);
             }
 
             foreach (var tags in defaultTagSets)
             {
-                Assert.Equal(new[] { ClientNameTag }, tags.Select(t => t.Key).ToArray());
+                Assert.Equal(new[] { ClientNameTag }, tags.Select(t => t.Key).Where(k => k != ReasonTag).ToArray());
                 Assert.DoesNotContain(tags, t => t.Key == InstanceTag);
             }
         }

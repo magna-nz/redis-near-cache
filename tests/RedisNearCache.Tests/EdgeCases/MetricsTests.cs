@@ -17,7 +17,17 @@ public class MetricsTests
 
     public MetricsTests(ITestOutputHelper output) => _out = output;
 
-    /// <summary>One round of observable measurements for one cache instance, keyed by instrument name.</summary>
+    /// <summary>
+    /// One round of observable measurements for one cache instance, keyed by instrument name and SUMMED over the
+    /// remaining tags.
+    /// </summary>
+    /// <remarks>
+    /// Summed, not assigned, because <c>redisnearcache.flushes</c> and <c>redisnearcache.rearms</c> report one
+    /// measurement per <c>reason</c>: assigning would keep whichever reason the collector happened to see last, so a
+    /// real flush would read as 0 and the assertions below would pass while measuring nothing. The sum over the
+    /// reason tag is the instrument's total, which is what those assertions are about. Every other instrument emits a
+    /// single measurement per cycle, so summing leaves it unchanged.
+    /// </remarks>
     private static Dictionary<string, long> Collect(string clientName)
     {
         var collected = new Dictionary<string, long>();
@@ -30,7 +40,9 @@ public class MetricsTests
         {
             foreach (var tag in tags)
             {
-                if (tag.Key == ClientNameTag && (string?)tag.Value == clientName) collected[instrument.Name] = value;
+                if (tag.Key != ClientNameTag || (string?)tag.Value != clientName) continue;
+                collected[instrument.Name] = collected.GetValueOrDefault(instrument.Name) + value;
+                break;
             }
         });
         listener.Start();

@@ -28,6 +28,7 @@ public class LostEndpointGateTests
 
         public IReadOnlyDictionary<EndPoint, long> RedirectTargets { get; } = new Dictionary<EndPoint, long>();
         public IReadOnlyDictionary<EndPoint, long> ReplicaRedirectTargets { get; } = new Dictionary<EndPoint, long>();
+        public long PreArmFailures => 0;
 
         public void RaiseArmed(EndPoint endPoint, ArmReason reason = ArmReason.InteractiveRestored) =>
             Armed?.Invoke(new TrackingArmedEvent(endPoint, 1, reason));

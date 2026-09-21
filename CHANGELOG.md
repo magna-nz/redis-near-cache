@@ -1,5 +1,76 @@
 # Changelog
 
+## 1.7.0 (2026-09-21)
+
+- Feature: `redisnearcache.flushes` and `redisnearcache.rearms` now carry a `reason` tag and emit one series per
+  reason (5 for `flushes` - `ServerFlush`, `Rearm`, `TrackingLost`, `EndpointRemoved`, `Manual`; 7 for `rearms` -
+  `InteractiveRestored`, `SubscriptionRestored`, `Manual`, `TopologyChanged`, `Recovered`, `VerificationFailed`,
+  `PushConnectionRestored`) instead of one. Summed across `reason` the totals are numerically identical to
+  before, so a dashboard aggregating with `sum`/`rate` is unaffected; a dashboard that assumed exactly one series
+  per `rnc.client_name` for either instrument will now see several and needs a `sum by (rnc.client_name)` (or
+  equivalent) added. `ArmReason.Initial` and `ArmReason.Promoted` do not appear on `rearms`: they are arms, not
+  re-arms, and were never counted towards `Statistics.Rearms` either.
+- Feature: seven new instruments on the `RedisNearCache` meter: `redisnearcache.pass_through.seconds` (gauge,
+  `s`, 0 while coherent, otherwise seconds since coherence was lost, counted from construction so an instance
+  that never manages its first arm reports a growing duration instead of looking healthy),
+  `redisnearcache.endpoints.lost` (gauge, masters whose tracking is currently lost),
+  `redisnearcache.ttl_cap.abandoned` and `redisnearcache.untracked_reads.unavailable` (gauges, 0/1, the
+  `RespectServerTtl` and `CLIENT CACHING NO`-in-a-transaction latches, previously logged once and then invisible
+  for the life of the process), `redisnearcache.serializer_failures` (counter; the exception still reaches the
+  caller unchanged), `redisnearcache.l1.store_refusals` (counter; stores `MemoryCache` refused for a reason other
+  than the value alone exceeding the size budget - it cannot distinguish that from the `MemoryCache` size-drift
+  bug documented on `L1Cache`, so a non-zero reading is a symptom to investigate, not a diagnosis on its own) and
+  `redisnearcache.prearm_failures` (counter; failed attempts to pre-arm a replica ahead of a failover). Matching
+  new properties on `RedisNearCacheStatistics`; see DESIGN.md's Observability section for why none of this adds
+  a write to the read path.
+- Feature: the health check's `Data` grew from 8 keys to 15 (one per `Statistics` member above), plus a 16th,
+  `lostEndpoints` (the lost endpoints' addresses, comma-joined), present only when the health check is wired to
+  this library's own cache and absent for a caller's own `IRedisNearCache` implementation. `Healthy`/`Degraded`
+  semantics are unchanged; the check still never returns `Unhealthy`.
+- `RedisNearCacheStatistics.ToString()` gained the new fields, appended after the existing ones; the documented
+  prefix (`hits=... misses=... invalidations=...`) is unchanged.
+- Replica pre-arm failures are now visible instead of Debug-only. A failed attempt to establish a pre-arm is
+  counted (`redisnearcache.prearm_failures`) and logged at Warning once per endpoint, the latch clearing when that
+  endpoint recovers so a later genuine failure is reported again. The per-sweep lines stay at Debug deliberately:
+  the pre-arm sweep runs every 5 seconds for the life of the process, so anything that repeats per sweep must not
+  be a warning. Losing an existing pre-arm (a connection to a pre-armed replica failing) moved from Debug to
+  Information, and is not counted as a failure - the pre-arm succeeded, and the next sweep re-arms it.
+- Fix: a replica with no visible subscriber connection now warns only after 3 consecutive sweeps, at Debug before
+  that, rather than on the first. That warning carries proxy/ACL remediation advice, and a healthy replica whose
+  subscriber connection simply has not appeared yet - or one that is flapping - was being handed advice that did
+  not apply to it. Every sweep is still counted.
+- Fix: the periodic re-check of an ALREADY pre-armed replica no longer counts as a pre-arm failure. It runs
+  `ROLE` every sweep, so against a server that restricts that command (a proxy, or a least-privilege ACL)
+  `redisnearcache.prearm_failures` climbed every 5 seconds for the life of the process while the replica was in
+  fact armed and healthy.
+- Feature: tracing. A `System.Diagnostics.ActivitySource` named `RedisNearCache` (`RedisNearCacheStatistics.ActivitySourceName`,
+  the same string as `MeterName` - one instrumentation scope for both), one per cache instance, disposed with it.
+  Two spans: `redisnearcache.read` around the Redis round trip of a MISS (an L1 hit starts no span, and does not
+  even call `StartActivity`), and `redisnearcache.arm` around arming one endpoint (initial arm and every re-arm,
+  distinguished by an `rnc.arm_reason` attribute). Attributes: `rnc.client_name`, `rnc.instance` on every span;
+  `rnc.key`, `rnc.stored`, `rnc.not_stored_reason` on the read span; `rnc.endpoint`, `rnc.arm_reason`,
+  `rnc.redirect_client_id` on the arm span. The arm span is raised in BOTH tracking modes; in `Broadcast`, which
+  has no redirect target, `rnc.redirect_client_id` is omitted rather than given a placeholder, and one span is
+  raised per attempt so `Broadcast`'s retry ladder shows as several. No flush span - a flush stays visible only through
+  `redisnearcache.flushes`/`reason`, as documented in DESIGN.md's Observability section. Wire it up with
+  `.WithTracing(t => t.AddSource(RedisNearCacheStatistics.ActivitySourceName))` alongside the existing
+  `AddMeter(RedisNearCacheStatistics.MeterName)`.
+- Fix: `L1Cache.Clear()` now takes every stripe lock, in index order, around `MemoryCache.Clear()`, instead of
+  none. `Set`'s store-refusal check asks whether the entry it just stored is still present; without this, a
+  flush interleaving between that store and its check could empty the cache and be counted as a silent refusal
+  that never happened, inflating `redisnearcache.l1.store_refusals`/`Statistics.L1StoreRefusals`. Holding the
+  stripes makes the store and its check atomic against a flush. Cost: 64 uncontended monitors on a path that
+  already replaces the backing collection - a flush now waits for stores in flight and a store waits for the
+  clear's walk of the detached old state; both are bounded, and a flush is rare next to a per-miss store. See
+  DESIGN.md's L1 locking section for the deadlock-freedom argument.
+- Docs: DESIGN.md documents the limits of `Statistics.L1StoreRefusals`/`redisnearcache.l1.store_refusals` more
+  precisely: it cannot tell the `MemoryCache` size-accounting drift bug (dotnet/runtime#129186) apart from a byte
+  budget that is legitimately full with compaction lagging, so under a tight `L1SizeLimitBytes` with churn a
+  non-zero reading can be entirely benign - treat it as a symptom to investigate, not a diagnosis on its own.
+- `RedisNearCacheHealthCheck.Registration(name?, serviceKey?, tags?)`: builds a ready-made `HealthCheckRegistration`
+  for the `IHealthChecksBuilder` you already have, including for a cache registered with
+  `AddKeyedRedisNearCache` (`services.AddHealthChecks().Add(RedisNearCacheHealthCheck.Registration(serviceKey: "orders"))`).
+
 ## 1.6.0 (2026-09-20)
 
 - Fix: on a deployment with more than one master, the cache could store a value that nothing was tracking for the

@@ -136,6 +136,33 @@ reader between the remove and the set misses (and counts a miss) where it used t
 package reference is only a lower bound, and an ASP.NET Core 9/10 application resolves its own 9.x/10.x build, so
 the workaround stays until the package floor contains the fix; the storm tests fail at once if it is removed early.
 
+**`L1Cache.Clear` takes every stripe too, in index order, around `MemoryCache.Clear()`.** `Set`'s refusal check
+(above) asks whether the entry it just stored is still there; `MemoryCache.Clear()` swaps out the whole backing
+collection, so a flush landing between that store and that check would empty the cache and read as a silent
+refusal that never happened. Holding every stripe for the clear makes the store and its check atomic with respect
+to a flush, which is what keeps the refusal counter exact. The cost is 64 uncontended monitors on a path that
+already replaces the backing collection: a flush now waits for any store in flight (nothing under a stripe does
+I/O, awaits, or runs a callback - `MemoryCache` has none registered), and a store waits for `Clear`'s walk of the
+detached old state. That is a new coupling between the invalidation/push thread and L1 size, but a bounded one,
+and rare - a flush is a re-arm, an endpoint removal or a server flush, where a store is per miss. Deadlock-free:
+`Set` and `Remove` each take exactly one stripe and never call into `Clear`; `Clear` takes them in one fixed
+order; there is no cycle to construct.
+
+**The refusal counter's limits.** `L1Cache.StoreRefusals` cannot tell the size-accounting drift above apart from
+a legitimate refusal at the point of the `Set` that was refused: a byte budget genuinely full, with compaction
+not yet caught up, looks identical. Under a tight `L1SizeLimitBytes` with churn, a non-zero count can therefore
+be entirely benign. The only reliable way to tell them apart is the internal size total, reachable only by
+reflection, which this deliberately does not use - so treat a non-zero reading as a symptom to investigate, not
+a diagnosis on its own.
+
+It under-counts in the other direction as well, deliberately: `Set` does not look for a refusal at all when the
+entry's own lifetime is under 50 ms, because an entry that EXPIRED between the store and the presence check one
+statement later cannot be told from one that was refused. That costs nothing real - `L1MaxAge` is minutes by
+default, and a `RespectServerTtl` cap landing under 50 ms is a key about to vanish anyway - and it is the cheaper
+error: a counter that ticks over every short-lived entry is worse than useless. A pause longer than the lifetime
+of an entry just ABOVE the threshold can still be miscounted, and nothing short of `MemoryCache` reporting why a
+`Set` did not take would close that.
+
 **Multi-key reads.** `GetManyAsync<T>`/`GetManyBytesAsync` (`Abstractions/Internal/ManyReads.cs`) are the read
 path above run once per distinct key, all started before any is awaited, so the misses pipeline onto one round
 trip per node - not an `MGET`. An `MGET` would need the in-flight check, the TTL cap and its fallbacks,
@@ -357,23 +384,109 @@ provider yields another, and a connection the server closes at expiry is an ordi
 ## Observability
 
 Statistics, metrics and the health check all read existing state; none of them add cost to the read or
-invalidation path.
+invalidation path. Tracing is the exception on one path only: a MISS now starts a span. An L1 hit and every
+invalidation/flush still add nothing - see below.
 
 - **Metrics are observable instruments, not counters updated on the hot path.** A `System.Diagnostics.Metrics`
   `Meter` named `RedisNearCache` (`RedisNearCacheStatistics.MeterName`) exposes the same counters as
-  `Statistics` plus L1 entry count and coherence as gauges, but every instrument is read from `Statistics` or
-  `L1Cache` only when something collects (an OpenTelemetry exporter, `dotnet-counters`). `GetAsync`, `SetAsync`
-  and the invalidation handlers touch nothing metrics-related.
+  `Statistics` plus gauges for L1 entry count, coherence, pass-through duration, lost-endpoint count and two
+  latched flags (`RespectServerTtl` abandonment, untracked-reads unavailability), but every instrument is read
+  from `Statistics`, `L1Cache` or the armer only when something collects (an OpenTelemetry exporter,
+  `dotnet-counters`). `GetAsync`, `SetAsync` and the invalidation handlers touch nothing metrics-related. Where
+  a new signal needed a count at all (a serializer throwing, an L1 store refusal, a failed replica pre-arm),
+  the increment sits on a path that was already a failure path - an `Interlocked` bump inside a `catch` that
+  rethrows, or beside a warning that was already being logged - never a new write on the read path.
+  "A failed replica pre-arm" means a failed attempt to ESTABLISH one, and nothing else: the periodic re-check of
+  an already pre-armed replica is not counted, however it fails. It runs `ROLE` every sweep, so on a server that
+  restricts that command - a proxy, or a least-privilege ACL - counting it would report a permanent, growing
+  pre-arm failure against a replica that is in fact armed and healthy.
 - **One `Meter` per cache instance, tagged `rnc.client_name`.** The cache already owns a unique client name
   per instance (`{ClientNamePrefix}-{guid}`); reusing it as a tag, rather than sharing one process-wide
   `Meter`, is what keeps several `IRedisNearCache` instances in one process (two providers, or tests) distinct
   in an exported series without extra configuration. The `Meter` is disposed with the cache, same lifetime as
   everything else it owns.
+- **`redisnearcache.flushes` and `redisnearcache.rearms` carry a `reason` tag, one measurement per reason on
+  every collection, zeros included.** The reasons are closed enums (`FlushReason`; the re-arm-causing subset of
+  `ArmReason`), so the cardinality this adds is fixed and small - unlike an endpoint address, which is why no
+  instrument here is tagged with one (see below). Zeros are emitted rather than letting the series disappear
+  when a reason has never fired: an instrument that vanishes reads on a dashboard as a broken exporter, not as
+  nothing having gone wrong. `ArmReason.Initial` and `ArmReason.Promoted` are excluded from the `rearms`
+  breakdown - they are arms but never re-arms, so a permanent 0 next to them would suggest a re-arm reason that
+  simply never fires, which is not the same thing as one that has not fired yet. Summed over the `reason` tag,
+  each total is unchanged from before the breakdown existed.
+- **Endpoint addresses appear in the health check's `Data` and in logs, never in a metric tag.** An address is
+  unbounded cardinality - as many series as the deployment has ever had endpoints - unlike the closed `reason`
+  tag above or the per-instance `rnc.client_name`/`rnc.instance` tags. `RedisNearCacheStatistics.LostEndpointCount`
+  is the number of endpoints currently lost; only the concrete `RedisNearCache` facade can also name them, which
+  is why the health check's `lostEndpoints` key is present only over the library's own cache instance and absent
+  for a caller's own `IRedisNearCache` implementation, rather than reported as an empty string that would read
+  as "nothing is lost".
 - **The health check reports `Degraded`, not `Unhealthy`, when not coherent.** Pass-through is a real state,
   not a failure one: reads still succeed, served straight from Redis, exactly as `IsCoherent` documents.
   `Unhealthy` would tell an orchestrator to stop routing traffic or restart the instance, which would not fix
   anything here and would drop the very traffic pass-through is designed to keep serving; `Degraded` reports
   the condition without recommending an action that makes it worse.
+
+### Tracing
+
+An `ActivitySource` (`RedisNearCacheTracing`), one per cache instance, disposed with the cache exactly as the
+`Meter` is. It is named `"RedisNearCache"` - the same string as the meter name, exposed publicly as
+`RedisNearCacheStatistics.ActivitySourceName` - deliberately: the metrics and the spans of one cache instance are
+one instrumentation scope, sharing a name and a version, so a caller who has wired up `AddMeter(...)` needs only
+`AddSource(RedisNearCacheStatistics.ActivitySourceName)` alongside it to get both.
+
+Two spans only, both `ActivityKind.Client`: `redisnearcache.read` around the Redis round trip of a MISS, and
+`redisnearcache.arm` around arming one endpoint (the initial arm and every re-arm, distinguished by the
+`rnc.arm_reason` attribute rather than a second span name, so a slow arm is attributable without doubling the
+span count). Attributes: `rnc.client_name` and `rnc.instance` on every span (the same instance tags the metrics
+carry); `rnc.key` and `rnc.stored`/`rnc.not_stored_reason` on the read span; `rnc.endpoint`, `rnc.arm_reason` and
+`rnc.redirect_client_id` on the arm span.
+
+The arm span covers BOTH tracking modes under the one name. `TrackingMode.Broadcast` issues no `CLIENT TRACKING
+OFF` - a fresh socket never has tracking on - but it does everything else worth timing: `CLIENT TRACKING ON BCAST`
+with the configured prefixes, `CLIENT TRACKINGINFO` to verify, and a retry ladder with backoff that `Redirect` has
+no equivalent of and that can give up on a node entirely. It is also the mode recommended in front of a proxy, so
+its users are the likeliest to be measuring arm latency in the first place. One span per attempt, so that retry
+ladder shows as several spans rather than one long one. `rnc.redirect_client_id` is absent in `Broadcast`, which
+has no redirect target - omitted rather than emitted as a placeholder, so its presence tells you the mode.
+
+- **A hot L1 hit creates no span, and does not even call `StartActivity`.** `RedisNearCache.GetStoredBytesAsync`
+  returns the hit before touching `RedisNearCacheTracing` at all. This is deliberate, not incidental:
+  `ActivitySource.StartActivity` is not free even with nobody listening - several field reads and a branch, an
+  allocation once something is - so the read span starts only once the read is already going to Redis, which is
+  the expensive part it is timing. A test fails if the span moves above the L1 lookup.
+- **There is deliberately no flush span.** A flush runs on the invalidation-handler path, which this section's
+  opening rule says must touch nothing observability-related, and a flush is already visible through
+  `redisnearcache.flushes` and its `reason` tag - a second signal for the same event would just be a slower way
+  to see it.
+- **A span may carry a cache key and an endpoint address; a metric tag may not.** The instrument-tag cardinality
+  rule above (endpoints, closed enums only) is about metrics, which are pre-aggregated into one time series per
+  distinct tag value forever. A span is not aggregated - it is stored with the one trace that recorded it - so a
+  high-cardinality attribute costs that trace's storage and nothing else. The two rules look inconsistent side by
+  side; they are not the same rule, and the read/arm spans are the reason a span is worth having here at all: to
+  say which key, or which endpoint. Do not "fix" the spans by copying the metric-tag rule onto them.
+- **`rnc.not_stored_reason` is the most operationally useful attribute here.** It is present whenever
+  `rnc.stored` is `false`, and says why a reply that reached the facade was not put in L1 - the one thing no
+  counter can say per key. The values, in the order `RedisNearCacheTracing` spells them: `key_missing` (nothing
+  existed in Redis to store), `race_discarded` (an invalidation for the key arrived while the read was in flight,
+  or `PTTL` said it had already gone), `ttl_unknown` (the remaining TTL could not be read at all, so
+  `RespectServerTtl` has no cap to store under), `caching_disabled` (the cache is in pass-through),
+  `outside_key_prefixes` (the key is outside `KeyPrefixes`, deliberately neither tracked nor stored), and
+  `caching_resumed_mid_read` (the read went out during pass-through, so it carries no TTL to cap by, and caching
+  came back while it was in flight - rare, and only ever transient).
+- **The arm span covers `CLIENT TRACKING OFF` -> `ON REDIRECT` -> `TRACKINGINFO` only.** It starts after the
+  point-of-no-return lock (`TrackingArmer`), so no invalidation-handler flush ever runs with a span current, and
+  it ends before the `Armed` event is raised, so anything observing that event - the facade's flush, a test -
+  already sees a finished span rather than racing one.
+
+### Instrument names stay `redisnearcache.*`
+
+The instruments do not follow OpenTelemetry's semantic conventions for cache or database clients, which would
+suggest `cache.*` or `db.*` names instead. That is a deliberate choice, not an oversight the next change should
+correct: renaming an instrument changes its identity for every dashboard and alert already built against
+`redisnearcache.*`, and publishing both the old and new names side by side would double every series for
+everyone who is not in the middle of migrating, forever, to save a rename for those who are. The prefix stays
+as it is.
 
 ## Not in v1
 

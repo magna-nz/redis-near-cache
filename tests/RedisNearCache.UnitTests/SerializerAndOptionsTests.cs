@@ -100,10 +100,15 @@ public class SerializerAndOptionsTests
     public void StatisticsCountAndPrint()
     {
         var s = new RedisNearCacheStatistics();
-        s.Hit(); s.Hit(); s.Miss(); s.Invalidation(); s.Flush(); s.Rearm(); s.RaceDiscard();
+        s.Hit(); s.Hit(); s.Miss(); s.Invalidation();
+        s.Flush(Internal.FlushReason.Manual); s.Rearm(Internal.ArmReason.Manual); s.RaceDiscard(); s.SerializerFailure();
         Assert.Equal(2, s.Hits);
         Assert.Equal(1, s.Misses);
-        // l1Entries is appended last and reads 0 with no L1 attached; the prefix is unchanged on purpose.
-        Assert.Equal("hits=2 misses=1 invalidations=1 flushes=1 rearms=1 raceDiscards=1 l1Entries=0", s.ToString());
+        // l1Entries closed the original line and reads 0 with no L1 attached; the prefix is unchanged on purpose, and
+        // everything added since is appended after it.
+        Assert.StartsWith("hits=2 misses=1 invalidations=1 flushes=1 rearms=1 raceDiscards=1 l1Entries=0", s.ToString(), StringComparison.Ordinal);
+        // Nothing is attached, so every computed member reads its "no cache behind me" default.
+        Assert.Contains("passThroughSeconds=0.0 lostEndpointCount=0 ttlCapAbandoned=False untrackedReadsUnavailable=False", s.ToString(), StringComparison.Ordinal);
+        Assert.Contains("serializerFailures=1 l1StoreRefusals=0 preArmFailures=0", s.ToString(), StringComparison.Ordinal);
     }
 }
