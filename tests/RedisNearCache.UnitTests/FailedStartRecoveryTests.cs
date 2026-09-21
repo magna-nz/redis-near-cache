@@ -51,6 +51,7 @@ public class FailedStartRecoveryTests
 #pragma warning restore CS0067
         public IReadOnlyDictionary<EndPoint, long> RedirectTargets { get; } = new Dictionary<EndPoint, long>();
         public IReadOnlyDictionary<EndPoint, long> ReplicaRedirectTargets { get; } = new Dictionary<EndPoint, long>();
+        public long PreArmFailures => 0;
 
         public Task StartAsync(CancellationToken cancellationToken)
         {

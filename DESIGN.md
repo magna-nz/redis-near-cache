@@ -361,19 +361,48 @@ invalidation path.
 
 - **Metrics are observable instruments, not counters updated on the hot path.** A `System.Diagnostics.Metrics`
   `Meter` named `RedisNearCache` (`RedisNearCacheStatistics.MeterName`) exposes the same counters as
-  `Statistics` plus L1 entry count and coherence as gauges, but every instrument is read from `Statistics` or
-  `L1Cache` only when something collects (an OpenTelemetry exporter, `dotnet-counters`). `GetAsync`, `SetAsync`
-  and the invalidation handlers touch nothing metrics-related.
+  `Statistics` plus gauges for L1 entry count, coherence, pass-through duration, lost-endpoint count and two
+  latched flags (`RespectServerTtl` abandonment, untracked-reads unavailability), but every instrument is read
+  from `Statistics`, `L1Cache` or the armer only when something collects (an OpenTelemetry exporter,
+  `dotnet-counters`). `GetAsync`, `SetAsync` and the invalidation handlers touch nothing metrics-related. Where
+  a new signal needed a count at all (a serializer throwing, an L1 store refusal, a failed replica pre-arm),
+  the increment sits on a path that was already a failure path - an `Interlocked` bump inside a `catch` that
+  rethrows, or beside a warning that was already being logged - never a new write on the read path.
 - **One `Meter` per cache instance, tagged `rnc.client_name`.** The cache already owns a unique client name
   per instance (`{ClientNamePrefix}-{guid}`); reusing it as a tag, rather than sharing one process-wide
   `Meter`, is what keeps several `IRedisNearCache` instances in one process (two providers, or tests) distinct
   in an exported series without extra configuration. The `Meter` is disposed with the cache, same lifetime as
   everything else it owns.
+- **`redisnearcache.flushes` and `redisnearcache.rearms` carry a `reason` tag, one measurement per reason on
+  every collection, zeros included.** The reasons are closed enums (`FlushReason`; the re-arm-causing subset of
+  `ArmReason`), so the cardinality this adds is fixed and small - unlike an endpoint address, which is why no
+  instrument here is tagged with one (see below). Zeros are emitted rather than letting the series disappear
+  when a reason has never fired: an instrument that vanishes reads on a dashboard as a broken exporter, not as
+  nothing having gone wrong. `ArmReason.Initial` and `ArmReason.Promoted` are excluded from the `rearms`
+  breakdown - they are arms but never re-arms, so a permanent 0 next to them would suggest a re-arm reason that
+  simply never fires, which is not the same thing as one that has not fired yet. Summed over the `reason` tag,
+  each total is unchanged from before the breakdown existed.
+- **Endpoint addresses appear in the health check's `Data` and in logs, never in a metric tag.** An address is
+  unbounded cardinality - as many series as the deployment has ever had endpoints - unlike the closed `reason`
+  tag above or the per-instance `rnc.client_name`/`rnc.instance` tags. `RedisNearCacheStatistics.LostEndpointCount`
+  is the number of endpoints currently lost; only the concrete `RedisNearCache` facade can also name them, which
+  is why the health check's `lostEndpoints` key is present only over the library's own cache instance and absent
+  for a caller's own `IRedisNearCache` implementation, rather than reported as an empty string that would read
+  as "nothing is lost".
 - **The health check reports `Degraded`, not `Unhealthy`, when not coherent.** Pass-through is a real state,
   not a failure one: reads still succeed, served straight from Redis, exactly as `IsCoherent` documents.
   `Unhealthy` would tell an orchestrator to stop routing traffic or restart the instance, which would not fix
   anything here and would drop the very traffic pass-through is designed to keep serving; `Degraded` reports
   the condition without recommending an action that makes it worse.
+
+### Instrument names stay `redisnearcache.*`
+
+The instruments do not follow OpenTelemetry's semantic conventions for cache or database clients, which would
+suggest `cache.*` or `db.*` names instead. That is a deliberate choice, not an oversight the next change should
+correct: renaming an instrument changes its identity for every dashboard and alert already built against
+`redisnearcache.*`, and publishing both the old and new names side by side would double every series for
+everyone who is not in the middle of migrating, forever, to save a rename for those who are. The prefix stays
+as it is.
 
 ## Not in v1
 

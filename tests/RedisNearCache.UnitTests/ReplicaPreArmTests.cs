@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using RedisNearCache.Internal;
@@ -23,6 +25,28 @@ public class ReplicaPreArmTests
     private const int MasterPort = 7000;
     private const int ReplicaPort = 7001;
 
+    /// <summary>Records every log entry; the pre-arm warn-once latch is only visible through the log level actually used.</summary>
+    private sealed class RecordingLogger : ILogger<TrackingArmer>
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            lock (Entries) Entries.Add((logLevel, formatter(state, exception)));
+        }
+    }
+
+    private static int CountAt(RecordingLogger log, LogLevel level, EndPoint endPoint)
+    {
+        lock (log.Entries)
+        {
+            return log.Entries.Count(e => e.Level == level
+                && e.Message.Contains(endPoint.ToString()!, StringComparison.Ordinal)
+                && e.Message.Contains("pre-arm", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
     private sealed class Rig : IAsyncDisposable
     {
         public required FakeMultiplexer Mux { get; init; }
@@ -32,7 +56,7 @@ public class ReplicaPreArmTests
         public required FakeServer Replica { get; init; }
         public required ConcurrentQueue<string> Events { get; init; }
 
-        public static async Task<Rig> StartAsync(Action<FakeServer, FakeServer>? configure = null)
+        public static async Task<Rig> StartAsync(Action<FakeServer, FakeServer>? configure = null, ILogger<TrackingArmer>? logger = null)
         {
             var mux = new FakeMultiplexer("rnc-unit");
             var master = mux.Add(MasterPort, isReplica: false);
@@ -40,7 +64,7 @@ public class ReplicaPreArmTests
             configure?.Invoke(master, replica);
 
             var connection = FakeRedis.Connection(mux);
-            var armer = new TrackingArmer(connection, NullLogger<TrackingArmer>.Instance, Timeout.InfiniteTimeSpan);
+            var armer = new TrackingArmer(connection, logger ?? NullLogger<TrackingArmer>.Instance, Timeout.InfiniteTimeSpan);
             // Subscribe before the facade is built: its constructor starts the initial arm, and against the fake
             // (every reply completes synchronously) the Initial event is raised before the constructor returns.
             var events = new ConcurrentQueue<string>();
@@ -306,5 +330,120 @@ public class ReplicaPreArmTests
         Assert.True(await UntilAsync(() => rig.Replica.RoleCalls >= 1, 3000), "the pre-arm sweep never asked the replica for its ROLE.");
         await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.Count > 0, 300);
         Assert.Empty(rig.Armer.ReplicaRedirectTargets);
+    }
+
+    // --- pre-arm failure counting and the warn-once latch ------------------------------------------------------
+
+    /// <summary>
+    /// The primary counter site (CLIENT TRACKING ON REDIRECT failing): every failed sweep counts, but only the
+    /// first one warns; later ones - the sweep runs every 5 s forever - drop to Debug. Recovery clears the latch,
+    /// so a genuine later failure warns again instead of staying silent.
+    /// </summary>
+    [Fact]
+    public async Task FailedPreArmCountsEverySweepButWarnsOnceThenTheLatchClearsOnRecoverySoALaterFailureWarnsAgain()
+    {
+        var recorder = new RecordingLogger();
+        var failing = true;
+        await using var rig = await Rig.StartAsync((_, replica) =>
+        {
+            replica.CommandHook = command =>
+                command.StartsWith("CLIENT TRACKING ON", StringComparison.Ordinal) && failing
+                    ? Task.FromException(new InvalidOperationException("boom"))
+                    : Task.CompletedTask;
+        }, recorder);
+
+        // Wait on the log entry itself, not on the counter: CountPreArmFailure() and the log call are two separate
+        // synchronized operations on the background sweep, so a poller that observes the counter first can still
+        // race the log call by a few instructions.
+        Assert.True(await UntilAsync(() => CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint) >= 1, 3000),
+            "the failed pre-arm was never warned about: " + rig.Describe());
+        Assert.Equal(1, CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint));
+        Assert.True(rig.Armer.PreArmFailures >= 1, "the warned failure must also be counted.");
+
+        rig.Mux.RaiseConfigurationChanged(rig.Master);
+        // A later sweep repeats the failure at Debug, never a second Warning: the sweep runs every 5 s forever.
+        Assert.True(await UntilAsync(() => CountAt(recorder, LogLevel.Debug, rig.Replica.EndPoint) >= 1, 3000),
+            "a second sweep never re-attempted (and logged at Debug) the pre-arm: " + rig.Describe());
+        Assert.Equal(1, CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint));
+        Assert.True(rig.Armer.PreArmFailures >= 2, "every failed sweep must be counted, even the ones that only log at Debug.");
+
+        // Recovery: the next sweep succeeds and clears the latch.
+        failing = false;
+        rig.Mux.RaiseConfigurationChanged(rig.Master);
+        Assert.True(await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000), "the replica never recovered: " + rig.Describe());
+
+        // Drop the pre-arm (without going through RemoveEndpoint) so the next failure goes through the pre-arm
+        // path again rather than the recheck path. OnConnectionFailed runs synchronously on the calling thread.
+        rig.Mux.RaiseConnectionFailed(rig.Replica, ConnectionType.Interactive);
+        Assert.False(rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint));
+
+        failing = true;
+        rig.Mux.RaiseConfigurationChanged(rig.Master);
+        Assert.True(await UntilAsync(() => CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint) == 2, 3000),
+            "a genuine later failure after recovery must warn again, not stay silent at Debug: " + rig.Describe());
+    }
+
+    /// <summary>
+    /// A permanently hidden subscriber connection (an Enterprise proxy, a restricted ACL) is the identical condition
+    /// the master arm path already warns about with remediation; it gets the same counter and the same latch.
+    /// </summary>
+    [Fact]
+    public async Task HiddenSubscriberConnectionOnAReplicaCountsAndWarnsOnce()
+    {
+        var recorder = new RecordingLogger();
+        await using var rig = await Rig.StartAsync((_, replica) => replica.SubscriberListed = false, recorder);
+
+        Assert.True(await UntilAsync(() => CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint) >= 1, 3000),
+            "the hidden subscriber was never warned about: " + rig.Describe());
+        Assert.Equal(1, CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint));
+        Assert.True(rig.Armer.PreArmFailures >= 1, "the warned failure must also be counted.");
+        Assert.Empty(rig.Armer.ReplicaRedirectTargets);
+
+        rig.Mux.RaiseConfigurationChanged(rig.Master);
+        Assert.True(await UntilAsync(() => CountAt(recorder, LogLevel.Debug, rig.Replica.EndPoint) >= 1, 3000),
+            "a second sweep never re-attempted the pre-arm: " + rig.Describe());
+        Assert.Equal(1, CountAt(recorder, LogLevel.Warning, rig.Replica.EndPoint));
+    }
+
+    /// <summary>
+    /// A pre-armed replica that only lost its connection (site 682) is expected and self-healing (CLAUDE.md: the next
+    /// 5 s sweep re-arms it): Information, not Warning, and NOT counted as a pre-arm failure - the pre-arm itself
+    /// succeeded.
+    /// </summary>
+    [Fact]
+    public async Task ALostPreArmedConnectionLogsInformationAndDoesNotCountAsAPreArmFailure()
+    {
+        var recorder = new RecordingLogger();
+        await using var rig = await Rig.StartAsync(logger: recorder);
+        Assert.True(
+            await UntilAsync(() => rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000),
+            "the replica was never pre-armed: " + rig.Describe());
+
+        rig.Mux.RaiseConnectionFailed(rig.Replica, ConnectionType.Interactive);
+        Assert.True(await UntilAsync(() => !rig.Armer.ReplicaRedirectTargets.ContainsKey(rig.Replica.EndPoint), 3000));
+
+        Assert.Equal(0, rig.Armer.PreArmFailures);
+        lock (recorder.Entries)
+        {
+            Assert.Contains(recorder.Entries, e => e.Level == LogLevel.Information
+                && e.Message.Contains(rig.Replica.EndPoint.ToString()!, StringComparison.Ordinal)
+                && e.Message.Contains("pre-armed", StringComparison.Ordinal));
+            Assert.DoesNotContain(recorder.Entries, e => e.Level == LogLevel.Warning
+                && e.Message.Contains(rig.Replica.EndPoint.ToString()!, StringComparison.Ordinal));
+        }
+    }
+
+    /// <summary>Broadcast mode never pre-arms a replica at all, so its <see cref="ITrackingArmer.PreArmFailures"/> is a constant 0.</summary>
+    [Fact]
+    public async Task BroadcastTrackerReportsZeroPreArmFailures()
+    {
+        var mux = new FakeMultiplexer("rnc-unit-broadcast");
+        mux.Add(MasterPort, isReplica: false);
+        var connection = FakeRedis.Connection(mux);
+        var options = new RedisNearCacheOptions { ConnectionString = "localhost:0" };
+        await using var broadcast = new RedisNearCache.Tracking.Broadcast.BroadcastTracker(connection, options, NullLogger<RedisNearCache.Tracking.Broadcast.BroadcastTracker>.Instance);
+
+        ITrackingArmer contract = broadcast;
+        Assert.Equal(0, contract.PreArmFailures);
     }
 }

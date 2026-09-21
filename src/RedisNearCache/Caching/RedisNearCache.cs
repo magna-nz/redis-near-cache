@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Net;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -68,6 +69,26 @@ internal sealed class RedisNearCache : IRedisNearCache
     private readonly object _coherenceLock = new();
 
     /// <summary>
+    /// <see cref="Stopwatch.GetTimestamp"/> of the moment the cache last stopped being coherent, or
+    /// <see cref="NotInPassThrough"/> while it is. A monotonic clock, not <c>DateTime.UtcNow</c>: the value is only
+    /// ever subtracted from a later reading of the same clock, which a wall clock adjustment would corrupt.
+    /// <para>
+    /// Initialised to "now" because a new cache IS in pass-through - <see cref="_starting"/> is true until the start
+    /// sequence returns - so an instance that never arms reports a growing duration rather than a healthy-looking 0.
+    /// </para>
+    /// Written only under <see cref="_coherenceLock"/>: set (if not already set) in <see cref="ResetCoherence"/>,
+    /// which every path that takes coherence away calls first, and cleared in <see cref="SignalCoherence"/> under the
+    /// same <c>IsCoherent</c> test that releases the waiters, so the timestamp and the coherence signal cannot
+    /// disagree. Keyed off those two seams rather than off <see cref="_lostCount"/>, because a lost endpoint is only
+    /// one of the three things <see cref="CachingEnabled"/> tests: a failed start degrades the cache with an EMPTY
+    /// lost set, and the start itself is a pass-through stretch no loss is ever announced for.
+    /// </summary>
+    private long _passThroughSince = Stopwatch.GetTimestamp();
+
+    /// <summary>Sentinel for "coherent, so there is no pass-through to time". 0 is a legitimate timestamp, so it cannot be used.</summary>
+    private const long NotInPassThrough = long.MinValue;
+
+    /// <summary>
     /// Set once the server has rejected PTTL outright (an ACL without it, a proxy): the TTL cap cannot be honoured, so
     /// misses fall back to a plain GET and are cached for L1MaxAge, as with RespectServerTtl off. Logged once.
     /// </summary>
@@ -118,6 +139,16 @@ internal sealed class RedisNearCache : IRedisNearCache
         _inflight = new InFlightTracker();
         // The statistics object does not own L1, so it is pointed at it here and detached again on dispose.
         Statistics.AttachL1(() => _l1.Count);
+        // Same arrangement for everything computed rather than counted: read when something collects, never on a
+        // read. _passThroughSince, _lostCount and the two latches are state the facade keeps anyway; L1's refusal
+        // count and the armer's pre-arm failure count belong to objects the statistics do not own either.
+        Statistics.AttachFacade(
+            () => PassThroughSeconds,
+            () => _lostCount,
+            () => Volatile.Read(ref _ttlCapUnavailable) == 1,
+            () => Volatile.Read(ref _untrackedReadsUnavailable) == 1,
+            () => _l1.StoreRefusals,
+            () => _armer.PreArmFailures);
         // Observable instruments only: they read what is counted anyway, so no metric costs the read path anything.
         _metrics = new RedisNearCacheMetrics(Statistics, _connection.ClientName, () => IsCoherent, _options.InstanceName);
 
@@ -254,24 +285,28 @@ internal sealed class RedisNearCache : IRedisNearCache
         Statistics.Invalidation();
     }
 
-    /// <summary>The one whole-cache flush. Every path that cannot trust L1 comes through here.</summary>
-    private void FlushLocal()
+    /// <summary>
+    /// The one whole-cache flush. Every path that cannot trust L1 comes through here. <paramref name="reason"/> is
+    /// counted alongside the total and published as the <c>reason</c> tag; it changes nothing about the order of the
+    /// four steps below, which is load-bearing (DESIGN.md) and which other tests read the counter to observe.
+    /// </summary>
+    private void FlushLocal(FlushReason reason)
     {
         _inflight.MarkAllInvalidated();
         _options.TestHooks.InsideFlushHandler?.Invoke();
         _l1.Clear();
-        Statistics.Flush();
+        Statistics.Flush(reason);
     }
 
-    private void OnFlushAll() => FlushLocal();
+    private void OnFlushAll() => FlushLocal(FlushReason.ServerFlush);
 
     private void OnArmed(TrackingArmedEvent e)
     {
         // Initial: nothing was cached yet. Promoted: the node was armed while it was still a replica, so every read
         // routed to it since is tracked and no re-arm is needed; L1 is still flushed once, because entries read from
         // the demoted master before the failover are protected only by that node's tracking table from here on.
-        if (e.Reason != ArmReason.Initial) FlushLocal();
-        if (e.Reason is not (ArmReason.Initial or ArmReason.Promoted)) Statistics.Rearm();
+        if (e.Reason != ArmReason.Initial) FlushLocal(FlushReason.Rearm);
+        if (e.Reason is not (ArmReason.Initial or ArmReason.Promoted)) Statistics.Rearm(e.Reason);
         // Re-enable caching only AFTER the flush, so no concurrent read can hit an entry the flush discards.
         RemoveLost(e.EndPoint);
         // One master's initial arm says nothing about the others the same start is still arming, none of which was
@@ -295,7 +330,7 @@ internal sealed class RedisNearCache : IRedisNearCache
         // against a still-completed source and spin.
         ResetCoherence();
         AddLost(endPoint);
-        FlushLocal();
+        FlushLocal(FlushReason.TrackingLost);
     }
 
     private void OnEndpointRemoved(EndPoint endPoint)
@@ -304,7 +339,7 @@ internal sealed class RedisNearCache : IRedisNearCache
         // protected by nothing now - its tracking may already be gone without an invalidation ever arriving - so
         // flush unconditionally, even if tracking was never reported lost there. Then stop waiting on it: it will
         // never be re-armed, so it must not keep us in pass-through. Flush first, re-enable after, as in OnArmed.
-        FlushLocal();
+        FlushLocal(FlushReason.EndpointRemoved);
         RemoveLost(endPoint);
         SignalCoherence();
     }
@@ -322,6 +357,37 @@ internal sealed class RedisNearCache : IRedisNearCache
         lock (_lostLock)
         {
             if (_lostEndpoints.Remove(endPoint)) _lostCount = _lostEndpoints.Count;
+        }
+    }
+
+    /// <summary>
+    /// The addresses of the endpoints whose tracking is lost, comma-joined, or an empty string when none is. For the
+    /// health check's <c>Data</c> and for logs only: an endpoint address is unbounded cardinality, so it must never
+    /// become a metric tag, which is why <see cref="RedisNearCacheStatistics.LostEndpointCount"/> is the number alone.
+    /// Takes <see cref="_lostLock"/>, so it is a diagnostic read, not something to do per request.
+    /// </summary>
+    internal string LostEndpointAddresses()
+    {
+        lock (_lostLock)
+        {
+            return _lostEndpoints.Count == 0 ? string.Empty : string.Join(",", _lostEndpoints.Select(e => e.ToString()));
+        }
+    }
+
+    /// <summary>
+    /// Seconds since coherence was last lost, or 0 while the cache is coherent. Computed from
+    /// <see cref="_passThroughSince"/> at collection time; nothing on the read path maintains it.
+    /// </summary>
+    private double PassThroughSeconds
+    {
+        get
+        {
+            var since = Volatile.Read(ref _passThroughSince);
+            if (since == NotInPassThrough) return 0;
+            var elapsed = Stopwatch.GetTimestamp() - since;
+            // A clear racing this read (the cache just became coherent) can make the difference negative; report the
+            // coherent answer rather than a negative duration.
+            return elapsed <= 0 ? 0 : (double)elapsed / Stopwatch.Frequency;
         }
     }
 
@@ -396,7 +462,11 @@ internal sealed class RedisNearCache : IRedisNearCache
     {
         lock (_coherenceLock)
         {
-            if (IsCoherent) _coherence.TrySetResult();
+            if (!IsCoherent) return;
+            _coherence.TrySetResult();
+            // Inside the same lock and under the same test as the signal, so the duration and the coherence state can
+            // never disagree: whatever says "coherent" to a waiter says "0 seconds of pass-through" to a collector.
+            Volatile.Write(ref _passThroughSince, NotInPassThrough);
         }
     }
 
@@ -405,6 +475,10 @@ internal sealed class RedisNearCache : IRedisNearCache
     {
         lock (_coherenceLock)
         {
+            // Regardless of the source's state, and only if the clock is not already running: a second loss while the
+            // first is still pending must not restart the clock, or a flapping endpoint would report a duration that
+            // never grows past the gap between two losses.
+            if (Volatile.Read(ref _passThroughSince) == NotInPassThrough) Volatile.Write(ref _passThroughSince, Stopwatch.GetTimestamp());
             if (_coherence.Task.IsCompleted) _coherence = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         }
     }
@@ -463,7 +537,36 @@ internal sealed class RedisNearCache : IRedisNearCache
     public async ValueTask<T?> GetAsync<T>(string key, CancellationToken cancellationToken = default)
     {
         var bytes = await GetStoredBytesAsync(key, cancellationToken).ConfigureAwait(false);
-        return bytes is null ? default : _options.Serializer.Deserialize<T>(bytes);
+        return bytes is null ? default : Deserialize<T>(bytes);
+    }
+
+    // The only two places the configured serializer is called. A try/catch that does not throw costs nothing, so
+    // counting the failures adds nothing to the read or write path; the exception is rethrown untouched, neither
+    // swallowed nor wrapped, so a caller still sees exactly what its serializer threw.
+    private byte[] Serialize<T>(T value)
+    {
+        try
+        {
+            return _options.Serializer.Serialize(value);
+        }
+        catch
+        {
+            Statistics.SerializerFailure();
+            throw;
+        }
+    }
+
+    private T? Deserialize<T>(ReadOnlyMemory<byte> bytes)
+    {
+        try
+        {
+            return _options.Serializer.Deserialize<T>(bytes);
+        }
+        catch
+        {
+            Statistics.SerializerFailure();
+            throw;
+        }
     }
 
     // A copy: the array read may be the one held in L1.
@@ -757,14 +860,14 @@ internal sealed class RedisNearCache : IRedisNearCache
     public async ValueTask SetAsync<T>(string key, T value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        await WriteAsync(key, _options.Serializer.Serialize(value), expiry, When.Always, keepTtl: false, cancellationToken).ConfigureAwait(false);
+        await WriteAsync(key, Serialize(value), expiry, When.Always, keepTtl: false, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask<bool> SetAsync<T>(string key, T value, When when, TimeSpan? expiry = null, bool keepTtl = false, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         ConditionalWrite.ThrowIfInvalid(expiry, keepTtl);
-        return await WriteAsync(key, _options.Serializer.Serialize(value), expiry, when, keepTtl, cancellationToken).ConfigureAwait(false);
+        return await WriteAsync(key, Serialize(value), expiry, when, keepTtl, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask SetBytesAsync(string key, ReadOnlyMemory<byte> value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)
@@ -842,7 +945,7 @@ internal sealed class RedisNearCache : IRedisNearCache
     public void EvictAllLocal()
     {
         if (Volatile.Read(ref _disposed) == 1) return;
-        try { FlushLocal(); }
+        try { FlushLocal(FlushReason.Manual); }
         catch (ObjectDisposedException) { /* a dispose won the race after the check above: same no-op */ }
     }
 
@@ -850,7 +953,7 @@ internal sealed class RedisNearCache : IRedisNearCache
     {
         if (CachingEnabled && Volatile.Read(ref _disposed) == 0 && _l1.TryGet(FullKey(key), out var bytes))
         {
-            value = _options.Serializer.Deserialize<T>(bytes);
+            value = Deserialize<T>(bytes);
             return true;
         }
 
@@ -887,6 +990,7 @@ internal sealed class RedisNearCache : IRedisNearCache
             // Stop publishing before L1 goes, so no collection cycle can reach a disposed store.
             _metrics.Dispose();
             Statistics.DetachL1();
+            Statistics.DetachFacade();
             _l1.Dispose();
         }
 

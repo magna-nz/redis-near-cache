@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 namespace RedisNearCache;
@@ -7,11 +8,15 @@ namespace RedisNearCache;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Register it explicitly with a name of your choosing; RedisNearCache does not add an <c>IHealthChecksBuilder</c>
-/// extension because there is nothing to configure beyond resolving <see cref="IRedisNearCache"/>:
+/// RedisNearCache does not add an <c>IHealthChecksBuilder</c> extension because <c>IHealthChecksBuilder</c> lives
+/// in <c>Microsoft.Extensions.Diagnostics.HealthChecks</c>, a package this library deliberately does not
+/// reference (it depends only on the Abstractions package, which exports <see cref="IHealthCheck"/> and
+/// <see cref="HealthCheckRegistration"/> but not the builder). Use <see cref="Registration"/> instead to get a
+/// ready-made registration for the builder you already have, including for a cache registered with a service key
+/// (<c>AddKeyedRedisNearCache</c>), which plain <c>AddCheck&lt;RedisNearCacheHealthCheck&gt;</c> cannot resolve:
 /// </para>
 /// <code>
-/// services.AddHealthChecks().AddCheck&lt;RedisNearCacheHealthCheck&gt;("redis-near-cache");
+/// services.AddHealthChecks().Add(RedisNearCacheHealthCheck.Registration(serviceKey: "orders"));
 /// </code>
 /// <para>
 /// While <see cref="IRedisNearCache.IsCoherent"/> is false the cache is in pass-through: every read still
@@ -24,6 +29,37 @@ namespace RedisNearCache;
 /// </remarks>
 public sealed class RedisNearCacheHealthCheck : IHealthCheck
 {
+    /// <summary>The name a registration produced by <see cref="Registration"/> uses for the default (non-keyed) instance.</summary>
+    private const string DefaultName = "redis-near-cache";
+
+    /// <summary>
+    /// Builds a <see cref="HealthCheckRegistration"/> for an <see cref="IRedisNearCache"/> already registered with
+    /// <c>services</c>, default or keyed, to hand to the <c>IHealthChecksBuilder</c> you already have (see the
+    /// type-level remarks for why this library does not add its own builder extension).
+    /// </summary>
+    /// <param name="name">
+    /// The registration name. Defaults to <c>"redis-near-cache"</c> for the default instance, or
+    /// <c>$"redis-near-cache-{serviceKey}"</c> for a keyed one, so two keyed registrations cannot collide.
+    /// </param>
+    /// <param name="serviceKey">
+    /// <see langword="null"/> to resolve the default <see cref="IRedisNearCache"/>; otherwise the key it was
+    /// registered under (e.g. with <c>AddKeyedRedisNearCache</c>), resolved with
+    /// <see cref="ServiceProviderKeyedServiceExtensions.GetRequiredKeyedService{T}(IServiceProvider, object?)"/>.
+    /// </param>
+    /// <param name="tags">Optional tags passed through to the registration.</param>
+    public static HealthCheckRegistration Registration(string? name = null, string? serviceKey = null, IEnumerable<string>? tags = null)
+    {
+        var registrationName = name ?? (serviceKey is null ? DefaultName : $"{DefaultName}-{serviceKey}");
+        return new HealthCheckRegistration(
+            registrationName,
+            provider => new RedisNearCacheHealthCheck(serviceKey is null
+                ? provider.GetRequiredService<IRedisNearCache>()
+                : provider.GetRequiredKeyedService<IRedisNearCache>(serviceKey)),
+            // Never Unhealthy by design; see the type-level remarks.
+            failureStatus: null,
+            tags);
+    }
+
     private readonly IRedisNearCache _cache;
 
     /// <summary>Creates the health check over an already-registered <see cref="IRedisNearCache"/>.</summary>
@@ -66,7 +102,24 @@ public sealed class RedisNearCacheHealthCheck : IHealthCheck
             ["rearms"] = stats.Rearms,
             ["raceDiscards"] = stats.RaceDiscards,
             ["l1Entries"] = stats.L1Entries,
+            // Everything below reads Statistics, never the concrete cache, so a caller's own IRedisNearCache
+            // implementation reports the same keys (its own counters' defaults) rather than falling over.
+            ["passThroughSeconds"] = stats.PassThroughSeconds,
+            ["lostEndpointCount"] = stats.LostEndpointCount,
+            ["ttlCapAbandoned"] = stats.TtlCapAbandoned,
+            ["untrackedReadsUnavailable"] = stats.UntrackedReadsUnavailable,
+            ["serializerFailures"] = stats.SerializerFailures,
+            ["l1StoreRefusals"] = stats.L1StoreRefusals,
+            ["preArmFailures"] = stats.PreArmFailures,
         };
+
+        // The one exception: WHICH endpoints are lost is unbounded cardinality, so it is not on Statistics (and not on
+        // any metric tag) - only the concrete cache can answer it. Omitted entirely for any other implementation,
+        // rather than reported as an empty string that would read as "nothing is lost".
+        if (_cache is Caching.RedisNearCache facade)
+        {
+            data["lostEndpoints"] = facade.LostEndpointAddresses();
+        }
 
         var result = coherent
             ? HealthCheckResult.Healthy("RedisNearCache is coherent: tracking is armed on every master and reads are served from L1.", data)

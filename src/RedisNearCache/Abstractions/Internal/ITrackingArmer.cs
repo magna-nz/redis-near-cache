@@ -70,6 +70,14 @@ internal interface ITrackingArmer : IAsyncDisposable
     /// </summary>
     IReadOnlyDictionary<EndPoint, long> ReplicaRedirectTargets { get; }
 
+    /// <summary>
+    /// Failed attempts to pre-arm a replica, read by the facade when something collects (the same arrangement as
+    /// <see cref="ReplicaRedirectTargets"/>: pre-arm state the armer owns and the facade only observes). The armer is
+    /// constructed before the facade and cannot be handed its <see cref="RedisNearCacheStatistics"/>, so the count
+    /// lives here. Monotonic; never reset.
+    /// </summary>
+    long PreArmFailures { get; }
+
     /// <summary>Re-arms one endpoint now.</summary>
     Task RearmAsync(EndPoint endPoint, ArmReason reason, CancellationToken cancellationToken);
 

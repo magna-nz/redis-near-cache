@@ -31,6 +31,7 @@ public class InitialArmWindowTests
 
         public IReadOnlyDictionary<EndPoint, long> RedirectTargets { get; } = new Dictionary<EndPoint, long>();
         public IReadOnlyDictionary<EndPoint, long> ReplicaRedirectTargets { get; } = new Dictionary<EndPoint, long>();
+        public long PreArmFailures => 0;
 
         public TaskCompletionSource FirstArmed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 

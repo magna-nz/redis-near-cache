@@ -157,6 +157,23 @@ internal sealed class TrackingArmer : ITrackingArmer
     /// <inheritdoc />
     public IReadOnlyDictionary<EndPoint, long> ReplicaRedirectTargets => new Dictionary<EndPoint, long>(_replicaTargets);
 
+    /// <summary>Counted by <see cref="CountPreArmFailure"/>; see <see cref="PreArmFailures"/>.</summary>
+    private long _preArmFailures;
+
+    /// <inheritdoc />
+    public long PreArmFailures => Volatile.Read(ref _preArmFailures);
+
+    /// <summary>Records one failed pre-arm attempt of a replica; see the call sites in <see cref="PreArmReplicaCoreAsync"/>.</summary>
+    private void CountPreArmFailure() => Interlocked.Increment(ref _preArmFailures);
+
+    /// <summary>
+    /// Per endpoint, whether a pre-arm failure has already been warned about since the last success. The pre-arm
+    /// sweep runs every 5 seconds forever, so without this an endpoint stuck failing would warn once per sweep for
+    /// the life of the process; cleared on the next successful pre-arm and on <see cref="RemoveEndpoint"/>, so a
+    /// genuine later failure is reported again.
+    /// </summary>
+    private readonly ConcurrentDictionary<EndPoint, byte> _preArmWarned = new();
+
     /// <inheritdoc />
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -679,7 +696,9 @@ internal sealed class TrackingArmer : ITrackingArmer
                 wasPreArmed = _replicaTargets.TryRemove(endPoint, out _);
             }
             if (wasPreArmed)
-                _logger.LogDebug("RedisNearCache lost the {ConnectionType} connection to pre-armed replica {EndPoint}; it will be re-armed", e.ConnectionType, endPoint);
+                // The pre-arm succeeded; only the connection was lost, and CLAUDE.md books this as expected: the
+                // next 5 s sweep re-arms it. Not a pre-arm failure, so not counted; Information rather than Warning.
+                _logger.LogInformation("RedisNearCache lost the {ConnectionType} connection to pre-armed replica {EndPoint}; it will be re-armed", e.ConnectionType, endPoint);
             if (!IsTrackedMaster(endPoint))
             {
                 _logger.LogDebug("RedisNearCache ignored a {ConnectionType} failure on {EndPoint}: not a master we track", e.ConnectionType, endPoint);
@@ -1017,6 +1036,9 @@ internal sealed class TrackingArmer : ITrackingArmer
                     }
                     catch (Exception ex)
                     {
+                        // Sweep-wide, not per replica: one occurrence here says nothing about how many replicas (if
+                        // any) failed to pre-arm, so it is not counted as a pre-arm failure. Repeats every sweep with
+                        // no per-endpoint latch available, so it stays at Debug.
                         _logger.LogDebug(ex, "RedisNearCache replica pre-arm sweep failed");
                     }
                 }
@@ -1049,6 +1071,7 @@ internal sealed class TrackingArmer : ITrackingArmer
         }
         catch (Exception ex)
         {
+            // Sweep-wide, like the catch in RunPendingPreArmSweeps: not attributable to one replica, so not counted.
             _logger.LogDebug(ex, "RedisNearCache could not enumerate servers to pre-arm replicas");
             return;
         }
@@ -1111,6 +1134,9 @@ internal sealed class TrackingArmer : ITrackingArmer
         }
         catch (Exception ex)
         {
+            // A genuinely failed pre-arm re-check attempt on this one replica; counted, but this repeats every
+            // sweep with no per-endpoint latch available here, so it stays at Debug.
+            CountPreArmFailure();
             _logger.LogDebug(ex, "RedisNearCache could not re-check pre-armed replica {EndPoint}", endPoint);
         }
     }
@@ -1137,7 +1163,21 @@ internal sealed class TrackingArmer : ITrackingArmer
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "RedisNearCache could not pre-arm replica {EndPoint}; it will be retried", endPoint);
+            // Primary pre-arm-failure counter site. The pre-arm sweep runs every 5 s forever, so warn once per
+            // endpoint (via _preArmWarned) and drop to Debug on later sweeps until it recovers or is forgotten.
+            CountPreArmFailure();
+            if (_preArmWarned.TryAdd(endPoint, 0))
+            {
+                _logger.LogWarning(ex,
+                    "RedisNearCache could not pre-arm replica {EndPoint}; it will be retried. Until it succeeds, a " +
+                    "failover promoting this replica costs a re-arm and an L1 flush (a pass-through gap) that a " +
+                    "pre-arm would have avoided",
+                    endPoint);
+            }
+            else
+            {
+                _logger.LogDebug(ex, "RedisNearCache could not pre-arm replica {EndPoint}; it will be retried", endPoint);
+            }
         }
     }
 
@@ -1162,7 +1202,24 @@ internal sealed class TrackingArmer : ITrackingArmer
             var clients = await server.ClientListAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
             if (FindSubscriberId(clients, endPoint) is not { } redirectId)
             {
-                _logger.LogDebug("RedisNearCache found no subscriber connection on replica {EndPoint} yet; not pre-armed", endPoint);
+                // The identical condition on the master arm path (see the no-subscriber-connection remediation
+                // above) is permanent wherever the subscriber is hidden from CLIENT LIST (an Enterprise proxy, a
+                // restricted ACL), not a transient startup race, so it gets the same latch and warning as the
+                // primary pre-arm-failure site above.
+                CountPreArmFailure();
+                if (_preArmWarned.TryAdd(endPoint, 0))
+                {
+                    _logger.LogWarning(
+                        "RedisNearCache found no subscriber connection of client {ClientName} on replica {EndPoint}; not " +
+                        "pre-armed. If this is a Redis Enterprise-based service (Azure Managed Redis, Redis Cloud, Redis " +
+                        "Software), its proxy hides that connection from CLIENT LIST: set RedisNearCacheOptions.TrackingMode " +
+                        "= TrackingMode.Broadcast",
+                        _connection.ClientName, endPoint);
+                }
+                else
+                {
+                    _logger.LogDebug("RedisNearCache found no subscriber connection on replica {EndPoint} yet; not pre-armed", endPoint);
+                }
                 return;
             }
 
@@ -1198,6 +1255,8 @@ internal sealed class TrackingArmer : ITrackingArmer
                 }
                 if (_redirectTargets.ContainsKey(endPoint) || _lost.ContainsKey(endPoint)) return;
                 _replicaTargets[endPoint] = redirectId;
+                // Recovered: clear the latch so a genuine later failure warns again instead of staying silent at Debug.
+                _preArmWarned.TryRemove(endPoint, out _);
             }
             _logger.LogInformation("RedisNearCache pre-armed CLIENT TRACKING on replica {EndPoint} redirecting to client {RedirectClientId}", endPoint, redirectId);
         }
@@ -1359,6 +1418,8 @@ internal sealed class TrackingArmer : ITrackingArmer
         {
             var wasArmed = _redirectTargets.TryRemove(endPoint, out _);
             var wasLost = _lost.TryRemove(endPoint, out _);
+            // A forgotten endpoint must not leak a latch entry: a later reconnect at the same address starts clean.
+            _preArmWarned.TryRemove(endPoint, out _);
             if (!wasArmed && !wasLost) return;
             _logger.LogInformation("RedisNearCache forgot endpoint {EndPoint} (was {State})", endPoint, wasArmed ? "armed" : "lost");
             Raise(EndpointRemoved, endPoint, nameof(EndpointRemoved));

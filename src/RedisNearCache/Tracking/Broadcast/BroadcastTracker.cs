@@ -277,6 +277,14 @@ internal sealed class BroadcastTracker : ITrackingArmer, IInvalidationListener
     /// <remarks>Always empty: a broadcast socket tracks for itself, so there is nothing to pre-arm on a replica.</remarks>
     public IReadOnlyDictionary<EndPoint, long> ReplicaRedirectTargets => NoReplicas;
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// Always 0: broadcast mode never pre-arms a replica. There is no redirect target to point ahead of time - a
+    /// broadcast socket tracks for itself - so there is no pre-arm that could fail, and a promotion is answered by
+    /// the sweep arming the new master's own socket.
+    /// </remarks>
+    public long PreArmFailures => 0;
+
     // --- arming ---------------------------------------------------------------------------------------
 
     /// <summary>

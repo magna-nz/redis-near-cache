@@ -58,22 +58,23 @@ public class HealthCheckTests
     }
 
     [Fact]
-    public async Task DataContainsAllEightKeysWithTheRightValues()
+    public async Task DataContainsEveryStatisticsKeyWithTheRightValues()
     {
         var fake = new FakeNearCache { IsCoherent = true };
         fake.Statistics.Hit();
         fake.Statistics.Hit();
         fake.Statistics.Miss();
         fake.Statistics.Invalidation();
-        fake.Statistics.Flush();
-        fake.Statistics.Rearm();
+        fake.Statistics.Flush(Internal.FlushReason.Manual);
+        fake.Statistics.Rearm(Internal.ArmReason.Manual);
         fake.Statistics.RaceDiscard();
+        fake.Statistics.SerializerFailure();
         var check = new RedisNearCacheHealthCheck(fake);
 
         var result = await check.CheckHealthAsync(Context());
 
         Assert.NotNull(result.Data);
-        Assert.Equal(8, result.Data!.Count);
+        Assert.Equal(15, result.Data!.Count);
         Assert.Equal(true, result.Data["coherent"]);
         Assert.Equal(2L, result.Data["hits"]);
         Assert.Equal(1L, result.Data["misses"]);
@@ -82,6 +83,19 @@ public class HealthCheckTests
         Assert.Equal(1L, result.Data["rearms"]);
         Assert.Equal(1L, result.Data["raceDiscards"]);
         Assert.Equal(0L, result.Data["l1Entries"]);
+        Assert.Equal(1L, result.Data["serializerFailures"]);
+        // Nothing is attached to this bare statistics object, so everything computed from a cache's own state reads
+        // its default - which is the point: the check works against ANY IRedisNearCache, not only the facade.
+        Assert.Equal(0d, result.Data["passThroughSeconds"]);
+        Assert.Equal(0L, result.Data["lostEndpointCount"]);
+        Assert.Equal(false, result.Data["ttlCapAbandoned"]);
+        Assert.Equal(false, result.Data["untrackedReadsUnavailable"]);
+        Assert.Equal(0L, result.Data["l1StoreRefusals"]);
+        Assert.Equal(0L, result.Data["preArmFailures"]);
+
+        // lostEndpoints comes off the concrete facade, so a caller's own implementation must not get the key at all -
+        // an empty string here would read as "nothing is lost" when the truth is "unknown".
+        Assert.False(result.Data.ContainsKey("lostEndpoints"));
     }
 
     [Fact]

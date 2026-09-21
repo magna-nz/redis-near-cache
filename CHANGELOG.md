@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+- Feature: `redisnearcache.flushes` and `redisnearcache.rearms` now carry a `reason` tag and emit one series per
+  reason (5 for `flushes` - `ServerFlush`, `Rearm`, `TrackingLost`, `EndpointRemoved`, `Manual`; 7 for `rearms` -
+  `InteractiveRestored`, `SubscriptionRestored`, `Manual`, `TopologyChanged`, `Recovered`, `VerificationFailed`,
+  `PushConnectionRestored`) instead of one. Summed across `reason` the totals are numerically identical to
+  before, so a dashboard aggregating with `sum`/`rate` is unaffected; a dashboard that assumed exactly one series
+  per `rnc.client_name` for either instrument will now see several and needs a `sum by (rnc.client_name)` (or
+  equivalent) added. `ArmReason.Initial` and `ArmReason.Promoted` do not appear on `rearms`: they are arms, not
+  re-arms, and were never counted towards `Statistics.Rearms` either.
+- Feature: seven new instruments on the `RedisNearCache` meter: `redisnearcache.pass_through.seconds` (gauge,
+  `s`, 0 while coherent, otherwise seconds since coherence was lost, counted from construction so an instance
+  that never manages its first arm reports a growing duration instead of looking healthy),
+  `redisnearcache.endpoints.lost` (gauge, masters whose tracking is currently lost),
+  `redisnearcache.ttl_cap.abandoned` and `redisnearcache.untracked_reads.unavailable` (gauges, 0/1, the
+  `RespectServerTtl` and `CLIENT CACHING NO`-in-a-transaction latches, previously logged once and then invisible
+  for the life of the process), `redisnearcache.serializer_failures` (counter; the exception still reaches the
+  caller unchanged), `redisnearcache.l1.store_refusals` (counter; stores `MemoryCache` refused for a reason other
+  than the value alone exceeding the size budget - it cannot distinguish that from the `MemoryCache` size-drift
+  bug documented on `L1Cache`, so a non-zero reading is a symptom to investigate, not a diagnosis on its own) and
+  `redisnearcache.prearm_failures` (counter; failed attempts to pre-arm a replica ahead of a failover). Matching
+  new properties on `RedisNearCacheStatistics`; see DESIGN.md's Observability section for why none of this adds
+  a write to the read path.
+- Feature: the health check's `Data` grew from 8 keys to 15 (one per `Statistics` member above), plus a 16th,
+  `lostEndpoints` (the lost endpoints' addresses, comma-joined), present only when the health check is wired to
+  this library's own cache and absent for a caller's own `IRedisNearCache` implementation. `Healthy`/`Degraded`
+  semantics are unchanged; the check still never returns `Unhealthy`.
+- `RedisNearCacheStatistics.ToString()` gained the new fields, appended after the existing ones; the documented
+  prefix (`hits=... misses=... invalidations=...`) is unchanged.
+- Selected `TrackingArmer` log lines around replica pre-arm changed level; see the source for the current,
+  authoritative levels rather than this entry.
+
 ## 1.6.0 (2026-09-20)
 
 - Fix: on a deployment with more than one master, the cache could store a value that nothing was tracking for the
